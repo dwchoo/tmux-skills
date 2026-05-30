@@ -40,6 +40,13 @@ def status_line(status: dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
+def managed_job_line(job: dict[str, Any]) -> str:
+    return (
+        f"managed job {job.get('job_id') or job.get('id')}: {job.get('status')} "
+        f"kind={job.get('kind')} pane={job.get('pane_id')} heartbeat={job.get('heartbeat_at')}"
+    )
+
+
 def context(args: argparse.Namespace) -> dict[str, Any]:
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     state = tmux_state.load_task_state(paths)
@@ -58,6 +65,9 @@ def context(args: argparse.Namespace) -> dict[str, Any]:
         evidence = [path for path in task.get("evidence_paths", []) if path]
         if evidence:
             lines.append("evidence: " + ", ".join(evidence[:3]))
+    active_jobs = [job for job in state.get("jobs", []) if tmux_state.is_active_managed_job(job)]
+    active_jobs.sort(key=lambda job: str(job.get("heartbeat_at") or job.get("updated_at") or ""), reverse=True)
+    lines.extend(managed_job_line(job) for job in active_jobs[:3])
     lines.extend(status_line(status) for status in interesting[:3])
     if errors:
         lines.append(f"Skipped {len(errors)} unreadable tmux-skills status file(s).")

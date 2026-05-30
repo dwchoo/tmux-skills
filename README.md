@@ -1,6 +1,6 @@
 # tmux-skills
 
-Codex skill for controlled tmux usage. It provides concise skill instructions, Python helpers for tmux panes/windows, long-running job wrappers, resumable follow-up task records, hook status readers, and reusable pane monitors.
+Codex skill for controlled tmux usage. It provides concise skill instructions, Python helpers for tmux panes/windows, long-running job wrappers, managed watch/queue workers, resumable follow-up task records, hook status readers, and reusable pane monitors.
 
 ## Requirements
 
@@ -10,19 +10,34 @@ Codex skill for controlled tmux usage. It provides concise skill instructions, P
 ## Files
 
 - `SKILL.md`: skill instructions and safety rules.
+- `llms.txt`: LLM-friendly documentation index.
+- `docs/`: canonical detailed contracts and runbooks.
 - `references/`: copyable hook snippets and workflow examples.
 - `scripts/tmux_control.py`: main tmux helper used by the skill.
 - `scripts/tmux_job.py`: long-running command wrapper.
+- `scripts/tmux_queue.py`: managed watch and queue-after worker.
 - `scripts/tmux_monitor.py`: single-trigger pane monitor.
 - `scripts/codex_tmux_hook.py`: command hook status reader.
 - `.codex/tmux-skills/tasks/`: runtime follow-up task records created by `task` and `run --next-instruction`.
+- `.codex/tmux-skills/jobs/`: managed background worker records created by `watch` and queue commands.
+
+## Documentation
+
+- Start with [`llms.txt`](llms.txt) for LLM-friendly discovery.
+- Use [`docs/README.md`](docs/README.md) as the docs wiki index.
+- Use [`docs/llm-wiki-style-guide.md`](docs/llm-wiki-style-guide.md) before adding or reorganizing wiki pages.
+- Use [`docs/workflows-and-features.md`](docs/workflows-and-features.md) for the desired operating flow and feature map.
+- Use [`docs/managed-workers.md`](docs/managed-workers.md) for managed worker contracts, dedupe, stale GC, and send preflight behavior.
+- Use [`docs/real-use-e2e.md`](docs/real-use-e2e.md) for the real tmux E2E harness and scenario coverage.
 
 ## Verify
 
 ```bash
-python3 -m py_compile scripts/tmux_control.py
-python3 -m py_compile scripts/tmux_job.py scripts/tmux_monitor.py scripts/codex_tmux_hook.py
-python3 -m unittest discover
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile scripts/*.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/e2e_real_use.py --scenario smoke --json
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/e2e_real_use.py --scenario all --json
+git diff --check
 python3 scripts/tmux_control.py --help
 python3 scripts/tmux_control.py list
 ```

@@ -1,0 +1,27 @@
+# tmux-skills
+
+> Codex skill for controlled tmux usage, managed watch/queue workers, hook-aware status records, and real-use tmux E2E validation.
+
+Use this file as the LLM entry point. Start with the core files for orientation, then read the detailed docs only for the behavior you need to modify or verify.
+
+## Core
+
+- [README](README.md): Project overview, requirements, file map, and verification entry points.
+- [Skill instructions](SKILL.md): Agent operating guide for choosing panes, sending commands, capturing output, and using tmux safely.
+
+## Detailed docs
+
+- [Docs index](docs/README.md): LLM wiki map and maintenance rules for README, SKILL, docs, and references.
+- [LLM wiki style guide](docs/llm-wiki-style-guide.md): Rules for writing canonical, low-duplication, code-fact-checked wiki pages.
+- [Workflows and features](docs/workflows-and-features.md): Desired operating flow, feature map, and workflow-to-test mapping.
+- [Managed workers](docs/managed-workers.md): Canonical contract for `watch`, `queue-after-idle`, `queue-after-status`, dedupe, stale GC, and send preflight behavior.
+- [Real-use E2E](docs/real-use-e2e.md): Canonical guide for `scripts/e2e_real_use.py`, smoke/all scenario groups, exit codes, diagnostics, and cleanup checks.
+
+## References
+
+- [Hook snippets](references/HOOKS.md): Copyable Codex command hook snippets for tmux status and follow-up task context.
+- [Workflows](references/WORKFLOWS.md): Copyable tmux-skills workflow examples for long-running jobs, resume, monitors, and output review.
+
+## Optional
+
+No optional docs are required for normal agent execution yet.

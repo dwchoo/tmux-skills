@@ -1,0 +1,1018 @@
+#!/usr/bin/env python3
+"""Real-use E2E scenarios for tmux-skills managed workers."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CONTROL = ROOT / "scripts" / "tmux_control.py"
+HOOK = ROOT / "scripts" / "codex_tmux_hook.py"
+SKIP_EXIT_CODE = 77
+
+SMOKE_SCENARIOS = [
+    "idle-continuation",
+    "status-chain",
+    "status-chain-waits-for-busy-pane",
+    "concurrent-duplicate-race",
+    "preflight-strict",
+    "watch-visibility",
+]
+
+FULL_ONLY_SCENARIOS = [
+    "busy-pane-wait",
+    "status-fail-blocks",
+    "allow-duplicate",
+    "watch-duplicate-block",
+    "replace-same-job-only",
+    "cancel-active-queue",
+    "stale-gc-recovery",
+    "replace-rejects-foreign-pid",
+    "pane-missing-failure",
+]
+
+ALL_SCENARIOS = SMOKE_SCENARIOS + FULL_ONLY_SCENARIOS
+ACTIVE_MANAGED_STATUSES = {"starting", "running", "waiting", "waiting_status", "waiting_pane_idle"}
+
+
+def tmux_state_compatible_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+@dataclass
+class CommandResult:
+    args: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+    json_data: Any = None
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "args": self.args,
+            "returncode": self.returncode,
+            "stdout": self.stdout[-4000:],
+            "stderr": self.stderr[-4000:],
+            "json": self.json_data,
+        }
+
+
+class ScenarioFailure(Exception):
+    def __init__(self, scenario: str, step: str, message: str, command: CommandResult | None = None) -> None:
+        super().__init__(message)
+        self.scenario = scenario
+        self.step = step
+        self.message = message
+        self.command = command
+
+
+class Harness:
+    def __init__(self, *, keep_artifacts: bool = False) -> None:
+        self.keep_artifacts = keep_artifacts
+        self.base_dir = Path(tempfile.mkdtemp(prefix="tmux-skills-e2e-"))
+        self.workspace = self.base_dir / "workspace"
+        self.tmux_tmp = self.base_dir / "tmux"
+        self.workspace.mkdir()
+        self.tmux_tmp.mkdir()
+        self.session = f"tmux-skills-e2e-{os.getpid()}-{int(time.time() * 1000)}"
+        self.env = os.environ.copy()
+        self.env.pop("TMUX", None)
+        self.env["TMUX_TMPDIR"] = str(self.tmux_tmp)
+        self.env["PYTHONDONTWRITEBYTECODE"] = "1"
+        self.pane: str | None = None
+        self.jobs: list[str] = []
+        self.current_scenario = "setup"
+        self.last_command: CommandResult | None = None
+        self.removed_repo_artifacts: list[str] = []
+        self.remove_repo_runtime_artifacts()
+
+    def run(self, args: list[str], *, cwd: Path = ROOT, input_text: str | None = None) -> CommandResult:
+        result = subprocess.run(
+            args,
+            cwd=str(cwd),
+            env=self.env,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        parsed: Any = None
+        if result.stdout.strip():
+            try:
+                parsed = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                parsed = None
+        command = CommandResult(args=args, returncode=result.returncode, stdout=result.stdout, stderr=result.stderr, json_data=parsed)
+        self.last_command = command
+        return command
+
+    def control_args(self, args: list[str]) -> list[str]:
+        return [sys.executable, str(CONTROL), *args]
+
+    def popen_control(self, args: list[str]) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            self.control_args(args),
+            cwd=str(ROOT),
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def collect_process(self, proc: subprocess.Popen[str], args: list[str]) -> CommandResult:
+        stdout, stderr = proc.communicate()
+        parsed: Any = None
+        if stdout.strip():
+            try:
+                parsed = json.loads(stdout)
+            except json.JSONDecodeError:
+                parsed = None
+        command = CommandResult(
+            args=self.control_args(args),
+            returncode=proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            json_data=parsed,
+        )
+        self.last_command = command
+        return command
+
+    def require_success(self, command: CommandResult, *, step: str) -> CommandResult:
+        if command.returncode != 0:
+            raise ScenarioFailure(self.current_scenario, step, f"command failed with exit {command.returncode}", command)
+        return command
+
+    def control(self, args: list[str], *, step: str, check: bool = True) -> CommandResult:
+        command = self.run(self.control_args(args))
+        if check:
+            self.require_success(command, step=step)
+        return command
+
+    def hook_context(self, *, step: str) -> CommandResult:
+        command = self.run(
+            [
+                sys.executable,
+                str(HOOK),
+                "context",
+                "--event",
+                "UserPromptSubmit",
+                "--workspace",
+                str(self.workspace),
+            ],
+            input_text="{}",
+        )
+        self.require_success(command, step=step)
+        return command
+
+    def setup_tmux(self) -> None:
+        self.require_success(
+            self.run(
+                [
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    self.session,
+                    "-c",
+                    str(self.workspace),
+                    "env",
+                    "PS1=$ ",
+                    "bash",
+                    "--noprofile",
+                    "--norc",
+                ]
+            ),
+            step="tmux-new-session",
+        )
+        time.sleep(0.3)
+        panes = self.control(["list"], step="list-panes").json_data.get("panes", [])
+        candidates = [pane for pane in panes if pane.get("session_name") == self.session]
+        if not candidates:
+            raise ScenarioFailure(self.current_scenario, "find-pane", f"session pane not listed: {panes}")
+        self.pane = str(candidates[0]["pane_id"])
+
+    def tmux_send(self, command: str, *, step: str) -> None:
+        if not self.pane:
+            raise ScenarioFailure(self.current_scenario, step, "pane is not initialized")
+        self.require_success(self.run(["tmux", "send-keys", "-t", self.pane, command, "Enter"]), step=step)
+
+    def poll_until(self, label: str, timeout: float, predicate: Callable[[], Any]) -> Any:
+        deadline = time.monotonic() + timeout
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                value = predicate()
+            except Exception as exc:  # noqa: BLE001 - E2E diagnostics preserve arbitrary failures.
+                last_error = exc
+            else:
+                if value:
+                    return value
+            time.sleep(0.1)
+        detail = f"timed out after {timeout:.1f}s"
+        if last_error:
+            detail += f"; last error: {last_error}"
+        raise ScenarioFailure(self.current_scenario, label, detail, self.last_command)
+
+    def job_status(self, job_id: str, *, check: bool = False) -> dict[str, Any]:
+        command = self.control(
+            ["job", "status", "--job-id", job_id, "--workspace", str(self.workspace)],
+            step=f"job-status-{job_id}",
+            check=check,
+        )
+        return command.json_data or {}
+
+    def job_list(self) -> list[dict[str, Any]]:
+        command = self.control(["job", "list", "--workspace", str(self.workspace)], step="job-list", check=False)
+        data = command.json_data if isinstance(command.json_data, dict) else {}
+        jobs = data.get("jobs") or []
+        return jobs if isinstance(jobs, list) else []
+
+    def active_jobs(self) -> list[dict[str, Any]]:
+        return [
+            job
+            for job in self.job_list()
+            if str(job.get("status") or "") in ACTIVE_MANAGED_STATUSES and not job.get("stale")
+        ]
+
+    def cancel_active_jobs(self) -> None:
+        job_ids: list[str] = []
+        for job in self.active_jobs():
+            job_id = str(job.get("job_id") or "")
+            if job_id:
+                job_ids.append(job_id)
+        for job_id in self.jobs:
+            if job_id not in job_ids:
+                job_ids.append(job_id)
+        for job_id in reversed(job_ids):
+            self.control(["job", "cancel", "--job-id", job_id, "--workspace", str(self.workspace)], step=f"cancel-{job_id}", check=False)
+
+    def interrupt_pane(self) -> None:
+        if self.pane:
+            self.run(["tmux", "send-keys", "-t", self.pane, "C-c"])
+            time.sleep(0.2)
+
+    def before_scenario(self, name: str) -> None:
+        self.current_scenario = name
+        self.cancel_active_jobs()
+        self.interrupt_pane()
+
+    def after_scenario(self) -> None:
+        self.cancel_active_jobs()
+        self.interrupt_pane()
+
+    def start_queue_idle(self, job_id: str, command_text: str, *extra: str, check: bool = True) -> CommandResult:
+        self.jobs.append(job_id)
+        return self.control(
+            [
+                "queue-after-idle",
+                "--job-id",
+                job_id,
+                "--pane",
+                str(self.pane),
+                "--command",
+                command_text,
+                "--poll-seconds",
+                "0.1",
+                "--workspace",
+                str(self.workspace),
+                *extra,
+            ],
+            step=f"start-{job_id}",
+            check=check,
+        )
+
+    def wait_status(self, job_id: str, expected: str, *, timeout: float = 10.0) -> dict[str, Any]:
+        def check_status() -> dict[str, Any] | None:
+            data = self.job_status(job_id)
+            status = (data.get("status") or {}).get("status") or (data.get("record") or {}).get("status")
+            return data if status == expected else None
+
+        return self.poll_until(f"wait-{job_id}-{expected}", timeout, check_status)
+
+    def wait_file(self, path: Path, expected_text: str, *, timeout: float = 10.0) -> bool:
+        def check_file() -> bool:
+            return path.exists() and path.read_text(encoding="utf-8") == expected_text
+
+        return bool(self.poll_until(f"wait-file-{path.name}", timeout, check_file))
+
+    def state_tree(self) -> list[str]:
+        root = self.workspace / ".codex" / "tmux-skills"
+        if not root.exists():
+            return []
+        return sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file())[:100]
+
+    def pane_capture(self) -> str:
+        if not self.pane:
+            return ""
+        command = self.control(["capture", "--pane", self.pane, "--lines", "80", "--strip-ansi", "--max-chars", "4000"], step="pane-capture", check=False)
+        data = command.json_data if isinstance(command.json_data, dict) else {}
+        return str(data.get("output") or command.stdout)[-4000:]
+
+    def diagnostics(self, failure: ScenarioFailure) -> dict[str, Any]:
+        return {
+            "scenario": failure.scenario,
+            "step": failure.step,
+            "message": failure.message,
+            "command": failure.command.summary() if failure.command else None,
+            "workspace": str(self.workspace),
+            "state_dir": str(self.workspace / ".codex" / "tmux-skills"),
+            "session": self.session,
+            "pane": self.pane,
+            "pane_capture": self.pane_capture(),
+            "state_tree": self.state_tree(),
+            "jobs": {job_id: self.job_status(job_id) for job_id in self.jobs},
+        }
+
+    def repo_runtime_artifacts(self) -> list[str]:
+        artifacts: list[str] = []
+        ignored_parts = {".git"}
+        for path in ROOT.rglob("__pycache__"):
+            if path.is_dir() and not (set(path.relative_to(ROOT).parts) & ignored_parts):
+                artifacts.append(str(path.relative_to(ROOT)))
+        for path in ROOT.rglob("*.pyc"):
+            if path.is_file() and not (set(path.relative_to(ROOT).parts) & ignored_parts):
+                artifacts.append(str(path.relative_to(ROOT)))
+        return sorted(artifacts)
+
+    def remove_repo_runtime_artifacts(self) -> list[str]:
+        before = self.repo_runtime_artifacts()
+        for path in ROOT.rglob("*.pyc"):
+            if ".git" not in path.relative_to(ROOT).parts:
+                path.unlink(missing_ok=True)
+        for path in sorted(ROOT.rglob("__pycache__"), key=lambda item: len(item.parts), reverse=True):
+            if ".git" not in path.relative_to(ROOT).parts and path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+        self.removed_repo_artifacts.extend(item for item in before if item not in self.removed_repo_artifacts)
+        return before
+
+    def session_exists(self) -> bool:
+        return self.run(["tmux", "has-session", "-t", self.session]).returncode == 0
+
+    def cleanup(self, *, remove_artifacts: bool = True) -> dict[str, Any]:
+        self.cancel_active_jobs()
+        self.run(["tmux", "kill-session", "-t", self.session])
+        session_absent = not self.session_exists()
+        if remove_artifacts:
+            shutil.rmtree(self.base_dir, ignore_errors=True)
+        self.remove_repo_runtime_artifacts()
+        repo_artifacts = self.repo_runtime_artifacts()
+        temp_dir_removed = not self.base_dir.exists()
+        return {
+            "session_absent": session_absent,
+            "temp_dir_removed": temp_dir_removed,
+            "repo_runtime_artifacts": repo_artifacts,
+            "removed_repo_runtime_artifacts": self.removed_repo_artifacts,
+            "artifact_dir": str(self.base_dir),
+        }
+
+    def scenario_idle_continuation(self) -> dict[str, Any]:
+        self.current_scenario = "idle-continuation"
+        job_id = "idle-e2e"
+        output = self.workspace / "idle.out"
+        start = self.start_queue_idle(job_id, "printf idle-ok > idle.out")
+        self.wait_status(job_id, "submitted")
+        self.wait_file(output, "idle-ok")
+        record = self.job_status(job_id).get("record") or {}
+        for key in ("dedupe_key", "owner", "check_interval_seconds"):
+            if key not in record:
+                raise ScenarioFailure(self.current_scenario, "record-contract", f"missing record key: {key}")
+        return {"job_id": job_id, "status_path": start.json_data.get("status_path"), "output": str(output)}
+
+    def scenario_status_chain(self) -> dict[str, Any]:
+        self.current_scenario = "status-chain"
+        job_id = "status-e2e"
+        status_file = self.workspace / "status.tsv"
+        output = self.workspace / "status.out"
+        status_file.write_text("run_cfg\tstatus\nconfigs/msec.toml\trunning\n", encoding="utf-8")
+        self.jobs.append(job_id)
+        self.control(
+            [
+                "queue-after-status",
+                "--job-id",
+                job_id,
+                "--then-pane",
+                str(self.pane),
+                "--then-command",
+                "printf status-ok > status.out",
+                "--status-file",
+                "status.tsv",
+                "--require-row",
+                "run_cfg=configs/msec.toml,status=done",
+                "--interval",
+                "0.1",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="start-status-chain",
+        )
+        time.sleep(0.3)
+        if output.exists():
+            raise ScenarioFailure(self.current_scenario, "premature-submit", "status command ran before TSV was done")
+        status_file.write_text("run_cfg\tstatus\nconfigs/msec.toml\tdone\n", encoding="utf-8")
+        self.wait_status(job_id, "submitted")
+        self.wait_file(output, "status-ok")
+        return {"job_id": job_id, "output": str(output)}
+
+    def scenario_status_chain_waits_for_busy_pane(self) -> dict[str, Any]:
+        self.current_scenario = "status-chain-waits-for-busy-pane"
+        job_id = "status-busy-e2e"
+        status_file = self.workspace / "status-busy.tsv"
+        output = self.workspace / "status-busy.out"
+        status_file.write_text("run_cfg\tstatus\nconfigs/msec.toml\tdone\n", encoding="utf-8")
+        self.tmux_send("sleep 2.5", step="busy-pane")
+        time.sleep(0.2)
+        self.jobs.append(job_id)
+        self.control(
+            [
+                "queue-after-status",
+                "--job-id",
+                job_id,
+                "--pane",
+                str(self.pane),
+                "--command",
+                "printf status-busy-ok > status-busy.out",
+                "--status-file",
+                "status-busy.tsv",
+                "--require-row",
+                "run_cfg=configs/msec.toml,status=done",
+                "--poll-seconds",
+                "0.1",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="start-status-busy",
+        )
+        waiting = self.wait_status(job_id, "waiting_pane_idle", timeout=2.0)
+        if output.exists():
+            raise ScenarioFailure(self.current_scenario, "premature-submit", "status command ran while target pane was busy")
+        self.wait_status(job_id, "submitted", timeout=15.0)
+        self.wait_file(output, "status-busy-ok", timeout=15.0)
+        return {"job_id": job_id, "waiting_status": (waiting.get("status") or {}).get("status"), "output": str(output)}
+
+    def scenario_concurrent_duplicate_race(self) -> dict[str, Any]:
+        self.current_scenario = "concurrent-duplicate-race"
+        job_ids = ["race-a", "race-b"]
+        self.jobs.extend(job_ids)
+        self.tmux_send("sleep 3", step="busy-pane")
+        time.sleep(0.2)
+        base_args = [
+            "queue-after-idle",
+            "--pane",
+            str(self.pane),
+            "--command",
+            "printf race-ok > race.out",
+            "--poll-seconds",
+            "0.1",
+            "--workspace",
+            str(self.workspace),
+        ]
+        procs = [
+            self.popen_control([*base_args, "--job-id", job_ids[0], "--owner", "codex-a"]),
+            self.popen_control([*base_args, "--job-id", job_ids[1], "--owner", "codex-b"]),
+        ]
+        results = [
+            self.collect_process(procs[0], [*base_args, "--job-id", job_ids[0], "--owner", "codex-a"]),
+            self.collect_process(procs[1], [*base_args, "--job-id", job_ids[1], "--owner", "codex-b"]),
+        ]
+        started = [result for result in results if isinstance(result.json_data, dict) and result.json_data.get("started") is True]
+        duplicates = [
+            result
+            for result in results
+            if result.returncode == 2 and isinstance(result.json_data, dict) and result.json_data.get("duplicate") is True
+        ]
+        if len(started) != 1 or len(duplicates) != 1:
+            raise ScenarioFailure(
+                self.current_scenario,
+                "exactly-one-start",
+                f"expected one started and one duplicate; got {[result.summary() for result in results]}",
+            )
+        dedupe_key = started[0].json_data.get("dedupe_key")
+        active_same_key = [
+            job
+            for job in self.active_jobs()
+            if job.get("dedupe_key") == dedupe_key and str(job.get("status") or "") in ACTIVE_MANAGED_STATUSES
+        ]
+        if len(active_same_key) != 1:
+            raise ScenarioFailure(
+                self.current_scenario,
+                "active-record-count",
+                f"expected one active record for dedupe key; got {active_same_key}",
+            )
+        return {
+            "started_job_id": started[0].json_data.get("job_id"),
+            "duplicate_job_id": duplicates[0].json_data.get("job_id"),
+            "duplicate_exit_code": duplicates[0].returncode,
+            "active_job_id": active_same_key[0].get("job_id"),
+        }
+
+    def scenario_duplicate_block(self) -> dict[str, Any]:
+        self.current_scenario = "duplicate-block"
+        self.tmux_send("sleep 4", step="busy-pane")
+        time.sleep(0.2)
+        self.start_queue_idle("dup-first", "printf dup > dup.out", "--owner", "codex-a")
+        second = self.start_queue_idle("dup-second", "printf dup > dup.out", "--owner", "codex-b", check=False)
+        if second.returncode != 2 or not isinstance(second.json_data, dict) or not second.json_data.get("duplicate"):
+            raise ScenarioFailure(self.current_scenario, "duplicate-contract", "duplicate was not rejected with exit 2", second)
+        if second.json_data.get("existing_job_id") != "dup-first":
+            raise ScenarioFailure(self.current_scenario, "duplicate-existing", "wrong existing_job_id", second)
+        return {"duplicate_exit_code": second.returncode, "existing_job_id": second.json_data.get("existing_job_id")}
+
+    def scenario_preflight_strict(self) -> dict[str, Any]:
+        self.current_scenario = "preflight-strict"
+        scripts_dir = self.workspace / "scripts"
+        scripts_dir.mkdir()
+        script = scripts_dir / "mock_train.sh"
+        script.write_text("printf should-not-run > preflight.out\n", encoding="utf-8")
+        command = self.control(
+            [
+                "send",
+                "--pane",
+                str(self.pane),
+                "--command",
+                str(script),
+                "--enter",
+                "--strict-preflight",
+            ],
+            step="strict-preflight",
+            check=False,
+        )
+        data = command.json_data if isinstance(command.json_data, dict) else {}
+        if command.returncode != 2 or data.get("sent_to_pane") is not False:
+            raise ScenarioFailure(self.current_scenario, "strict-contract", "strict preflight did not reject send", command)
+        if (self.workspace / "preflight.out").exists():
+            raise ScenarioFailure(self.current_scenario, "preflight-output", "non-executable script was run")
+        return {"returncode": command.returncode, "reason": data.get("reason")}
+
+    def scenario_watch_visibility(self) -> dict[str, Any]:
+        self.current_scenario = "watch-visibility"
+        job_id = "watch-e2e"
+        self.jobs.append(job_id)
+        self.control(
+            [
+                "watch",
+                "--job-id",
+                job_id,
+                "--pane",
+                str(self.pane),
+                "--interval",
+                "0.1",
+                "--timeout-seconds",
+                "0.8",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="start-watch",
+        )
+
+        def hook_has_job() -> bool:
+            data = self.hook_context(step="hook-context").json_data or {}
+            context = ((data.get("hookSpecificOutput") or {}).get("additionalContext") or "")
+            return f"managed job {job_id}: running" in context
+
+        self.poll_until("hook-active-watch", 3.0, hook_has_job)
+        self.wait_status(job_id, "timeout", timeout=5.0)
+        status = self.job_status(job_id).get("status") or {}
+        log_path = Path(str(status.get("log_path") or ""))
+        if not log_path.exists():
+            raise ScenarioFailure(self.current_scenario, "watch-log", "watch log was not written")
+        return {"job_id": job_id, "log_path": str(log_path)}
+
+    def scenario_busy_pane_wait(self) -> dict[str, Any]:
+        self.current_scenario = "busy-pane-wait"
+        output = self.workspace / "busy.out"
+        self.tmux_send("sleep 2", step="busy-pane")
+        time.sleep(0.2)
+        self.start_queue_idle("busy-e2e", "printf busy-ok > busy.out")
+        time.sleep(0.5)
+        if output.exists():
+            raise ScenarioFailure(self.current_scenario, "premature-submit", "command submitted while pane was busy")
+        self.wait_status("busy-e2e", "submitted", timeout=15.0)
+        self.wait_file(output, "busy-ok")
+        return {"job_id": "busy-e2e", "output": str(output)}
+
+    def scenario_status_fail_blocks(self) -> dict[str, Any]:
+        self.current_scenario = "status-fail-blocks"
+        job_id = "status-fail-e2e"
+        status_file = self.workspace / "fail.tsv"
+        output = self.workspace / "fail.out"
+        status_file.write_text("run_cfg\tstatus\nconfigs/msec.toml\trunning\n", encoding="utf-8")
+        self.jobs.append(job_id)
+        self.control(
+            [
+                "queue-after-status",
+                "--job-id",
+                job_id,
+                "--pane",
+                str(self.pane),
+                "--command",
+                "printf fail-bad > fail.out",
+                "--status-file",
+                "fail.tsv",
+                "--require-row",
+                "run_cfg=configs/msec.toml,status=done",
+                "--fail-row",
+                "run_cfg=configs/msec.toml,status=failed",
+                "--poll-seconds",
+                "0.1",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="start-status-fail",
+        )
+        status_file.write_text("run_cfg\tstatus\nconfigs/msec.toml\tfailed\n", encoding="utf-8")
+        self.wait_status(job_id, "failed")
+        if output.exists():
+            raise ScenarioFailure(self.current_scenario, "fail-output", "fail condition still submitted command")
+        status = self.job_status(job_id).get("status") or {}
+        return {"job_id": job_id, "matched_fail_rows": status.get("matched_fail_rows")}
+
+    def scenario_allow_duplicate(self) -> dict[str, Any]:
+        self.current_scenario = "allow-duplicate"
+        self.tmux_send("sleep 4", step="busy-pane")
+        time.sleep(0.2)
+        self.start_queue_idle("allow-first", "printf allow > allow.out")
+        second = self.start_queue_idle("allow-second", "printf allow > allow.out", "--allow-duplicate")
+        record = (second.json_data or {}).get("record") or {}
+        if record.get("duplicate_allowed") is not True or record.get("duplicate_of") != "allow-first":
+            raise ScenarioFailure(self.current_scenario, "allow-contract", "duplicate metadata missing", second)
+        return {"duplicate_of": record.get("duplicate_of")}
+
+    def scenario_watch_duplicate_block(self) -> dict[str, Any]:
+        self.current_scenario = "watch-duplicate-block"
+        first_id = "watch-dupe-first"
+        second_id = "watch-dupe-second"
+        allowed_id = "watch-dupe-allowed"
+        status_file = self.workspace / "watch-dupe.status"
+        status_file.write_text("watching\n", encoding="utf-8")
+        self.jobs.extend([first_id, second_id, allowed_id])
+        self.control(
+            [
+                "watch",
+                "--job-id",
+                first_id,
+                "--pane",
+                str(self.pane),
+                "--interval",
+                "0.2",
+                "--timeout-seconds",
+                "5",
+                "--status-file",
+                "watch-dupe.status",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="watch-dupe-first",
+        )
+        second = self.control(
+            [
+                "watch",
+                "--job-id",
+                second_id,
+                "--pane",
+                str(self.pane),
+                "--interval",
+                "0.2",
+                "--timeout-seconds",
+                "5",
+                "--status-file",
+                "watch-dupe.status",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="watch-dupe-second",
+            check=False,
+        )
+        if second.returncode != 2 or not (isinstance(second.json_data, dict) and second.json_data.get("duplicate")):
+            raise ScenarioFailure(self.current_scenario, "watch-duplicate-contract", "watch duplicate was not rejected", second)
+        allowed = self.control(
+            [
+                "watch",
+                "--job-id",
+                allowed_id,
+                "--pane",
+                str(self.pane),
+                "--interval",
+                "0.2",
+                "--timeout-seconds",
+                "5",
+                "--status-file",
+                "watch-dupe.status",
+                "--workspace",
+                str(self.workspace),
+                "--allow-duplicate",
+            ],
+            step="watch-dupe-allowed",
+        )
+        record = (allowed.json_data or {}).get("record") or {}
+        if record.get("duplicate_allowed") is not True or record.get("duplicate_of") != first_id:
+            raise ScenarioFailure(self.current_scenario, "watch-allow-contract", "watch allow-duplicate metadata missing", allowed)
+        return {"duplicate_exit_code": second.returncode, "duplicate_of": record.get("duplicate_of")}
+
+    def scenario_replace_same_job_only(self) -> dict[str, Any]:
+        self.current_scenario = "replace-same-job-only"
+        output = self.workspace / "replace.out"
+        self.tmux_send("sleep 2", step="busy-pane-same")
+        time.sleep(0.2)
+        self.start_queue_idle("replace-job", "printf first > replace.out")
+        self.start_queue_idle("replace-job", "printf second > replace.out", "--replace")
+        self.wait_status("replace-job", "submitted", timeout=15.0)
+        self.wait_file(output, "second", timeout=15.0)
+
+        self.tmux_send("sleep 4", step="busy-pane-different")
+        time.sleep(0.2)
+        self.start_queue_idle("replace-first", "printf same > replace-dupe.out")
+        second = self.start_queue_idle("replace-second", "printf same > replace-dupe.out", "--replace", check=False)
+        if second.returncode != 2 or not (isinstance(second.json_data, dict) and second.json_data.get("duplicate")):
+            raise ScenarioFailure(self.current_scenario, "replace-different-contract", "different job id was not duplicate-rejected", second)
+        return {"same_job_output": output.read_text(encoding="utf-8"), "different_job_exit": second.returncode}
+
+    def scenario_cancel_active_queue(self) -> dict[str, Any]:
+        self.current_scenario = "cancel-active-queue"
+        job_id = "cancel-e2e"
+        output = self.workspace / "cancel.out"
+        self.tmux_send("sleep 5", step="busy-pane")
+        time.sleep(0.2)
+        self.start_queue_idle(job_id, "printf should-not-run > cancel.out")
+        self.wait_status(job_id, "waiting_pane_idle", timeout=5.0)
+        cancelled = self.control(["job", "cancel", "--job-id", job_id, "--workspace", str(self.workspace)], step="cancel-active")
+        if not (cancelled.json_data or {}).get("cancelled"):
+            raise ScenarioFailure(self.current_scenario, "cancel-contract", "job cancel did not report cancelled", cancelled)
+
+        def stopped() -> dict[str, Any] | None:
+            data = self.job_status(job_id)
+            status = (data.get("status") or {}).get("status") or (data.get("record") or {}).get("status")
+            return data if status == "cancelled" and data.get("pid_running") is False else None
+
+        final_status = self.poll_until("cancel-pid-stopped", 5.0, stopped)
+        if output.exists():
+            raise ScenarioFailure(self.current_scenario, "cancel-output", "cancelled queue still submitted the command")
+        return {
+            "job_id": job_id,
+            "status": (final_status.get("status") or {}).get("status"),
+            "pid_running": final_status.get("pid_running"),
+        }
+
+    def scenario_stale_gc_recovery(self) -> dict[str, Any]:
+        self.current_scenario = "stale-gc-recovery"
+        seed_id = "stale-seed"
+        stale_id = "stale-old"
+        self.start_queue_idle(seed_id, "printf stale > stale.out")
+        self.wait_status(seed_id, "submitted")
+        seed_record_path = self.workspace / ".codex" / "tmux-skills" / "jobs" / f"{seed_id}.json"
+        seed_record = json.loads(seed_record_path.read_text(encoding="utf-8"))
+
+        record_path = self.workspace / ".codex" / "tmux-skills" / "jobs" / f"{stale_id}.json"
+        record = dict(seed_record)
+        old = "2000-01-01T00:00:00Z"
+        record.update(
+            {
+                "job_id": stale_id,
+                "status": "waiting_pane_idle",
+                "pid": 0,
+                "heartbeat_at": old,
+                "updated_at": old,
+                "created_at": old,
+                "check_interval_seconds": 1,
+                "status_path": str(self.workspace / ".codex" / "tmux-skills" / "status" / f"{stale_id}.json"),
+                "log_path": str(self.workspace / ".codex" / "tmux-skills" / "logs" / f"{stale_id}.log"),
+            }
+        )
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        dry = self.control(["job", "gc", "--stale", "--dry-run", "--workspace", str(self.workspace)], step="gc-dry-run")
+        stale_jobs = (dry.json_data or {}).get("stale_jobs") or []
+        if not any(job.get("job_id") == stale_id for job in stale_jobs):
+            raise ScenarioFailure(self.current_scenario, "gc-dry-run-contract", "stale job not reported", dry)
+        self.control(["job", "gc", "--stale", "--workspace", str(self.workspace)], step="gc-mark")
+        marked = json.loads(record_path.read_text(encoding="utf-8"))
+        if marked.get("status") != "stale":
+            raise ScenarioFailure(self.current_scenario, "gc-mark-contract", "stale job was not marked")
+        new = self.start_queue_idle("stale-new", "printf stale > stale.out")
+        if not (new.json_data or {}).get("started"):
+            raise ScenarioFailure(self.current_scenario, "stale-recreate", "same dedupe was not reusable after stale gc", new)
+        return {"old_status": marked.get("status"), "new_job": "stale-new"}
+
+    def scenario_replace_rejects_foreign_pid(self) -> dict[str, Any]:
+        self.current_scenario = "replace-rejects-foreign-pid"
+        job_id = "foreign-pid-e2e"
+        self.jobs.append(job_id)
+        foreign = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            record_path = self.workspace / ".codex" / "tmux-skills" / "jobs" / f"{job_id}.json"
+            record_path.parent.mkdir(parents=True, exist_ok=True)
+            now = tmux_state_compatible_now()
+            record = {
+                "version": 1,
+                "job_id": job_id,
+                "kind": "queue-after-idle",
+                "status": "waiting_pane_idle",
+                "pid": foreign.pid,
+                "pane_id": str(self.pane),
+                "workspace": str(self.workspace),
+                "state_dir": str(self.workspace / ".codex" / "tmux-skills"),
+                "status_path": str(self.workspace / ".codex" / "tmux-skills" / "status" / f"{job_id}.json"),
+                "log_path": str(self.workspace / ".codex" / "tmux-skills" / "logs" / f"{job_id}.log"),
+                "created_at": now,
+                "updated_at": now,
+                "heartbeat_at": now,
+                "check_interval_seconds": 1,
+            }
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            result = self.start_queue_idle(job_id, "printf foreign > foreign.out", "--replace", check=False)
+            data = result.json_data if isinstance(result.json_data, dict) else {}
+            reason = str(data.get("reason") or "")
+            if result.returncode != 2 or data.get("started") is not False or "no longer looks like this tmux-skills worker" not in reason:
+                raise ScenarioFailure(self.current_scenario, "foreign-pid-contract", "foreign pid replace was not rejected safely", result)
+            if foreign.poll() is not None:
+                raise ScenarioFailure(self.current_scenario, "foreign-pid-still-running", "foreign process was killed by --replace")
+            return {"job_id": job_id, "foreign_pid": foreign.pid, "reason": reason}
+        finally:
+            if foreign.poll() is None:
+                foreign.terminate()
+                try:
+                    foreign.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    foreign.kill()
+                    foreign.wait(timeout=5)
+
+    def scenario_pane_missing_failure(self) -> dict[str, Any]:
+        self.current_scenario = "pane-missing-failure"
+        job_id = "missing-pane-e2e"
+        self.jobs.append(job_id)
+        self.control(
+            [
+                "queue-after-idle",
+                "--job-id",
+                job_id,
+                "--pane",
+                "%999999",
+                "--command",
+                "printf missing > missing.out",
+                "--poll-seconds",
+                "0.1",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="start-missing-pane",
+        )
+        self.wait_status(job_id, "failed", timeout=5.0)
+        if (self.workspace / "missing.out").exists():
+            raise ScenarioFailure(self.current_scenario, "missing-output", "missing pane command produced output")
+        return {"job_id": job_id, "status": "failed"}
+
+
+SCENARIO_METHODS = {
+    "idle-continuation": Harness.scenario_idle_continuation,
+    "status-chain": Harness.scenario_status_chain,
+    "status-chain-waits-for-busy-pane": Harness.scenario_status_chain_waits_for_busy_pane,
+    "concurrent-duplicate-race": Harness.scenario_concurrent_duplicate_race,
+    "duplicate-block": Harness.scenario_duplicate_block,
+    "preflight-strict": Harness.scenario_preflight_strict,
+    "watch-visibility": Harness.scenario_watch_visibility,
+    "busy-pane-wait": Harness.scenario_busy_pane_wait,
+    "status-fail-blocks": Harness.scenario_status_fail_blocks,
+    "allow-duplicate": Harness.scenario_allow_duplicate,
+    "watch-duplicate-block": Harness.scenario_watch_duplicate_block,
+    "replace-same-job-only": Harness.scenario_replace_same_job_only,
+    "cancel-active-queue": Harness.scenario_cancel_active_queue,
+    "stale-gc-recovery": Harness.scenario_stale_gc_recovery,
+    "replace-rejects-foreign-pid": Harness.scenario_replace_rejects_foreign_pid,
+    "pane-missing-failure": Harness.scenario_pane_missing_failure,
+}
+
+
+def selected_scenarios(value: str) -> list[str]:
+    if value == "smoke":
+        return list(SMOKE_SCENARIOS)
+    if value == "all":
+        return list(ALL_SCENARIOS)
+    return [value]
+
+
+def skip_result(json_output: bool) -> int:
+    payload = {"status": "skipped", "reason": "tmux is not installed or not on PATH"}
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"SKIP: {payload['reason']}")
+    return SKIP_EXIT_CODE
+
+
+def run_scenarios(names: list[str], *, keep_artifacts: bool) -> tuple[int, dict[str, Any]]:
+    harness = Harness(keep_artifacts=keep_artifacts)
+    results: list[dict[str, Any]] = []
+    status = "passed"
+    exit_code = 0
+    cleanup_info: dict[str, Any] | None = None
+    try:
+        harness.setup_tmux()
+        for name in names:
+            method = SCENARIO_METHODS[name]
+            started = time.monotonic()
+            try:
+                harness.before_scenario(name)
+                detail = method(harness)
+                harness.after_scenario()
+                results.append({"scenario": name, "status": "passed", "elapsed_seconds": round(time.monotonic() - started, 3), "detail": detail})
+            except ScenarioFailure as exc:
+                status = "failed"
+                exit_code = 1
+                results.append({"scenario": name, "status": "failed", "elapsed_seconds": round(time.monotonic() - started, 3), "failure": harness.diagnostics(exc)})
+                break
+    finally:
+        if status == "passed" or not keep_artifacts:
+            cleanup_info = harness.cleanup(remove_artifacts=True)
+        else:
+            harness.cancel_active_jobs()
+            harness.run(["tmux", "kill-session", "-t", harness.session])
+            harness.remove_repo_runtime_artifacts()
+            cleanup_info = {
+                "session_absent": not harness.session_exists(),
+                "temp_dir_removed": False,
+                "repo_runtime_artifacts": harness.repo_runtime_artifacts(),
+                "removed_repo_runtime_artifacts": harness.removed_repo_artifacts,
+                "artifact_dir": str(harness.base_dir),
+            }
+
+    if status == "passed" and cleanup_info:
+        cleanup_errors: list[str] = []
+        if not cleanup_info.get("session_absent"):
+            cleanup_errors.append("test tmux session still exists")
+        if not cleanup_info.get("temp_dir_removed"):
+            cleanup_errors.append("temp directory still exists")
+        if cleanup_info.get("repo_runtime_artifacts"):
+            cleanup_errors.append(f"repo runtime artifacts remain: {cleanup_info['repo_runtime_artifacts']}")
+        if cleanup_errors:
+            status = "failed"
+            exit_code = 1
+            results.append(
+                {
+                    "scenario": "e2e-cleanup-verification",
+                    "status": "failed",
+                    "elapsed_seconds": 0.0,
+                    "failure": {
+                        "scenario": "e2e-cleanup-verification",
+                        "step": "post-run-cleanup",
+                        "message": "; ".join(cleanup_errors),
+                        "cleanup": cleanup_info,
+                    },
+                }
+            )
+
+    return exit_code, {
+        "status": status,
+        "scenario_count": len(names),
+        "selected_scenarios": names,
+        "results": results,
+        "artifacts_kept": bool(keep_artifacts and cleanup_info and not cleanup_info.get("temp_dir_removed")),
+        "artifact_dir": str(harness.base_dir) if keep_artifacts and cleanup_info and not cleanup_info.get("temp_dir_removed") else None,
+        "cleanup": cleanup_info,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run real-use E2E scenarios for tmux-skills")
+    choices = ["smoke", "all", *SCENARIO_METHODS.keys()]
+    parser.add_argument("--scenario", choices=choices, default="smoke")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable summary")
+    parser.add_argument("--keep-artifacts", action="store_true", help="Keep temp artifacts after a failure")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if shutil.which("tmux") is None:
+        return skip_result(args.json)
+
+    names = selected_scenarios(args.scenario)
+    exit_code, summary = run_scenarios(names, keep_artifacts=args.keep_artifacts)
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    elif exit_code == 0:
+        print(f"PASS: {', '.join(names)}")
+    else:
+        failed = next((result for result in summary["results"] if result["status"] == "failed"), None)
+        print(json.dumps(failed or summary, indent=2, sort_keys=True))
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

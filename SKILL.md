@@ -17,8 +17,9 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 6. Send commands with `python scripts/tmux_control.py send --pane <pane_id> --command '<command>' --enter --require-idle-shell` unless the pane is explicitly intended to receive input while busy.
 7. Capture results with `python scripts/tmux_control.py capture --pane <pane_id> --lines 200`; add `--strip-ansi` for tqdm/color/control-heavy output.
 8. For long-running commands, use `python scripts/tmux_control.py run --pane <pane_id> --command '<command>'` so completion/failure is recorded under `.codex/tmux-skills`.
-9. Add resume-only follow-up instructions with `run --next-instruction TEXT` or `task add`.
-10. Summarize the important output and continue with code edits or further tmux commands only when the result supports it.
+9. For delayed checks or follow-up submissions, use managed `watch`, `queue-after-idle`, or `queue-after-status` instead of raw shell `sleep` watchers.
+10. Add resume-only follow-up instructions with `run --next-instruction TEXT` or `task add`.
+11. Summarize the important output and continue with code edits or further tmux commands only when the result supports it.
 
 ## Target Selection
 - Prefer the current tmux window only when `$TMUX` is set.
@@ -37,6 +38,7 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 - Use `send --no-enter` only when the user wants the command staged for review.
 - Use `send --enter` when the user has asked Codex to run the command.
 - Prefer `send --require-idle-shell` for user-selected panes; it refuses to send when the target is not an idle shell prompt or has child processes.
+- If `send` warns that a script is not executable, use `bash path/to/script.sh`, `--bash-if-not-executable`, or fix the executable bit deliberately.
 - Capture output before diagnosing failures, changing code, or claiming completion.
 - Use `capture --strip-ansi` for progress bars, colored output, or terminal-control-heavy logs.
 - Use `capture --max-chars N` when output is large; truncation happens after optional ANSI stripping.
@@ -51,6 +53,12 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 
 ## Long-Running Jobs and Hooks
 - `run` stores command files, logs, status JSON, and acknowledgements in `.codex/tmux-skills` by default.
+- Managed worker contracts are canonical in [docs/managed-workers.md](docs/managed-workers.md).
+- Real-use E2E coverage is canonical in [docs/real-use-e2e.md](docs/real-use-e2e.md).
+- `watch`, `queue-after-idle`, and `queue-after-status` store managed worker records in `.codex/tmux-skills/jobs`; inspect them with `watch list`, `watch status`, or `job status`.
+- Use `queue-after-idle` when the next command should run only after a busy pane returns to an idle shell.
+- Use `queue-after-status` when a status TSV must reach required row states before the next command is submitted.
+- Cancel managed background workers with `watch cancel --job-id ID` or `job cancel --job-id ID`.
 - `run --next-instruction` and `task add` store Codex instructions in `.codex/tmux-skills/tasks`; they do not execute while Codex is absent.
 - Codex hooks do not directly observe independent tmux jobs. Use `SessionStart`, `UserPromptSubmit`, and `Stop` command hooks to read status files.
 - `SessionStart` resume/compact context can expose ready follow-up tasks. A new startup should use explicit `task load --for-skill` instead of auto-running prior work.
@@ -74,6 +82,13 @@ python scripts/tmux_control.py spawn [--target SESSION:WINDOW] [--cwd PATH] [--v
 python scripts/tmux_control.py new-window --cwd PATH [--target SESSION] [--name NAME]
 python scripts/tmux_control.py send --pane PANE_ID --command TEXT [--require-idle-shell] [--enter|--no-enter]
 python scripts/tmux_control.py run --pane PANE_ID (--command TEXT|--command-file PATH) [--job-id ID] [--next-instruction TEXT]
+python scripts/tmux_control.py watch --job-id ID --pane PANE_ID [--interval N] [--capture-lines N]
+python scripts/tmux_control.py watch list|status|cancel [--job-id ID]
+python scripts/tmux_control.py queue-after-idle --job-id ID (--pane|--then-pane) PANE_ID (--command|--then-command) TEXT
+python scripts/tmux_control.py queue-after-status --job-id ID --status-file PATH --require-row KEY:VALUE (--pane|--then-pane) PANE_ID (--command|--then-command) TEXT
+python scripts/tmux_control.py job list|status|cancel|gc [--job-id ID]
+python scripts/e2e_real_use.py --scenario smoke
+python scripts/e2e_real_use.py --scenario all --json
 python scripts/tmux_control.py task load [--for-skill] [--json]
 python scripts/tmux_control.py task next [--json]
 python scripts/tmux_control.py task claim --task-id TASK_ID

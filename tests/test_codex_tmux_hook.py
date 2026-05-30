@@ -93,6 +93,27 @@ class CodexTmuxHookTests(unittest.TestCase):
         self.assertIn("Inspect the failed training log", stop["reason"])
         self.assertEqual(stored["status"], "waiting")
 
+    def test_context_includes_active_managed_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            tmux_state.atomic_write_json(
+                tmux_state.job_path(paths, "watch"),
+                {
+                    "job_id": "watch",
+                    "kind": "watch",
+                    "status": "running",
+                    "pane_id": "%1",
+                    "heartbeat_at": tmux_state.utc_now(),
+                    "updated_at": tmux_state.utc_now(),
+                },
+            )
+
+            output = self.run_hook(["context", "--event", "UserPromptSubmit", "--workspace", tmp], {})
+
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("managed job watch: running kind=watch pane=%1 heartbeat=", context)
+
 
 if __name__ == "__main__":
     unittest.main()

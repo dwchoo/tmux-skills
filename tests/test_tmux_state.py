@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import sys
@@ -89,6 +90,22 @@ class TmuxStateTests(unittest.TestCase):
             second["last_output"] = "second"
             second["event_id"] = tmux_state.terminal_event_id(second)
             self.assertFalse(tmux_state.is_acked(paths, second))
+
+    def test_managed_job_stale_reason_requires_active_and_old_heartbeat(self) -> None:
+        fresh = {
+            "job_id": "fresh",
+            "status": "waiting_status",
+            "pid": 0,
+            "heartbeat_at": tmux_state.utc_now(),
+            "check_interval_seconds": 1,
+        }
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds").replace("+00:00", "Z")
+        old = dict(fresh, job_id="old", heartbeat_at=old_time)
+        submitted = dict(old, status="submitted")
+
+        self.assertIsNone(tmux_state.managed_job_stale_reason(fresh, pid_running=False, pid_matches=False))
+        self.assertIn("heartbeat older", tmux_state.managed_job_stale_reason(old, pid_running=False, pid_matches=False) or "")
+        self.assertIsNone(tmux_state.managed_job_stale_reason(submitted, pid_running=False, pid_matches=False))
 
 
 if __name__ == "__main__":

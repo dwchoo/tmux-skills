@@ -1,0 +1,121 @@
+# Real-use E2E
+
+This document is the canonical reference for `scripts/e2e_real_use.py`.
+
+## Overview
+
+The real-use E2E harness validates managed worker behavior through the public `scripts/tmux_control.py` CLI and real tmux worker processes. It uses a temporary workspace, a temporary `TMUX_TMPDIR`, and an isolated tmux session. It does not target user tmux sessions or repository runtime state.
+
+## Commands
+
+```bash
+python3 scripts/e2e_real_use.py --scenario smoke
+python3 scripts/e2e_real_use.py --scenario all --json
+python3 scripts/e2e_real_use.py --scenario concurrent-duplicate-race --json
+python3 scripts/e2e_real_use.py --scenario idle-continuation --keep-artifacts
+```
+
+Options:
+
+- `--scenario smoke` runs the fast real-use set.
+- `--scenario all` runs smoke plus full-only lifecycle scenarios.
+- `--scenario <name>` runs one named scenario.
+- `--json` prints a machine-readable summary.
+- `--keep-artifacts` keeps the temporary workspace after a failure for debugging.
+
+## Scenario Groups
+
+Current code facts from `scripts/e2e_real_use.py`:
+
+- `smoke` has 6 scenarios.
+- `all` has 15 scenarios.
+- `all` is `smoke` plus the full-only scenarios.
+- Some scenarios are individually runnable but intentionally not part of `smoke` or `all`.
+
+Smoke scenarios:
+
+- `idle-continuation`
+- `status-chain`
+- `status-chain-waits-for-busy-pane`
+- `concurrent-duplicate-race`
+- `preflight-strict`
+- `watch-visibility`
+
+Full-only scenarios:
+
+- `busy-pane-wait`
+- `status-fail-blocks`
+- `allow-duplicate`
+- `watch-duplicate-block`
+- `replace-same-job-only`
+- `cancel-active-queue`
+- `stale-gc-recovery`
+- `replace-rejects-foreign-pid`
+- `pane-missing-failure`
+
+Individual-only scenarios:
+
+- `duplicate-block`: legacy sequential duplicate check retained for direct compatibility testing. The stronger concurrent duplicate race is part of `smoke`.
+
+## Scenario Matrix
+
+Each scenario runs against a temporary workspace, a temporary `TMUX_TMPDIR`, and an isolated tmux session. It calls `scripts/tmux_control.py` through subprocesses instead of importing internal functions.
+
+| Scenario | Workflow covered | Setup | Action | Required assertions |
+| --- | --- | --- | --- | --- |
+| `idle-continuation` | Queue a command after an already idle pane. | Start an isolated tmux pane and choose an output file. | Start `queue-after-idle` with a short `printf` command. | Job reaches `submitted`, output file is written, and the record includes `dedupe_key`, `owner`, and `check_interval_seconds`. |
+| `status-chain` | Queue a command after a status TSV reaches required rows. | Write a TSV with `running` status and no output file. | Start `queue-after-status`, verify no early output, then rewrite TSV to `done`. | Command is not submitted while status is `running`; after `done`, job reaches `submitted` and output file contains the expected text. |
+| `status-chain-waits-for-busy-pane` | Status-ready command waits for pane idle. | Put the pane in `sleep`, write the status TSV as already `done`, and choose an output file. | Start `queue-after-status` while the pane is busy. | Job reaches `waiting_pane_idle`, output file does not exist during sleep, then job reaches `submitted` after idle. |
+| `concurrent-duplicate-race` | Registry lock and dedupe under simultaneous CLI starts. | Put the pane in `sleep` so both queues remain active long enough to race. | Launch two `queue-after-idle` CLI subprocesses with the same pane and command but different job ids and owners. | Exactly one process returns `started: true`; exactly one exits `2` with `duplicate: true`; only one active record exists for the dedupe key. |
+| `duplicate-block` | Sequential duplicate reject compatibility path. | Put the pane in `sleep` and start a first active queue with owner A. | Start a second same-dedupe queue with owner B. | Second start exits `2`, JSON has `duplicate: true`, `existing_job_id` points to the first job, and the duplicate command must not submit. |
+| `preflight-strict` | Strict send preflight. | Create a non-executable `.sh` script that would write an output file if executed. | Call `send --strict-preflight --enter` with the script path. | Command exits `2`, JSON reports `sent_to_pane: false`, and the output file is absent. |
+| `watch-visibility` | Managed watch appears in hook context. | Start an isolated pane and a short-timeout `watch`. | Poll `codex_tmux_hook.py context` for active managed job text. | Hook context includes `managed job <id>: running`; after timeout, job reaches `timeout` and the watch log exists. |
+| `busy-pane-wait` | Queue after idle does not submit prematurely. | Put the pane in `sleep` and choose an output file. | Start `queue-after-idle` while the pane is busy. | Output file is absent during sleep; after idle, job reaches `submitted` and output is written. |
+| `status-fail-blocks` | Fail rows block queued submission. | Write a TSV with `running` status and configure both require and fail rows. | Start `queue-after-status`, then rewrite TSV to the fail status. | Job reaches `failed`, matched fail rows are recorded, and the command output file is absent. |
+| `allow-duplicate` | Intentional duplicate escape hatch. | Put the pane in `sleep` and start a first active queue. | Start a second queue with the same dedupe input plus `--allow-duplicate`. | Second job starts and its record contains `duplicate_allowed: true` and `duplicate_of` pointing to the first job. |
+| `watch-duplicate-block` | Watch dedupe contract. | Create a status file and start a first watch for the same pane/status-file pair. | Start a second watch without `--allow-duplicate`, then a third with `--allow-duplicate`. | Second watch exits `2` with `duplicate: true`; allowed watch starts and records duplicate metadata. |
+| `replace-same-job-only` | Replace semantics. | Start a queue with one job id, then start another queue with the same job id and `--replace`. | Wait for the replacement command to submit, then attempt `--replace` using a different job id but same dedupe input. | Same job id replacement runs the second command; different job id is duplicate-rejected with exit `2`. |
+| `cancel-active-queue` | User cancellation before delayed submission. | Put the pane in `sleep`, start a queue, and wait for `waiting_pane_idle`. | Call `job cancel --job-id <id>`. | Job reaches `cancelled`, `pid_running` becomes false, and the queued command output file is absent. |
+| `stale-gc-recovery` | Stale record marking and dedupe reuse. | Create a submitted seed record, then write a fake old active record with the same dedupe key and stale timestamps. | Run `job gc --stale --dry-run`, then `job gc --stale`, then recreate the same queue. | Dry run reports the stale job, GC marks it `stale`, and a new job with the same dedupe input can start. |
+| `replace-rejects-foreign-pid` | Foreign PID safety. | Start a live non-`tmux_queue.py` process and write a managed job record pointing at its PID. | Start the same job id with `--replace`. | Command exits `2`, reason says the PID no longer looks like this tmux-skills worker, and the foreign process remains alive until harness cleanup. |
+| `pane-missing-failure` | Missing pane terminal failure. | Use a pane id that should not resolve. | Start `queue-after-idle` targeting the missing pane. | Job reaches `failed` quickly and the queued command output file is absent. |
+
+## Scenario Design Rules
+
+- Prefer public CLI subprocesses over internal Python calls.
+- Keep each scenario independent by using temporary workspace state and unique job ids.
+- Make negative assertions explicit with consistent language: command must not submit, or output file is absent.
+- Verify state transitions, not just final files.
+- Use `smoke` for high-risk everyday flows and `all` for lifecycle, recovery, and safety edges.
+- Document individually runnable scenarios even when they are not included in `smoke` or `all`.
+- Keep scenario names stable because docs, JSON output, and developer workflows reference them directly.
+
+## Exit Codes
+
+- `0`: all selected scenarios passed.
+- `1`: at least one selected scenario failed.
+- `77`: `tmux` is not installed or is not on `PATH`; treat as skipped.
+
+## Diagnostics
+
+On failure, the harness reports:
+
+- Failing scenario and step.
+- Command arguments, stdout, stderr, return code, and parsed JSON when available.
+- Temporary workspace and state directory.
+- Isolated tmux session and pane id.
+- Recent pane capture.
+- Bounded state tree summary.
+- Managed job status details for jobs touched by the scenario.
+
+## Cleanup Verification
+
+Each scenario starts and ends with best-effort active job cancellation and pane interruption so one scenario does not leak work into the next.
+
+On success, the harness verifies:
+
+- The isolated tmux session is gone.
+- The temporary directory was removed.
+- The repository has no `__pycache__` or `.pyc` artifacts.
+
+The harness removes Python runtime artifacts before cleanup verification. When `--keep-artifacts` is used, artifacts are kept only after failure.

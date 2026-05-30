@@ -14,8 +14,9 @@ from typing import Any
 
 STATE_VERSION = 1
 TASK_VERSION = 2
-TERMINAL_STATUSES = {"succeeded", "failed", "matched", "timeout", "stopped"}
-RUNNING_STATUSES = {"pending", "running"}
+TERMINAL_STATUSES = {"succeeded", "failed", "matched", "timeout", "stopped", "submitted", "cancelled", "stale"}
+MANAGED_ACTIVE_STATUSES = {"starting", "running", "waiting", "waiting_status", "waiting_pane_idle"}
+RUNNING_STATUSES = {"pending", "running", "starting", "waiting", "waiting_status", "waiting_pane_idle"}
 TASK_STATUSES = {"waiting", "ready", "in_progress", "done", "blocked", "cancelled"}
 TASK_OPEN_STATUSES = {"waiting", "ready", "in_progress"}
 DEFAULT_STALE_SECONDS = 30 * 60
@@ -51,11 +52,12 @@ def state_paths(workspace: str | None = None, state_dir: str | None = None) -> d
         "status": root / "status",
         "acks": root / "acks",
         "tasks": root / "tasks",
+        "jobs": root / "jobs",
     }
 
 
 def ensure_state_dirs(paths: dict[str, Path]) -> None:
-    for key in ("commands", "logs", "status", "acks", "tasks"):
+    for key in ("commands", "logs", "status", "acks", "tasks", "jobs"):
         paths[key].mkdir(parents=True, exist_ok=True)
 
 
@@ -83,6 +85,14 @@ def ack_path(paths: dict[str, Path], event_id: str) -> Path:
 
 def task_path(paths: dict[str, Path], task_id: str) -> Path:
     return paths["tasks"] / f"{safe_id(task_id)}.json"
+
+
+def job_path(paths: dict[str, Path], job_id: str) -> Path:
+    return paths["jobs"] / f"{safe_id(job_id)}.json"
+
+
+def job_registry_lock_path(paths: dict[str, Path]) -> Path:
+    return paths["jobs"] / ".registry.lock"
 
 
 def read_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -262,6 +272,48 @@ def is_terminal(status: dict[str, Any]) -> bool:
     return str(status.get("status") or "") in TERMINAL_STATUSES
 
 
+def is_active_managed_job(record: dict[str, Any]) -> bool:
+    return str(record.get("status") or "") in MANAGED_ACTIVE_STATUSES
+
+
+def managed_job_interval_seconds(record: dict[str, Any]) -> float:
+    try:
+        interval = float(record.get("check_interval_seconds") or 0)
+    except (TypeError, ValueError):
+        interval = 0.0
+    return max(interval, 0.0)
+
+
+def managed_job_stale_threshold(record: dict[str, Any]) -> float:
+    return max(3.0 * managed_job_interval_seconds(record), 300.0)
+
+
+def managed_job_stale_reason(
+    record: dict[str, Any],
+    *,
+    pid_running: bool | None = None,
+    pid_matches: bool | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    if not is_active_managed_job(record):
+        return None
+
+    age = age_seconds(record.get("heartbeat_at") or record.get("updated_at"), now=now)
+    if age is None:
+        return "missing heartbeat"
+    threshold = managed_job_stale_threshold(record)
+    if age < threshold:
+        return None
+
+    if not record.get("pid"):
+        return f"heartbeat older than {int(threshold)}s and no pid recorded"
+    if pid_running is False:
+        return f"heartbeat older than {int(threshold)}s and pid is not running"
+    if pid_matches is False:
+        return f"heartbeat older than {int(threshold)}s and pid is not a tmux-skills worker"
+    return None
+
+
 def sort_key(status: dict[str, Any]) -> str:
     return str(status.get("ended_at") or status.get("updated_at") or status.get("started_at") or "")
 
@@ -363,6 +415,37 @@ def load_tasks(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     return tasks, errors
 
 
+def normalize_managed_job(record: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
+    job_id = str(record.get("job_id") or record.get("id") or (path.stem if path else "unknown"))
+    normalized = dict(record)
+    normalized.setdefault("version", STATE_VERSION)
+    normalized["job_id"] = job_id
+    normalized["id"] = job_id
+    normalized.setdefault("kind", "job")
+    normalized.setdefault("status", "unknown")
+    normalized.setdefault("pane_id", None)
+    normalized.setdefault("heartbeat_at", normalized.get("updated_at"))
+    normalized.setdefault("updated_at", normalized.get("heartbeat_at"))
+    normalized.setdefault("status_path", None)
+    normalized.setdefault("log_path", None)
+    normalized.setdefault("job_path", str(path) if path else None)
+    return normalized
+
+
+def load_managed_jobs(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    job_dir = root / "jobs"
+    jobs: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for path in sorted(job_dir.glob("*.json")):
+        data, error = read_json(path)
+        if error:
+            errors.append({"path": str(path), "error": error})
+            continue
+        if data:
+            jobs.append(normalize_managed_job(data, path))
+    return jobs, errors
+
+
 def write_task(paths: dict[str, Path], task: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_task(task)
     normalized["updated_at"] = utc_now()
@@ -444,22 +527,26 @@ def load_task_state(
     stale_seconds: int = DEFAULT_STALE_SECONDS,
 ) -> dict[str, Any]:
     statuses, status_errors = load_statuses_normalized(paths["root"])
+    jobs, job_errors = load_managed_jobs(paths["root"])
     tasks, task_errors = load_tasks(paths["root"])
     enriched_tasks = [task_with_effective_state(task, statuses, stale_seconds=stale_seconds) for task in tasks]
     statuses.sort(key=sort_key, reverse=True)
+    jobs.sort(key=lambda job: str(job.get("heartbeat_at") or job.get("updated_at") or ""), reverse=True)
     enriched_tasks.sort(key=lambda task: str(task.get("updated_at") or task.get("created_at") or ""))
     return {
         "workspace": str(paths["workspace"]),
         "state_dir": str(paths["root"]),
         "statuses": statuses,
+        "jobs": jobs,
         "tasks": enriched_tasks,
-        "errors": status_errors + task_errors,
+        "errors": status_errors + job_errors + task_errors,
     }
 
 
 def classify_task_state(state: dict[str, Any], *, max_items: int = 5) -> dict[str, Any]:
     tasks = list(state["tasks"])
     statuses = list(state["statuses"])
+    jobs = list(state.get("jobs", []))
     ready = [task for task in tasks if task.get("effective_status") == "ready"]
     running_tasks = [task for task in tasks if task.get("effective_status") == "in_progress" and not task.get("stale")]
     blocked = [
@@ -468,12 +555,13 @@ def classify_task_state(state: dict[str, Any], *, max_items: int = 5) -> dict[st
         if task.get("effective_status") in {"blocked", "cancelled"} or task.get("stale")
     ]
     running_statuses = [status for status in statuses if str(status.get("status") or "") in RUNNING_STATUSES]
+    active_jobs = [job for job in jobs if is_active_managed_job(job)]
     recent_jobs = [status for status in statuses if is_terminal(status)]
     return {
         "workspace": state["workspace"],
         "state_dir": state["state_dir"],
         "ready_tasks": ready[:max_items],
-        "running": (running_tasks + running_statuses)[:max_items],
+        "running": (running_tasks + running_statuses + active_jobs)[:max_items],
         "recent_jobs": recent_jobs[:max_items],
         "blocked": blocked[:max_items],
         "errors": state["errors"],
