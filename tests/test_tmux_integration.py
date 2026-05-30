@@ -107,6 +107,15 @@ class TmuxIntegrationTests(unittest.TestCase):
         current = self.run_control(["current", "--target", pane])
         self.assertEqual(Path(current["current"]["current_path"]).resolve(), self.workspace.resolve())
 
+    def test_new_window_outside_tmux_first_window_uses_requested_name(self) -> None:
+        result = self.run_control(
+            ["new-window", "--cwd", str(self.workspace), "--workspace", str(self.workspace), "--name", "requested-name"]
+        )
+        window_id = str(result["window_id"])
+        name = self.tmux(["display-message", "-p", "-t", window_id, "#{window_name}"]).stdout.strip()
+
+        self.assertEqual(name, "requested-name")
+
     def test_send_require_idle_shell_rejects_busy_pane(self) -> None:
         pane = self.start_session()
         output = self.workspace / "busy.out"

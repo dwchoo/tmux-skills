@@ -366,7 +366,7 @@ def ensure_managed_target(cwd: Path) -> tuple[str, str]:
     return session, f"{session}:{window_index}"
 
 
-def ensure_managed_session(workspace: Path, cwd: Path) -> tuple[str, str | None]:
+def ensure_managed_session(workspace: Path, cwd: Path, name: str | None = None) -> tuple[str, str | None]:
     session = workspace_session_name(workspace)
     if session_exists(session):
         return session, None
@@ -380,7 +380,7 @@ def ensure_managed_session(workspace: Path, cwd: Path) -> tuple[str, str | None]
             "-s",
             session,
             "-n",
-            "work",
+            name or "work",
             "-c",
             str(cwd),
         ]
@@ -440,7 +440,7 @@ def new_window(args: argparse.Namespace) -> dict[str, Any]:
     elif inside_tmux():
         target = run_tmux(["display-message", "-p", "#{session_name}"]).stdout.strip()
     else:
-        session, existing_window_id = ensure_managed_session(workspace, cwd)
+        session, existing_window_id = ensure_managed_session(workspace, cwd, args.name)
         tmpdir = tmux_tmpdir_value()
         attach_command = f"TMUX_TMPDIR={tmpdir} tmux attach -t {session}" if tmpdir else f"tmux attach -t {session}"
         target = session
@@ -722,7 +722,7 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
         require_idle_shell=args.require_idle_shell,
     )
     send_result = send(send_args)
-    return {
+    result = {
         "job_id": item_id,
         "attempt": attempt,
         "pane_id": args.pane,
@@ -735,6 +735,29 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
         "state_dir": str(paths["root"]),
         "next_task": next_task,
     }
+    if not send_result.get("sent_to_pane", False):
+        failed = tmux_state.build_status(
+            kind="job",
+            item_id=item_id,
+            attempt=attempt,
+            name=args.name,
+            status="failed",
+            pane_id=args.pane,
+            command_preview_text=tmux_state.command_preview(command_text),
+            cwd=str(cwd),
+            status_file=status_file,
+            log_file=log_file,
+            exit_code=1,
+            last_output=f"command was not sent to pane: {send_result.get('reason')}",
+        )
+        tmux_state.write_status(status_file, failed)
+        if next_task is not None:
+            next_task["status"] = "cancelled"
+            next_task["blocked_reason"] = "job command was not sent to pane"
+            next_task = tmux_state.write_task(paths, next_task)
+            result["next_task"] = next_task
+        result["status"] = "failed"
+    return result
 
 
 def monitor(args: argparse.Namespace) -> dict[str, Any]:
@@ -765,7 +788,7 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
     if args.timeout_seconds is not None:
         argv.extend(["--timeout-seconds", str(args.timeout_seconds)])
 
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=tmux_env())
     return {
         "monitor_id": monitor_id,
         "pid": proc.pid,
@@ -1147,7 +1170,7 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
                 command_path_value=command_path_value,
                 extra=record_extra,
             )
-            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=tmux_env())
             status = "running" if kind == "watch" else "waiting"
             record = write_managed_job_record(
                 paths,

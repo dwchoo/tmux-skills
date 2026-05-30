@@ -116,12 +116,75 @@ class TmuxControlTests(unittest.TestCase):
             self.assertIsNone(error)
             self.assertEqual(status["status"], "pending")
 
+    def test_run_send_failure_finalizes_status_and_cancels_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                pane="%0",
+                command_text="echo should-not-run",
+                command_file=None,
+                job_id="send failure",
+                name=None,
+                cwd=tmp,
+                workspace=tmp,
+                state_dir=None,
+                require_idle_shell=True,
+                next_instruction="inspect the failed job",
+                next_instruction_file=None,
+                next_on="succeeded",
+            )
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": False, "reason": "pane is busy"}):
+                result = tmux_control.run_job(args)
+
+            paths = tmux_state.state_paths(tmp)
+            status, error = tmux_state.read_json(tmux_state.status_path(paths, "send-failure"))
+            state = tmux_state.load_task_state(paths)
+
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIsNone(error)
+        assert status is not None
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["exit_code"], 1)
+        self.assertIn("pane is busy", status["last_output"])
+        self.assertEqual(len(state["tasks"]), 1)
+        task = state["tasks"][0]
+        self.assertEqual(task["status"], "cancelled")
+        self.assertEqual(task["blocked_reason"], "job command was not sent to pane")
+        self.assertNotEqual(task["effective_status"], "ready")
+
     def test_monitor_rejects_no_condition_in_main_parser_contract(self) -> None:
         parser = tmux_control.build_parser()
         args = parser.parse_args(["monitor", "--pane", "%1"])
         self.assertIsNone(args.match_regex)
         self.assertFalse(args.idle_shell)
         self.assertIsNone(args.timeout_seconds)
+
+    def test_monitor_spawns_worker_with_tmux_env(self) -> None:
+        class Proc:
+            pid = 12345
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                pane="%1",
+                poll_seconds=1.0,
+                lines=50,
+                match_regex=None,
+                idle_shell=False,
+                timeout_seconds=1.0,
+                workspace=tmp,
+                state_dir=None,
+            )
+            with mock.patch.object(tmux_control, "inside_tmux", return_value=False):
+                with mock.patch.dict(tmux_control.os.environ, {}, clear=True):
+                    with mock.patch.object(tmux_control.subprocess, "Popen", return_value=Proc()) as popen:
+                        result = tmux_control.monitor(args)
+
+        self.assertEqual(result["pid"], 12345)
+        self.assertEqual(popen.call_count, 1)
+        env = popen.call_args.kwargs.get("env")
+        self.assertIsNotNone(env)
+        assert env is not None
+        self.assertIn("TMUX_TMPDIR", env)
 
     def test_send_strict_preflight_refuses_non_executable_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
