@@ -11,28 +11,7 @@ import time
 from pathlib import Path
 
 import tmux_state
-
-
-ANSI_RE = re.compile(
-    r"(?:\x1B\][^\x07\x1B]*(?:\x07|\x1B\\))"
-    r"|(?:\x1B[P^_].*?\x1B\\)"
-    r"|(?:\x1B\[[0-?]*[ -/]*[@-~])"
-    r"|(?:\x1B[@-Z\\-_])",
-    re.DOTALL,
-)
-PROMPT_RE = re.compile("(?:[$#%]|\\u276f|\\u276e|\\u279c|\\u03bb)\\s*$")
-
-
-def strip_ansi(text: str) -> str:
-    return ANSI_RE.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
-
-
-def prompt_like(output: str) -> bool:
-    for line in reversed(strip_ansi(output).splitlines()):
-        stripped = line.strip()
-        if stripped:
-            return bool(PROMPT_RE.search(stripped))
-    return False
+from tmux_text import prompt_like, strip_ansi
 
 
 def capture_pane(pane: str, lines: int) -> str:

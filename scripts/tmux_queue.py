@@ -425,13 +425,25 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
                     command_text=command_text,
                     last_output="status requirements met; submitted command",
                     extra={**extra, "idle_shell_check": guard},
-            )
+                )
             extra["idle_shell_check"] = guard
             last_output = str(guard.get("reason") or "status met; waiting for idle shell")
             waiting_status = "waiting_pane_idle"
         else:
             last_output = f"matched {len(matched_required)}/{len(required)} required rows"
             waiting_status = "waiting_status"
+
+        write_worker_record(paths, args, kind=kind, status=waiting_status, command_text=command_text, extra=extra)
+        write_worker_status(
+            paths,
+            args,
+            kind=kind,
+            status=waiting_status,
+            started_at=started_at,
+            command_text=command_text,
+            last_output=last_output,
+            extra=extra,
+        )
 
         if args.timeout_seconds is not None and time.monotonic() - started >= args.timeout_seconds:
             write_worker_record(paths, args, kind=kind, status="timeout", command_text=command_text, extra=extra)
@@ -448,17 +460,6 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
             )
             return 1
 
-        write_worker_record(paths, args, kind=kind, status=waiting_status, command_text=command_text, extra=extra)
-        write_worker_status(
-            paths,
-            args,
-            kind=kind,
-            status=waiting_status,
-            started_at=started_at,
-            command_text=command_text,
-            last_output=last_output,
-            extra=extra,
-        )
         sleep_interruptibly(args.poll_seconds)
 
     write_worker_record(paths, args, kind=kind, status="cancelled", command_text=command_text)

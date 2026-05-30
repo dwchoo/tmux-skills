@@ -107,6 +107,34 @@ class TmuxQueueTests(unittest.TestCase):
         self.assertIn("waiting_status", statuses)
         self.assertIn("waiting_pane_idle", statuses)
 
+    def test_queue_after_status_records_waiting_pane_idle_before_timeout_when_already_timed_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status_file = Path(tmp) / "status.tsv"
+            status_file.write_text("configs/msec.toml\tdone\n", encoding="utf-8")
+            args = self.status_args(tmp, status_file, poll_seconds=0.001, timeout_seconds=0.0)
+            original_write = tmux_queue.write_worker_record
+            statuses: list[str] = []
+
+            def record_status(*call_args: object, **kwargs: object) -> dict[str, object]:
+                statuses.append(str(kwargs["status"]))
+                return original_write(*call_args, **kwargs)
+
+            guard = {"ok": False, "reason": "busy"}
+            with mock.patch.object(tmux_queue.tmux_control, "idle_shell_check", return_value=guard), mock.patch.object(
+                tmux_queue, "write_worker_record", side_effect=record_status
+            ):
+                code = tmux_queue.run_queue_after_status(args)
+
+            paths = tmux_state.state_paths(tmp)
+            status, error = tmux_state.read_json(tmux_state.status_path(paths, "queue"))
+
+        self.assertIsNone(error)
+        self.assertEqual(code, 1)
+        self.assertEqual(statuses[-2:], ["waiting_pane_idle", "timeout"])
+        self.assertEqual(status["status"], "timeout")
+        self.assertEqual(status["idle_shell_check"], guard)
+        self.assertEqual(status["matched_required_rows"], ["configs/msec.toml:done"])
+
     def test_watch_records_timeout_after_capture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args = argparse.Namespace(

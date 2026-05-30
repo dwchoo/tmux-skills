@@ -37,25 +37,41 @@ class TmuxIntegrationTests(unittest.TestCase):
         )
         self.tmp.cleanup()
 
-    def run_control(self, args: list[str]) -> dict[str, object]:
-        result = subprocess.run(
+    def tmux(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["tmux", *args],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=check,
+        )
+
+    def run_control_process(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
             [sys.executable, str(CONTROL), *args],
             cwd=str(ROOT),
             env=self.env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            check=True,
+            check=False,
         )
+
+    def run_control(self, args: list[str]) -> dict[str, object]:
+        result = self.run_control_process(args)
+        if result.returncode != 0:
+            self.fail(f"tmux_control failed with {result.returncode}: stdout={result.stdout!r} stderr={result.stderr!r}")
         return json.loads(result.stdout)
 
+    def start_session(self) -> str:
+        self.tmux(["new-session", "-d", "-s", self.session, "-c", str(self.workspace)])
+        return self.tmux(["display-message", "-p", "-t", self.session, "#{pane_id}"]).stdout.strip()
+
     def test_spawn_run_and_capture(self) -> None:
-        subprocess.run(
-            ["tmux", "new-session", "-d", "-s", self.session, "-c", str(self.workspace)],
-            env=self.env,
-            check=True,
-        )
-        pane = self.run_control(["spawn", "--target", f"{self.session}:1", "--cwd", str(self.workspace)])["pane_id"]
+        self.start_session()
+        target = self.tmux(["display-message", "-p", "-t", self.session, "#{session_name}:#{window_index}"]).stdout.strip()
+        pane = self.run_control(["spawn", "--target", target, "--cwd", str(self.workspace)])["pane_id"]
         run = self.run_control(
             [
                 "run",
@@ -90,6 +106,53 @@ class TmuxIntegrationTests(unittest.TestCase):
         pane = str(result["pane_id"])
         current = self.run_control(["current", "--target", pane])
         self.assertEqual(Path(current["current"]["current_path"]).resolve(), self.workspace.resolve())
+
+    def test_send_require_idle_shell_rejects_busy_pane(self) -> None:
+        pane = self.start_session()
+        output = self.workspace / "busy.out"
+        self.tmux(["send-keys", "-t", pane, "-l", "sleep 5"])
+        self.tmux(["send-keys", "-t", pane, "Enter"])
+        subprocess.run(["sleep", "0.2"], check=True)
+
+        result = self.run_control_process(
+            [
+                "send",
+                "--pane",
+                pane,
+                "--command",
+                "printf busy > busy.out",
+                "--require-idle-shell",
+                "--enter",
+            ]
+        )
+        data = json.loads(result.stdout)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(data["sent_to_pane"])
+        self.assertIn("reason", data)
+        self.assertFalse(output.exists())
+
+    def test_send_require_idle_shell_rejects_killed_pane(self) -> None:
+        pane = self.start_session()
+        self.tmux(["kill-pane", "-t", pane])
+
+        result = self.run_control_process(
+            [
+                "send",
+                "--pane",
+                pane,
+                "--command",
+                "printf missing > missing.out",
+                "--require-idle-shell",
+                "--enter",
+            ]
+        )
+        data = json.loads(result.stdout)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(data["sent_to_pane"])
+        self.assertEqual(data["reason"], "pane could not be resolved")
+        self.assertFalse((self.workspace / "missing.out").exists())
 
 
 if __name__ == "__main__":

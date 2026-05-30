@@ -22,9 +22,10 @@ from pathlib import Path
 from typing import Any
 
 import tmux_state
+from tmux_text import prompt_like, strip_ansi
 
 
-FIELD_SEP = "\t"
+FIELD_SEP = "\x1f"
 PANE_FIELDS = [
     "#{session_name}",
     "#{window_index}",
@@ -61,15 +62,9 @@ CURRENT_FIELDS = [
 ]
 PANE_FORMAT = FIELD_SEP.join(PANE_FIELDS)
 CURRENT_FORMAT = FIELD_SEP.join(CURRENT_FIELDS)
+SPAWN_FORMAT = FIELD_SEP.join(["#{session_name}", "#{window_id}", "#{pane_id}"])
+NEW_WINDOW_FORMAT = FIELD_SEP.join(["#{session_name}", "#{window_id}", "#{window_index}", "#{pane_id}"])
 SHELL_COMMANDS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "mksh"}
-ANSI_RE = re.compile(
-    r"(?:\x1B\][^\x07\x1B]*(?:\x07|\x1B\\))"  # OSC: titles, hyperlinks, etc.
-    r"|(?:\x1B[P^_].*?\x1B\\)"  # DCS/PM/APC string controls.
-    r"|(?:\x1B\[[0-?]*[ -/]*[@-~])"  # CSI controls, including colors/cursor movement.
-    r"|(?:\x1B[@-Z\\-_])",  # 7-bit C1/Fe controls.
-    re.DOTALL,
-)
-PROMPT_RE = re.compile("(?:[$#%]|\\u276f|\\u276e|\\u279c|\\u03bb)\\s*$")
 
 
 def default_tmux_tmpdir() -> Path:
@@ -415,7 +410,7 @@ def spawn(args: argparse.Namespace) -> dict[str, Any]:
             *size_args,
             "-P",
             "-F",
-            "#{session_name}\t#{window_id}\t#{pane_id}",
+            SPAWN_FORMAT,
             "-c",
             str(cwd),
             "-t",
@@ -471,7 +466,7 @@ def new_window(args: argparse.Namespace) -> dict[str, Any]:
             "-d",
             "-P",
             "-F",
-            "#{session_name}\t#{window_id}\t#{window_index}\t#{pane_id}",
+            NEW_WINDOW_FORMAT,
             *name_args,
             "-c",
             str(cwd),
@@ -493,26 +488,10 @@ def new_window(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def strip_ansi(text: str) -> str:
-    # capture-pane can include terminal control bytes in old scrollback; remove those and
-    # normalize carriage returns so progress bars are readable in JSON output.
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    return ANSI_RE.sub("", normalized)
-
-
 def capture_text(pane: str, lines: int, *, strip: bool = False) -> str:
     result = run_tmux(["capture-pane", "-p", "-t", pane, "-S", f"-{lines}"])
     output = result.stdout.rstrip("\n")
     return strip_ansi(output) if strip else output
-
-
-def prompt_like(output: str) -> bool:
-    for line in reversed(strip_ansi(output).splitlines()):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        return bool(PROMPT_RE.search(stripped))
-    return False
 
 
 def idle_shell_check(pane: str) -> dict[str, Any]:

@@ -18,6 +18,61 @@ import tmux_state
 
 
 class TmuxControlTests(unittest.TestCase):
+    def test_parse_current_line_preserves_tabs_inside_fields(self) -> None:
+        parts = [
+            "session",
+            "$1",
+            "3",
+            "@4",
+            "window\tname",
+            "%5",
+            "0",
+            "bash",
+            "/tmp/path\twith-tab",
+            "title\twith-tab",
+            "123",
+            "0",
+            "80",
+            "24",
+            "/dev/ttys001",
+        ]
+        with mock.patch.object(tmux_control, "descendant_processes", return_value=(0, [], 0)):
+            parsed = tmux_control.parse_current_line(tmux_control.FIELD_SEP.join(parts))
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed["window_name"], "window\tname")
+        self.assertEqual(parsed["current_path"], "/tmp/path\twith-tab")
+        self.assertEqual(parsed["title"], "title\twith-tab")
+
+    def test_parse_pane_line_preserves_tabs_inside_fields(self) -> None:
+        parts = [
+            "session",
+            "3",
+            "@4",
+            "window\tname",
+            "%5",
+            "0",
+            "1",
+            "bash",
+            "/tmp/path\twith-tab",
+            "title\twith-tab",
+            "123",
+            "0",
+            "80",
+            "24",
+            "/dev/ttys001",
+        ]
+        with mock.patch.object(tmux_control, "descendant_processes", return_value=(0, [], 0)):
+            parsed = tmux_control.parse_pane_line(tmux_control.FIELD_SEP.join(parts), current_pane_id="%5")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed["window_name"], "window\tname")
+        self.assertEqual(parsed["current_path"], "/tmp/path\twith-tab")
+        self.assertEqual(parsed["title"], "title\twith-tab")
+        self.assertTrue(parsed["current"])
+
     def test_capture_max_chars_after_strip(self) -> None:
         args = argparse.Namespace(pane="%1", lines=10, strip_ansi=True, max_chars=4)
         with mock.patch.object(tmux_control, "capture_text", return_value="abcdef"):

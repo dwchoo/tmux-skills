@@ -72,7 +72,9 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 - If a command may affect user data or external systems, state the risk and wait for confirmation.
 
 ## Helper Script
-Use `scripts/tmux_control.py` from the skill directory. The helper is self-contained so it can also be copied into a repository-local skill installation.
+Use `scripts/tmux_control.py` from the skill directory. The helper uses only the Python standard library, but it imports sibling modules and launches sibling worker scripts, so copy or sync the whole `scripts/` directory for repository-local skill installations.
+
+This quick reference lists common paths; run `python scripts/tmux_control.py COMMAND --help` for the complete flag set.
 
 ```bash
 python scripts/tmux_control.py list
@@ -80,13 +82,13 @@ python scripts/tmux_control.py current [--target TARGET]
 python scripts/tmux_control.py resolve [--target TARGET] [--current-window] [--pane-index N|--ordinal N]
 python scripts/tmux_control.py spawn [--target SESSION:WINDOW] [--cwd PATH] [--vertical|--horizontal] [--percent N]
 python scripts/tmux_control.py new-window --cwd PATH [--target SESSION] [--name NAME]
-python scripts/tmux_control.py send --pane PANE_ID --command TEXT [--require-idle-shell] [--enter|--no-enter]
+python scripts/tmux_control.py send --pane PANE_ID --command TEXT [--require-idle-shell] [--strict-preflight] [--bash-if-not-executable] [--enter|--no-enter]
 python scripts/tmux_control.py run --pane PANE_ID (--command TEXT|--command-file PATH) [--job-id ID] [--next-instruction TEXT]
-python scripts/tmux_control.py watch --job-id ID --pane PANE_ID [--interval N] [--capture-lines N]
+python scripts/tmux_control.py watch --job-id ID --pane PANE_ID [--interval N] [--capture-lines N] [--replace] [--allow-duplicate]
 python scripts/tmux_control.py watch list|status|cancel [--job-id ID]
-python scripts/tmux_control.py queue-after-idle --job-id ID (--pane|--then-pane) PANE_ID (--command|--then-command) TEXT
-python scripts/tmux_control.py queue-after-status --job-id ID --status-file PATH --require-row KEY:VALUE (--pane|--then-pane) PANE_ID (--command|--then-command) TEXT
-python scripts/tmux_control.py job list|status|cancel|gc [--job-id ID]
+python scripts/tmux_control.py queue-after-idle --job-id ID (--pane|--then-pane) PANE_ID (--command|--then-command) TEXT [--interval N|--poll-seconds N] [--then-require-idle-shell] [--replace] [--allow-duplicate]
+python scripts/tmux_control.py queue-after-status --job-id ID --status-file PATH --require-row KEY:VALUE|key=value,... (--pane|--then-pane) PANE_ID (--command|--then-command) TEXT [--interval N|--poll-seconds N] [--then-require-idle-shell] [--replace] [--allow-duplicate]
+python scripts/tmux_control.py job list|status|cancel|gc [--job-id ID] [--stale] [--dry-run]
 python scripts/e2e_real_use.py --scenario smoke
 python scripts/e2e_real_use.py --scenario all --json
 python scripts/tmux_control.py task load [--for-skill] [--json]
