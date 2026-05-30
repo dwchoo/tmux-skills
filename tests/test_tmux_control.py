@@ -152,6 +152,41 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(task["blocked_reason"], "job command was not sent to pane")
         self.assertNotEqual(task["effective_status"], "ready")
 
+    def test_run_send_exception_finalizes_status_and_cancels_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                pane="%999999",
+                command_text="echo should-not-run",
+                command_file=None,
+                job_id="send exception",
+                name=None,
+                cwd=tmp,
+                workspace=tmp,
+                state_dir=None,
+                require_idle_shell=True,
+                next_instruction="inspect the failed job",
+                next_instruction_file=None,
+                next_on="succeeded",
+            )
+            with mock.patch.object(tmux_control, "send", side_effect=SystemExit(1)):
+                with self.assertRaises(SystemExit):
+                    tmux_control.run_job(args)
+
+            paths = tmux_state.state_paths(tmp)
+            status, error = tmux_state.read_json(tmux_state.status_path(paths, "send-exception"))
+            state = tmux_state.load_task_state(paths)
+
+        self.assertIsNone(error)
+        assert status is not None
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["exit_code"], 1)
+        self.assertIn("command was not sent to pane", status["last_output"])
+        self.assertEqual(len(state["tasks"]), 1)
+        task = state["tasks"][0]
+        self.assertEqual(task["status"], "cancelled")
+        self.assertEqual(task["blocked_reason"], "job command was not sent to pane")
+        self.assertNotEqual(task["effective_status"], "ready")
+
     def test_monitor_rejects_no_condition_in_main_parser_contract(self) -> None:
         parser = tmux_control.build_parser()
         args = parser.parse_args(["monitor", "--pane", "%1"])

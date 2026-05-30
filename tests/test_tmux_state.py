@@ -107,6 +107,32 @@ class TmuxStateTests(unittest.TestCase):
         self.assertIn("heartbeat older", tmux_state.managed_job_stale_reason(old, pid_running=False, pid_matches=False) or "")
         self.assertIsNone(tmux_state.managed_job_stale_reason(submitted, pid_running=False, pid_matches=False))
 
+    def test_age_seconds_handles_naive_timestamp(self) -> None:
+        parsed = tmux_state.parse_time("2026-05-30T12:00:00")
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertIsNotNone(parsed.tzinfo.utcoffset(parsed))
+
+        now = datetime(2026, 5, 30, 12, 1, tzinfo=timezone.utc)
+        self.assertEqual(tmux_state.age_seconds("2026-05-30T12:00:00", now=now), 60.0)
+        self.assertIsNone(tmux_state.age_seconds("not a timestamp", now=now))
+
+    def test_stale_detection_with_naive_heartbeat(self) -> None:
+        now = datetime(2026, 5, 30, 12, 10, tzinfo=timezone.utc)
+        old_time = datetime(2026, 5, 30, 12, 0).isoformat(timespec="seconds")
+        record = {
+            "job_id": "old",
+            "status": "waiting_status",
+            "pid": 123,
+            "heartbeat_at": old_time,
+            "check_interval_seconds": 1,
+        }
+
+        reason = tmux_state.managed_job_stale_reason(record, pid_running=False, now=now)
+        self.assertIsInstance(reason, str)
+        self.assertIn("heartbeat older", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

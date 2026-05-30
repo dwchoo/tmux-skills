@@ -721,7 +721,40 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
         no_enter=False,
         require_idle_shell=args.require_idle_shell,
     )
-    send_result = send(send_args)
+
+    def finalize_send_failure(reason: Any, result: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        nonlocal next_task
+        failed = tmux_state.build_status(
+            kind="job",
+            item_id=item_id,
+            attempt=attempt,
+            name=args.name,
+            status="failed",
+            pane_id=args.pane,
+            command_preview_text=tmux_state.command_preview(command_text),
+            cwd=str(cwd),
+            status_file=status_file,
+            log_file=log_file,
+            exit_code=1,
+            last_output=f"command was not sent to pane: {reason}",
+        )
+        tmux_state.write_status(status_file, failed)
+        if next_task is not None:
+            next_task["status"] = "cancelled"
+            next_task["blocked_reason"] = "job command was not sent to pane"
+            next_task = tmux_state.write_task(paths, next_task)
+            if result is not None:
+                result["next_task"] = next_task
+        if result is not None:
+            result["status"] = "failed"
+        return result
+
+    try:
+        send_result = send(send_args)
+    except BaseException as exc:
+        finalize_send_failure(exc)
+        raise
+
     result = {
         "job_id": item_id,
         "attempt": attempt,
@@ -736,27 +769,7 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
         "next_task": next_task,
     }
     if not send_result.get("sent_to_pane", False):
-        failed = tmux_state.build_status(
-            kind="job",
-            item_id=item_id,
-            attempt=attempt,
-            name=args.name,
-            status="failed",
-            pane_id=args.pane,
-            command_preview_text=tmux_state.command_preview(command_text),
-            cwd=str(cwd),
-            status_file=status_file,
-            log_file=log_file,
-            exit_code=1,
-            last_output=f"command was not sent to pane: {send_result.get('reason')}",
-        )
-        tmux_state.write_status(status_file, failed)
-        if next_task is not None:
-            next_task["status"] = "cancelled"
-            next_task["blocked_reason"] = "job command was not sent to pane"
-            next_task = tmux_state.write_task(paths, next_task)
-            result["next_task"] = next_task
-        result["status"] = "failed"
+        finalize_send_failure(send_result.get("reason"), result)
     return result
 
 

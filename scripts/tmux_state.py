@@ -137,9 +137,12 @@ def parse_time(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if result.tzinfo is None or result.tzinfo.utcoffset(result) is None:
+        result = result.replace(tzinfo=timezone.utc)
+    return result
 
 
 def age_seconds(value: Any, *, now: datetime | None = None) -> float | None:
@@ -147,7 +150,10 @@ def age_seconds(value: Any, *, now: datetime | None = None) -> float | None:
     if not timestamp:
         return None
     current = now or datetime.now(timezone.utc)
-    return (current - timestamp).total_seconds()
+    try:
+        return (current - timestamp).total_seconds()
+    except TypeError:
+        return None
 
 
 def terminal_event_id(status: dict[str, Any]) -> str:
