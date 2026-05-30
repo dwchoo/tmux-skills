@@ -10,18 +10,20 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import tmux_control
 import tmux_state
 
+class WorkerTerminatedBySignal(BaseException):
+    """Raised from SIGTERM so worker cleanup can write terminal status."""
 
-STOP_REQUESTED = False
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        super().__init__(signum)
 
-
-def request_stop(signum: int, _frame: object) -> None:
-    global STOP_REQUESTED
-    STOP_REQUESTED = True
+def raise_worker_terminated(signum: int, _frame: object) -> None:
+    raise WorkerTerminatedBySignal(signum)
 
 
 def command_hash(command_text: str | None) -> str | None:
@@ -129,7 +131,7 @@ def write_worker_status(
 
 def sleep_interruptibly(seconds: float) -> None:
     deadline = time.monotonic() + max(0.0, seconds)
-    while not STOP_REQUESTED and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
         time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
 
 
@@ -211,6 +213,137 @@ def fail_worker(
     return 1
 
 
+def active_worker_state(record: dict[str, Any] | None, status: dict[str, Any] | None) -> bool:
+    states = [str(data.get("status") or "") for data in (record, status) if data]
+    if any(state in tmux_state.TERMINAL_STATUSES for state in states):
+        return False
+    return any(state in tmux_state.MANAGED_ACTIVE_STATUSES for state in states)
+
+
+def terminalize_active_worker(
+    paths: dict[str, Path],
+    args: argparse.Namespace,
+    *,
+    job_id: str,
+    terminal_status: str,
+    last_output: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    record_path = tmux_state.job_path(paths, job_id)
+    status_file = tmux_state.status_path(paths, job_id)
+    record, _record_error = tmux_state.read_json(record_path)
+    status, _status_error = tmux_state.read_json(status_file)
+    if not active_worker_state(record, status):
+        return
+
+    now = tmux_state.utc_now()
+    merged_extra = extra or {}
+    kind = str((record or {}).get("kind") or (status or {}).get("kind") or getattr(args, "action", None) or "job")
+    pane_id = (record or {}).get("pane_id") or (status or {}).get("pane_id") or getattr(args, "pane", None)
+    log_file = tmux_state.log_path(paths, job_id)
+
+    record_data = dict(record or {})
+    record_data.update(
+        {
+            "version": record_data.get("version", 1),
+            "job_id": job_id,
+            "kind": kind,
+            "status": terminal_status,
+            "pid": os.getpid(),
+            "pane_id": pane_id,
+            "status_path": str(status_file),
+            "log_path": str(log_file),
+            "workspace": str(paths["workspace"]),
+            "state_dir": str(paths["root"]),
+            "updated_at": now,
+            "heartbeat_at": now,
+            **merged_extra,
+        }
+    )
+    record_data.setdefault("created_at", now)
+    tmux_state.atomic_write_json(record_path, record_data)
+
+    if status:
+        status_data = dict(status)
+        status_data.update(
+            {
+                "status": terminal_status,
+                "exit_code": 1,
+                "updated_at": now,
+                "ended_at": now,
+                "last_output": tmux_state.tail_text(last_output),
+                **merged_extra,
+            }
+        )
+    else:
+        status_data = tmux_state.build_status(
+            kind=kind,
+            item_id=job_id,
+            attempt=1,
+            name=getattr(args, "name", None),
+            status=terminal_status,
+            pane_id=pane_id,
+            command_preview_text=str((record or {}).get("command_path") or kind),
+            cwd=str(paths["workspace"]),
+            status_file=status_file,
+            log_file=log_file,
+            started_at=(record or {}).get("created_at"),
+            exit_code=1,
+            last_output=last_output,
+        )
+        status_data.update(merged_extra)
+    tmux_state.write_status(status_file, status_data)
+
+
+def safety_cancel_last_output(args: argparse.Namespace) -> str:
+    if getattr(args, "action", None) == "watch":
+        return "watch cancelled"
+    return "cancelled before command submission"
+
+
+def run_worker_safely(
+    args: argparse.Namespace,
+    paths: dict[str, Path],
+    job_id: str,
+    worker: Callable[[argparse.Namespace], int],
+) -> int:
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGTERM, raise_worker_terminated)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        return worker(args)
+    except WorkerTerminatedBySignal:
+        try:
+            terminalize_active_worker(
+                paths,
+                args,
+                job_id=job_id,
+                terminal_status="cancelled",
+                last_output=safety_cancel_last_output(args),
+            )
+        except BaseException:
+            pass
+        return 1
+    except BaseException as exc:
+        try:
+            last_output = f"worker aborted: {exc!r}"
+            terminalize_active_worker(
+                paths,
+                args,
+                job_id=job_id,
+                terminal_status="failed",
+                last_output=last_output,
+                extra={"error": last_output},
+            )
+        except BaseException:
+            pass
+        return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
+
+
 def pane_missing(guard: dict[str, Any]) -> bool:
     return guard.get("ok") is False and str(guard.get("reason") or "") == "pane could not be resolved"
 
@@ -278,7 +411,7 @@ def run_queue_after_idle(args: argparse.Namespace) -> int:
     kind = "queue-after-idle"
     write_worker_record(paths, args, kind=kind, status="waiting_pane_idle", command_text=command_text)
 
-    while not STOP_REQUESTED:
+    while True:
         try:
             guard = tmux_control.idle_shell_check(args.pane)
         except Exception as exc:
@@ -365,7 +498,7 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
     fail_rows = args.fail_row or []
     write_worker_record(paths, args, kind=kind, status="waiting_status", command_text=command_text, extra={"observed_status_file": str(observed_file)})
 
-    while not STOP_REQUESTED:
+    while True:
         rows = status_rows(observed_file) if observed_file else []
         matched_required = specs_matching(rows, required)
         matched_failed = specs_matching(rows, fail_rows)
@@ -486,7 +619,7 @@ def run_watch(args: argparse.Namespace) -> int:
     log_file = tmux_state.log_path(paths, args.job_id)
     write_worker_record(paths, args, kind=kind, status="running", extra={"observed_status_file": str(observed_file) if observed_file else None})
 
-    while not STOP_REQUESTED:
+    while True:
         try:
             output = tmux_control.capture_text(args.pane, args.capture_lines, strip=True)
         except Exception as exc:
@@ -601,21 +734,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
     args = build_parser().parse_args()
     if args.action in {"queue-after-idle", "queue-after-status"} and not (args.command_text or args.command_file):
         print(f"{args.action} requires --command or --command-file", file=sys.stderr)
         raise SystemExit(2)
+    paths = tmux_state.state_paths(args.workspace, args.state_dir)
+    job_id = tmux_state.safe_id(args.job_id)
     if args.action == "queue-after-idle":
-        raise SystemExit(run_queue_after_idle(args))
+        raise SystemExit(run_worker_safely(args, paths, job_id, run_queue_after_idle))
     if args.action == "queue-after-status":
         if not args.require_row:
             print("queue-after-status requires at least one --require-row", file=sys.stderr)
             raise SystemExit(2)
-        raise SystemExit(run_queue_after_status(args))
+        raise SystemExit(run_worker_safely(args, paths, job_id, run_queue_after_status))
     if args.action == "watch":
-        raise SystemExit(run_watch(args))
+        raise SystemExit(run_worker_safely(args, paths, job_id, run_watch))
     raise SystemExit(2)
 
 

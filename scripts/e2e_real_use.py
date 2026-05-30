@@ -29,6 +29,7 @@ SMOKE_SCENARIOS = [
     "concurrent-duplicate-race",
     "preflight-strict",
     "watch-visibility",
+    "capture-strips-ansi",
 ]
 
 FULL_ONLY_SCENARIOS = [
@@ -36,11 +37,17 @@ FULL_ONLY_SCENARIOS = [
     "status-fail-blocks",
     "allow-duplicate",
     "watch-duplicate-block",
+    "watch-concurrent-race",
     "replace-same-job-only",
     "cancel-active-queue",
     "stale-gc-recovery",
+    "corrupted-state-degrades",
     "replace-rejects-foreign-pid",
     "pane-missing-failure",
+    "status-timeout-blocks",
+    "pane-dies-mid-wait",
+    "task-followup-flow",
+    "stop-hook-blocks-terminal",
 ]
 
 ALL_SCENARIOS = SMOKE_SCENARIOS + FULL_ONLY_SCENARIOS
@@ -177,6 +184,20 @@ class Harness:
         self.require_success(command, step=step)
         return command
 
+    def hook_stop(self, *, step: str) -> CommandResult:
+        command = self.run(
+            [
+                sys.executable,
+                str(HOOK),
+                "stop",
+                "--workspace",
+                str(self.workspace),
+            ],
+            input_text="{}",
+        )
+        self.require_success(command, step=step)
+        return command
+
     def setup_tmux(self) -> None:
         self.require_success(
             self.run(
@@ -204,10 +225,18 @@ class Harness:
             raise ScenarioFailure(self.current_scenario, "find-pane", f"session pane not listed: {panes}")
         self.pane = str(candidates[0]["pane_id"])
 
+    def reset_tmux_session(self) -> None:
+        self.run(["tmux", "kill-session", "-t", self.session])
+        self.pane = None
+        self.setup_tmux()
+
     def tmux_send(self, command: str, *, step: str) -> None:
         if not self.pane:
             raise ScenarioFailure(self.current_scenario, step, "pane is not initialized")
         self.require_success(self.run(["tmux", "send-keys", "-t", self.pane, command, "Enter"]), step=step)
+
+    def tmux_kill_pane(self, pane: str, *, step: str) -> None:
+        self.require_success(self.run(["tmux", "kill-pane", "-t", pane]), step=step)
 
     def poll_until(self, label: str, timeout: float, predicate: Callable[[], Any]) -> Any:
         deadline = time.monotonic() + timeout
@@ -590,6 +619,57 @@ class Harness:
             raise ScenarioFailure(self.current_scenario, "watch-log", "watch log was not written")
         return {"job_id": job_id, "log_path": str(log_path)}
 
+    def scenario_capture_strips_ansi(self) -> dict[str, Any]:
+        self.current_scenario = "capture-strips-ansi"
+        ready = self.workspace / "capture.ready"
+        self.control(
+            [
+                "send",
+                "--pane",
+                str(self.pane),
+                "--command",
+                "printf '\\033[31mERR\\033[0m line1\\r\\033[KDONE\\n'",
+                "--enter",
+            ],
+            step="send-ansi-noise",
+        )
+
+        def mark_when_idle() -> CommandResult | None:
+            command = self.control(
+                [
+                    "send",
+                    "--pane",
+                    str(self.pane),
+                    "--command",
+                    "printf ready > capture.ready",
+                    "--enter",
+                    "--require-idle-shell",
+                ],
+                step="capture-ready-marker",
+                check=False,
+            )
+            data = command.json_data if isinstance(command.json_data, dict) else {}
+            return command if command.returncode == 0 and data.get("sent_to_pane") is True else None
+
+        self.poll_until("pane-idle-after-ansi", 5.0, mark_when_idle)
+        self.wait_file(ready, "ready", timeout=5.0)
+        stripped = self.control(
+            ["capture", "--pane", str(self.pane), "--lines", "50", "--strip-ansi"],
+            step="capture-stripped",
+        )
+        plain = self.control(["capture", "--pane", str(self.pane), "--lines", "50"], step="capture-plain")
+        stripped_output = str((stripped.json_data or {}).get("output") or "")
+        if "DONE" not in stripped_output:
+            raise ScenarioFailure(self.current_scenario, "capture-visible-token", "stripped capture did not include visible output", stripped)
+        if "\x1b" in stripped_output or "\x1b[" in stripped_output:
+            raise ScenarioFailure(self.current_scenario, "capture-ansi-stripped", "stripped capture still contains ANSI escape bytes", stripped)
+        plain_output = str((plain.json_data or {}).get("output") or "")
+        return {
+            "stripped_contains_done": "DONE" in stripped_output,
+            "stripped_has_esc": "\x1b" in stripped_output,
+            "plain_length": len(plain_output),
+        }
+
     def scenario_busy_pane_wait(self) -> dict[str, Any]:
         self.current_scenario = "busy-pane-wait"
         output = self.workspace / "busy.out"
@@ -721,6 +801,64 @@ class Harness:
             raise ScenarioFailure(self.current_scenario, "watch-allow-contract", "watch allow-duplicate metadata missing", allowed)
         return {"duplicate_exit_code": second.returncode, "duplicate_of": record.get("duplicate_of")}
 
+    def scenario_watch_concurrent_race(self) -> dict[str, Any]:
+        self.current_scenario = "watch-concurrent-race"
+        job_ids = ["watch-race-a", "watch-race-b"]
+        self.jobs.extend(job_ids)
+        base_args = [
+            "watch",
+            "--pane",
+            str(self.pane),
+            "--interval",
+            "0.1",
+            "--capture-lines",
+            "20",
+            "--timeout-seconds",
+            "2",
+            "--workspace",
+            str(self.workspace),
+        ]
+        procs = [
+            self.popen_control([*base_args, "--job-id", job_ids[0], "--owner", "codex-a"]),
+            self.popen_control([*base_args, "--job-id", job_ids[1], "--owner", "codex-b"]),
+        ]
+        results = [
+            self.collect_process(procs[0], [*base_args, "--job-id", job_ids[0], "--owner", "codex-a"]),
+            self.collect_process(procs[1], [*base_args, "--job-id", job_ids[1], "--owner", "codex-b"]),
+        ]
+        started = [result for result in results if isinstance(result.json_data, dict) and result.json_data.get("started") is True]
+        duplicates = [
+            result
+            for result in results
+            if result.returncode == 2 and isinstance(result.json_data, dict) and result.json_data.get("duplicate") is True
+        ]
+        if len(started) != 1 or len(duplicates) != 1:
+            raise ScenarioFailure(
+                self.current_scenario,
+                "exactly-one-start",
+                f"expected one started and one duplicate; got {[result.summary() for result in results]}",
+            )
+        dedupe_key = started[0].json_data.get("dedupe_key")
+        active_same_key = [
+            job
+            for job in self.active_jobs()
+            if job.get("kind") == "watch"
+            and job.get("dedupe_key") == dedupe_key
+            and str(job.get("status") or "") in ACTIVE_MANAGED_STATUSES
+        ]
+        if len(active_same_key) > 1:
+            raise ScenarioFailure(
+                self.current_scenario,
+                "active-record-count",
+                f"expected at most one active watch record for dedupe key; got {active_same_key}",
+            )
+        return {
+            "started_job_id": started[0].json_data.get("job_id"),
+            "duplicate_job_id": duplicates[0].json_data.get("job_id"),
+            "duplicate_exit_code": duplicates[0].returncode,
+            "active_job_ids": [job.get("job_id") for job in active_same_key],
+        }
+
     def scenario_replace_same_job_only(self) -> dict[str, Any]:
         self.current_scenario = "replace-same-job-only"
         output = self.workspace / "replace.out"
@@ -805,6 +943,61 @@ class Harness:
             raise ScenarioFailure(self.current_scenario, "stale-recreate", "same dedupe was not reusable after stale gc", new)
         return {"old_status": marked.get("status"), "new_job": "stale-new"}
 
+    def scenario_corrupted_state_degrades(self) -> dict[str, Any]:
+        self.current_scenario = "corrupted-state-degrades"
+        run_id = "corrupt-good-run"
+        managed_id = "corrupt-good-managed"
+        self.jobs.append(run_id)
+        run = self.control(
+            [
+                "run",
+                "--job-id",
+                run_id,
+                "--pane",
+                str(self.pane),
+                "--command",
+                "printf corrupt-ok > corrupt-good.out",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="run-good-job",
+        )
+        self.wait_status(run_id, "succeeded", timeout=10.0)
+        self.start_queue_idle(managed_id, "printf corrupt-managed > corrupt-managed.out")
+        self.wait_status(managed_id, "submitted", timeout=10.0)
+        state_dir = self.workspace / ".codex" / "tmux-skills"
+        corrupt_status = state_dir / "status" / "corrupt.json"
+        corrupt_job = state_dir / "jobs" / "corrupt.json"
+        corrupt_status.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_job.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_status.write_text("{ not: valid json", encoding="utf-8")
+        corrupt_job.write_text("{ not: valid json", encoding="utf-8")
+
+        listed = self.control(["job", "list", "--workspace", str(self.workspace)], step="job-list-corrupt", check=False)
+        if listed.returncode != 0:
+            raise ScenarioFailure(self.current_scenario, "job-list-returncode", "job list failed on corrupt state", listed)
+        if "Traceback (most recent call last)" in listed.stderr:
+            raise ScenarioFailure(self.current_scenario, "job-list-traceback", "job list emitted a traceback", listed)
+        listed_data = listed.json_data if isinstance(listed.json_data, dict) else {}
+        jobs = listed_data.get("jobs") or []
+        if not any(isinstance(job, dict) and job.get("job_id") == managed_id for job in jobs):
+            raise ScenarioFailure(self.current_scenario, "job-list-valid-entry", "valid job missing from job list", listed)
+
+        context = self.hook_context(step="hook-context-corrupt")
+        if "Traceback (most recent call last)" in context.stderr:
+            raise ScenarioFailure(self.current_scenario, "hook-context-traceback", "hook context emitted a traceback", context)
+        context_data = context.json_data if isinstance(context.json_data, dict) else {}
+        additional_context = str(((context_data.get("hookSpecificOutput") or {}).get("additionalContext") or ""))
+        if "unreadable" not in additional_context:
+            raise ScenarioFailure(self.current_scenario, "hook-context-unreadable", "hook context did not report unreadable state files", context)
+        return {
+            "run_id": run_id,
+            "managed_id": managed_id,
+            "run_status_path": (run.json_data or {}).get("status_path"),
+            "corrupt_status": str(corrupt_status),
+            "corrupt_job": str(corrupt_job),
+        }
+
     def scenario_replace_rejects_foreign_pid(self) -> dict[str, Any]:
         self.current_scenario = "replace-rejects-foreign-pid"
         job_id = "foreign-pid-e2e"
@@ -878,6 +1071,188 @@ class Harness:
             raise ScenarioFailure(self.current_scenario, "missing-output", "missing pane command produced output")
         return {"job_id": job_id, "status": "failed"}
 
+    def scenario_status_timeout_blocks(self) -> dict[str, Any]:
+        self.current_scenario = "status-timeout-blocks"
+        job_id = "status-timeout-e2e"
+        status_file = self.workspace / "status-timeout.tsv"
+        output = self.workspace / "status-timeout.out"
+        status_file.write_text("path\tstate\nconfigs/run.toml\trunning\n", encoding="utf-8")
+        self.jobs.append(job_id)
+        self.control(
+            [
+                "queue-after-status",
+                "--job-id",
+                job_id,
+                "--pane",
+                str(self.pane),
+                "--command",
+                "printf should-not-run > status-timeout.out",
+                "--status-file",
+                "status-timeout.tsv",
+                "--require-row",
+                "configs/run.toml:done",
+                "--timeout-seconds",
+                "1",
+                "--poll-seconds",
+                "0.1",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="start-status-timeout",
+        )
+        final = self.wait_status(job_id, "timeout", timeout=5.0)
+        if output.exists():
+            raise ScenarioFailure(self.current_scenario, "timeout-output", "timed out status wait still submitted command")
+        record = final.get("record") or {}
+        status = final.get("status") or {}
+        for source_name, source in (("record", record), ("status", status)):
+            if "matched_required_rows" not in source:
+                raise ScenarioFailure(self.current_scenario, "timeout-diagnostics", f"{source_name} missing matched_required_rows")
+        if record.get("send_result") is not None or status.get("send_result") is not None:
+            raise ScenarioFailure(self.current_scenario, "timeout-submit-contract", "timed out status wait recorded a send_result")
+        if record.get("status") == "submitted" or status.get("status") == "submitted":
+            raise ScenarioFailure(self.current_scenario, "timeout-submitted", "timed out status wait became submitted")
+        if status.get("exit_code") != 1:
+            raise ScenarioFailure(self.current_scenario, "timeout-exit-code", "timed out status wait did not record exit code 1")
+        return {
+            "job_id": job_id,
+            "status": status.get("status"),
+            "matched_required_rows": status.get("matched_required_rows"),
+        }
+
+    def scenario_pane_dies_mid_wait(self) -> dict[str, Any]:
+        self.current_scenario = "pane-dies-mid-wait"
+        job_id = "pane-dies-e2e"
+        output = self.workspace / "pane-dies.out"
+        target_pane = str(self.pane)
+        self.tmux_send("sleep 20", step="busy-pane")
+        time.sleep(0.2)
+        try:
+            self.start_queue_idle(job_id, "printf should-not-run > pane-dies.out")
+            self.wait_status(job_id, "waiting_pane_idle", timeout=5.0)
+            self.tmux_kill_pane(target_pane, step="kill-target-pane")
+
+            def terminal_failure() -> dict[str, Any] | None:
+                data = self.job_status(job_id)
+                status = (data.get("status") or {}).get("status") or (data.get("record") or {}).get("status")
+                return data if status in {"failed", "timeout"} else None
+
+            final = self.poll_until("pane-dies-terminal", 8.0, terminal_failure)
+            if output.exists():
+                raise ScenarioFailure(self.current_scenario, "pane-dies-output", "dead pane queue still submitted command")
+            record = final.get("record") or {}
+            status_record = final.get("status") or {}
+            if record.get("send_result") is not None or status_record.get("send_result") is not None:
+                raise ScenarioFailure(self.current_scenario, "pane-dies-submit-contract", "dead pane queue recorded a send_result")
+            status = (final.get("status") or {}).get("status") or (final.get("record") or {}).get("status")
+            return {"job_id": job_id, "status": status, "output_exists": output.exists()}
+        finally:
+            self.reset_tmux_session()
+
+    def scenario_task_followup_flow(self) -> dict[str, Any]:
+        self.current_scenario = "task-followup-flow"
+        job_id = "task-followup-e2e"
+        instruction = "FOLLOWUP: inspect results"
+        self.jobs.append(job_id)
+        started = self.control(
+            [
+                "run",
+                "--pane",
+                str(self.pane),
+                "--job-id",
+                job_id,
+                "--command",
+                "printf task-ok > task-followup.out",
+                "--workspace",
+                str(self.workspace),
+                "--next-instruction",
+                instruction,
+                "--next-on",
+                "succeeded",
+            ],
+            step="run-with-followup",
+        )
+        next_task = (started.json_data or {}).get("next_task") or {}
+        task_id = str(next_task.get("task_id") or "")
+        if not task_id:
+            raise ScenarioFailure(self.current_scenario, "next-task-created", "run did not return a follow-up task", started)
+        self.wait_status(job_id, "succeeded", timeout=10.0)
+
+        def ready_task() -> dict[str, Any] | None:
+            command = self.control(
+                ["task", "list", "--json", "--workspace", str(self.workspace)],
+                step="task-list-ready",
+            )
+            tasks = command.json_data if isinstance(command.json_data, list) else []
+            for task in tasks:
+                if task.get("task_id") == task_id and task.get("effective_status") == "ready":
+                    return task
+            return None
+
+        ready = self.poll_until("task-ready", 5.0, ready_task)
+        context = self.hook_context(step="hook-context-ready").json_data or {}
+        additional = ((context.get("hookSpecificOutput") or {}).get("additionalContext") or "")
+        if "ready task" not in additional or instruction not in additional:
+            raise ScenarioFailure(self.current_scenario, "hook-ready-task", "hook context did not expose the ready follow-up task")
+        claimed = self.control(
+            ["task", "claim", "--task-id", task_id, "--workspace", str(self.workspace)],
+            step="task-claim",
+        )
+        claimed_data = claimed.json_data if isinstance(claimed.json_data, dict) else {}
+        if claimed_data.get("status") != "in_progress":
+            raise ScenarioFailure(self.current_scenario, "task-claim-status", "claimed task did not move to in_progress", claimed)
+        next_after_claim = self.control(
+            ["task", "next", "--json", "--workspace", str(self.workspace)],
+            step="task-next-after-claim",
+        )
+        next_data = next_after_claim.json_data if isinstance(next_after_claim.json_data, dict) else {}
+        if next_data.get("task_id") == task_id and next_data.get("effective_status") == "ready":
+            raise ScenarioFailure(self.current_scenario, "task-next-claimed", "claimed task was still returned as ready", next_after_claim)
+        return {"job_id": job_id, "task_id": task_id, "ready_status": ready.get("effective_status"), "claimed_status": claimed_data.get("status")}
+
+    def scenario_stop_hook_blocks_terminal(self) -> dict[str, Any]:
+        self.current_scenario = "stop-hook-blocks-terminal"
+        job_id = "stop-hook-e2e"
+        output = self.workspace / "stop-hook.out"
+
+        for index in range(30):
+            drained = self.hook_stop(step=f"drain-stop-{index}")
+            data = drained.json_data if isinstance(drained.json_data, dict) else {}
+            if data.get("decision") != "block":
+                break
+            if "ready task" in str(data.get("reason") or ""):
+                raise ScenarioFailure(self.current_scenario, "drain-ready-task", "ready task interfered with stop hook terminal drain", drained)
+        else:
+            raise ScenarioFailure(self.current_scenario, "drain-stop-hooks", "could not drain existing terminal stop notifications")
+
+        self.jobs.append(job_id)
+        self.control(
+            [
+                "run",
+                "--pane",
+                str(self.pane),
+                "--job-id",
+                job_id,
+                "--command",
+                "printf stop-ok > stop-hook.out",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="run-terminal-job",
+        )
+        self.wait_status(job_id, "succeeded", timeout=10.0)
+        self.wait_file(output, "stop-ok", timeout=5.0)
+        first = self.hook_stop(step="stop-first")
+        first_data = first.json_data if isinstance(first.json_data, dict) else {}
+        first_reason = str(first_data.get("reason") or "")
+        if first_data.get("decision") != "block" or "terminal event" not in first_reason:
+            raise ScenarioFailure(self.current_scenario, "stop-first-block", "first stop hook call did not block on terminal event", first)
+        second = self.hook_stop(step="stop-second")
+        second_data = second.json_data if isinstance(second.json_data, dict) else {}
+        if second_data.get("decision") == "block":
+            raise ScenarioFailure(self.current_scenario, "stop-second-ack", "second stop hook call blocked after ack", second)
+        return {"job_id": job_id, "first_decision": first_data.get("decision"), "second": second_data}
+
 
 SCENARIO_METHODS = {
     "idle-continuation": Harness.scenario_idle_continuation,
@@ -887,15 +1262,22 @@ SCENARIO_METHODS = {
     "duplicate-block": Harness.scenario_duplicate_block,
     "preflight-strict": Harness.scenario_preflight_strict,
     "watch-visibility": Harness.scenario_watch_visibility,
+    "capture-strips-ansi": Harness.scenario_capture_strips_ansi,
     "busy-pane-wait": Harness.scenario_busy_pane_wait,
     "status-fail-blocks": Harness.scenario_status_fail_blocks,
     "allow-duplicate": Harness.scenario_allow_duplicate,
     "watch-duplicate-block": Harness.scenario_watch_duplicate_block,
+    "watch-concurrent-race": Harness.scenario_watch_concurrent_race,
     "replace-same-job-only": Harness.scenario_replace_same_job_only,
     "cancel-active-queue": Harness.scenario_cancel_active_queue,
     "stale-gc-recovery": Harness.scenario_stale_gc_recovery,
+    "corrupted-state-degrades": Harness.scenario_corrupted_state_degrades,
     "replace-rejects-foreign-pid": Harness.scenario_replace_rejects_foreign_pid,
     "pane-missing-failure": Harness.scenario_pane_missing_failure,
+    "status-timeout-blocks": Harness.scenario_status_timeout_blocks,
+    "pane-dies-mid-wait": Harness.scenario_pane_dies_mid_wait,
+    "task-followup-flow": Harness.scenario_task_followup_flow,
+    "stop-hook-blocks-terminal": Harness.scenario_stop_hook_blocks_terminal,
 }
 
 
@@ -916,7 +1298,7 @@ def skip_result(json_output: bool) -> int:
     return SKIP_EXIT_CODE
 
 
-def run_scenarios(names: list[str], *, keep_artifacts: bool) -> tuple[int, dict[str, Any]]:
+def run_scenarios(names: list[str], *, keep_artifacts: bool, keep_going: bool = False) -> tuple[int, dict[str, Any]]:
     harness = Harness(keep_artifacts=keep_artifacts)
     results: list[dict[str, Any]] = []
     status = "passed"
@@ -927,15 +1309,21 @@ def run_scenarios(names: list[str], *, keep_artifacts: bool) -> tuple[int, dict[
         for name in names:
             method = SCENARIO_METHODS[name]
             started = time.monotonic()
+            should_stop = False
             try:
                 harness.before_scenario(name)
                 detail = method(harness)
-                harness.after_scenario()
                 results.append({"scenario": name, "status": "passed", "elapsed_seconds": round(time.monotonic() - started, 3), "detail": detail})
             except ScenarioFailure as exc:
                 status = "failed"
                 exit_code = 1
                 results.append({"scenario": name, "status": "failed", "elapsed_seconds": round(time.monotonic() - started, 3), "failure": harness.diagnostics(exc)})
+                if not keep_going:
+                    should_stop = True
+            finally:
+                harness.after_scenario()
+            harness.before_scenario("teardown-check")
+            if should_stop:
                 break
     finally:
         if status == "passed" or not keep_artifacts:
@@ -994,6 +1382,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenario", choices=choices, default="smoke")
     parser.add_argument("--json", action="store_true", help="Print machine-readable summary")
     parser.add_argument("--keep-artifacts", action="store_true", help="Keep temp artifacts after a failure")
+    parser.add_argument("--keep-going", action="store_true", help="Run all selected scenarios even if some fail; aggregate results")
     return parser
 
 
@@ -1003,7 +1392,7 @@ def main() -> int:
         return skip_result(args.json)
 
     names = selected_scenarios(args.scenario)
-    exit_code, summary = run_scenarios(names, keep_artifacts=args.keep_artifacts)
+    exit_code, summary = run_scenarios(names, keep_artifacts=args.keep_artifacts, keep_going=args.keep_going)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
     elif exit_code == 0:
