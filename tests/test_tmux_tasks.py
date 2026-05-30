@@ -163,6 +163,37 @@ class TmuxTaskTests(unittest.TestCase):
             self.assertEqual(data["recent_jobs"][0]["id"], "old")
             self.assertEqual(len(data["errors"]), 1)
 
+    def test_load_tasks_tolerates_corrupt_task_object(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            good = tmux_state.build_task(
+                task_id="good",
+                instruction="Keep loading",
+                summary=None,
+                intent=None,
+                after_job_id=None,
+                after_event_id=None,
+                trigger_on="terminal",
+            )
+            tmux_state.write_task(paths, good)
+            (paths["tasks"] / "bad.json").write_text(
+                json.dumps({"task_id": "bad", "version": "not-an-int", "instruction": "x"}),
+                encoding="utf-8",
+            )
+
+            tasks, errors = tmux_state.load_tasks(paths["root"])
+            by_id = {task["task_id"]: task for task in tasks}
+            self.assertEqual(errors, [])
+            self.assertIn("good", by_id)
+            self.assertEqual(by_id["bad"]["version"], tmux_state.TASK_VERSION)
+
+            state = tmux_state.load_task_state(paths)
+            state_by_id = {task["task_id"]: task for task in state["tasks"]}
+            self.assertEqual(state["errors"], [])
+            self.assertIn("good", state_by_id)
+            self.assertEqual(state_by_id["bad"]["version"], tmux_state.TASK_VERSION)
+
     def test_stale_in_progress_and_reclaim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = tmux_state.state_paths(tmp)

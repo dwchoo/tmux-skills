@@ -8,11 +8,61 @@ import errno
 import os
 import pty
 import select
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
 import tmux_state
+
+
+def _terminate_process_group(proc: subprocess.Popen[bytes], *, grace: float = 2.0) -> None:
+    if proc.poll() is not None:
+        return
+
+    pgid: int | None = None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (AttributeError, OSError, ProcessLookupError):
+        pass
+
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (OSError, ProcessLookupError, PermissionError):
+            pass
+    else:
+        try:
+            proc.terminate()
+        except (OSError, ProcessLookupError):
+            pass
+
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except (OSError, ProcessLookupError):
+        return
+
+    if proc.poll() is not None:
+        return
+
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (OSError, ProcessLookupError, PermissionError):
+            pass
+    else:
+        try:
+            proc.kill()
+        except (OSError, ProcessLookupError):
+            pass
+
+    try:
+        proc.wait()
+    except (OSError, ProcessLookupError):
+        pass
 
 
 def read_command_text(path: Path) -> str:
@@ -64,7 +114,7 @@ def run_command_file(command_file: Path, cwd: Path, log_file: Path) -> tuple[int
     except KeyboardInterrupt:
         status = "stopped"
         if proc and proc.poll() is None:
-            proc.terminate()
+            _terminate_process_group(proc)
         return 130, status, tail.decode("utf-8", errors="replace")
     finally:
         if slave_fd >= 0:

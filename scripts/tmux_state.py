@@ -381,7 +381,11 @@ def build_task(
 def normalize_task(task: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
     task_id = str(task.get("task_id") or task.get("id") or (path.stem if path else f"task-{uuid.uuid4().hex[:12]}"))
     normalized = dict(task)
-    normalized["version"] = int(normalized.get("version") or TASK_VERSION)
+    try:
+        version = int(normalized.get("version") or TASK_VERSION)
+    except (TypeError, ValueError):
+        version = TASK_VERSION
+    normalized["version"] = version
     normalized["task_id"] = safe_id(task_id)
     if normalized.get("status") not in TASK_STATUSES:
         normalized["status"] = "waiting"
@@ -411,7 +415,11 @@ def load_tasks(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
             errors.append({"path": str(path), "error": error})
             continue
         if data:
-            tasks.append(normalize_task(data, path))
+            try:
+                tasks.append(normalize_task(data, path))
+            except Exception as exc:
+                errors.append({"path": str(path), "error": str(exc)})
+                continue
     return tasks, errors
 
 
