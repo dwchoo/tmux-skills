@@ -154,6 +154,21 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(result["pane_id"], "%1")
         self.assertIn("could not capture pane output", result["reason"])
 
+    def test_idle_shell_check_returns_structured_failure_when_capture_exits(self) -> None:
+        pane_info = {
+            "pane_id": "%1",
+            "current_command": "bash",
+            "pane_pid": "123",
+        }
+        with mock.patch.object(tmux_control, "current_info", return_value=pane_info):
+            with mock.patch.object(tmux_control, "descendant_processes", return_value=(0, [], 0)):
+                with mock.patch.object(tmux_control, "capture_text", side_effect=SystemExit(1)):
+                    result = tmux_control.idle_shell_check("%1")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("could not capture pane output", result["reason"])
+        self.assertIn("SystemExit(1)", result["reason"])
+
     def test_spawn_parser_rejects_invalid_percent(self) -> None:
         parser = tmux_control.build_parser()
         invalid_commands = [

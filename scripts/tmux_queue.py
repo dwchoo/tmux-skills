@@ -16,6 +16,10 @@ from typing import Any, Callable
 import tmux_control
 import tmux_state
 
+
+RETRY_AFTER_IDLE_RECHECK = 75
+
+
 class WorkerTerminatedBySignal(BaseException):
     """Raised from SIGTERM so worker cleanup can write terminal status."""
 
@@ -23,8 +27,13 @@ class WorkerTerminatedBySignal(BaseException):
         self.signum = signum
         super().__init__(signum)
 
+
 def raise_worker_terminated(signum: int, _frame: object) -> None:
     raise WorkerTerminatedBySignal(signum)
+
+
+def exception_text(exc: BaseException) -> str:
+    return repr(exc) if isinstance(exc, SystemExit) else str(exc)
 
 
 def positive_float(value: str) -> float:
@@ -470,6 +479,16 @@ def pane_missing(guard: dict[str, Any]) -> bool:
     return guard.get("ok") is False and str(guard.get("reason") or "") == "pane could not be resolved"
 
 
+def retryable_idle_send_result(result: dict[str, Any]) -> bool:
+    guard = result.get("idle_shell_check")
+    return (
+        result.get("sent_to_pane") is False
+        and isinstance(guard, dict)
+        and guard.get("ok") is False
+        and not pane_missing(guard)
+    )
+
+
 def submit_command(
     paths: dict[str, Path],
     args: argparse.Namespace,
@@ -479,6 +498,7 @@ def submit_command(
     command_text: str,
     last_output: str,
     extra: dict[str, Any] | None = None,
+    retry_idle_recheck: bool = False,
 ) -> int:
     send_args = argparse.Namespace(
         pane=args.pane,
@@ -491,8 +511,8 @@ def submit_command(
     )
     try:
         result = tmux_control.send(send_args)
-    except Exception as exc:
-        error = str(exc)
+    except (Exception, SystemExit) as exc:
+        error = exception_text(exc)
         return fail_worker(
             paths,
             args,
@@ -502,13 +522,28 @@ def submit_command(
             last_output=error,
             extra={**(extra or {}), "error": error},
         )
-    status = "submitted" if result.get("sent_to_pane") else "failed"
-    status_token = tmux_state.token_text(status)
     merged_extra = {
         **(extra or {}),
         "send_result": result,
         "command_hash": command_hash(command_text),
     }
+    if retry_idle_recheck and retryable_idle_send_result(result):
+        reason = str(result.get("reason") or "pane became busy before command submission")
+        retry_extra = {**merged_extra, "idle_shell_check": result.get("idle_shell_check")}
+        write_worker_record(paths, args, kind=kind, status="waiting_pane_idle", command_text=command_text, extra=retry_extra)
+        write_worker_status(
+            paths,
+            args,
+            kind=kind,
+            status="waiting_pane_idle",
+            started_at=started_at,
+            command_text=command_text,
+            last_output=reason,
+            extra=retry_extra,
+        )
+        return RETRY_AFTER_IDLE_RECHECK
+    status = "submitted" if result.get("sent_to_pane") else "failed"
+    status_token = tmux_state.token_text(status)
     write_worker_record(paths, args, kind=kind, status=status, command_text=command_text, extra=merged_extra)
     write_worker_status(
         paths,
@@ -542,8 +577,8 @@ def run_queue_after_idle(args: argparse.Namespace) -> int:
     while True:
         try:
             guard = tmux_control.idle_shell_check(args.pane)
-        except Exception as exc:
-            error = str(exc)
+        except (Exception, SystemExit) as exc:
+            error = exception_text(exc)
             return fail_worker(
                 paths,
                 args,
@@ -578,7 +613,7 @@ def run_queue_after_idle(args: argparse.Namespace) -> int:
                     extra={"idle_shell_check": guard},
                 )
                 return 1
-            return submit_command(
+            code = submit_command(
                 paths,
                 args,
                 started_at=started_at,
@@ -586,7 +621,12 @@ def run_queue_after_idle(args: argparse.Namespace) -> int:
                 command_text=command_text,
                 last_output="pane is idle; submitted command",
                 extra={"idle_shell_check": guard},
+                retry_idle_recheck=True,
             )
+            if code == RETRY_AFTER_IDLE_RECHECK:
+                sleep_interruptibly(args.poll_seconds)
+                continue
+            return code
         if timed_out(started, args.timeout_seconds):
             write_worker_record(paths, args, kind=kind, status="timeout", command_text=command_text, extra={"idle_shell_check": guard})
             write_worker_status(
@@ -613,19 +653,6 @@ def run_queue_after_idle(args: argparse.Namespace) -> int:
             extra={"idle_shell_check": guard},
         )
         sleep_interruptibly(args.poll_seconds)
-
-    write_worker_record(paths, args, kind=kind, status="cancelled", command_text=command_text)
-    write_worker_status(
-        paths,
-        args,
-        kind=kind,
-        status="cancelled",
-        started_at=started_at,
-        command_text=command_text,
-        last_output="cancelled before command submission",
-        exit_code=1,
-    )
-    return 1
 
 
 def run_queue_after_status(args: argparse.Namespace) -> int:
@@ -701,8 +728,8 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
         if required and len(matched_required) == len(required):
             try:
                 guard = tmux_control.idle_shell_check(args.pane) if args.require_idle_shell else {"ok": True}
-            except Exception as exc:
-                error = str(exc)
+            except (Exception, SystemExit) as exc:
+                error = exception_text(exc)
                 return fail_worker(
                     paths,
                     args,
@@ -738,7 +765,7 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
                         extra=timeout_extra,
                     )
                     return 1
-                return submit_command(
+                code = submit_command(
                     paths,
                     args,
                     started_at=started_at,
@@ -746,7 +773,12 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
                     command_text=command_text,
                     last_output="status requirements met; submitted command",
                     extra={**extra, "idle_shell_check": guard},
+                    retry_idle_recheck=True,
                 )
+                if code == RETRY_AFTER_IDLE_RECHECK:
+                    sleep_interruptibly(args.poll_seconds)
+                    continue
+                return code
             extra["idle_shell_check"] = guard
             last_output = str(guard.get("reason") or "status met; waiting for idle shell")
             waiting_status = "waiting_pane_idle"
@@ -783,19 +815,6 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
 
         sleep_interruptibly(args.poll_seconds)
 
-    write_worker_record(paths, args, kind=kind, status="cancelled", command_text=command_text)
-    write_worker_status(
-        paths,
-        args,
-        kind=kind,
-        status="cancelled",
-        started_at=started_at,
-        command_text=command_text,
-        last_output="cancelled before command submission",
-        exit_code=1,
-    )
-    return 1
-
 
 def run_watch(args: argparse.Namespace) -> int:
     identity_error = reject_invalid_worker_identity(args)
@@ -830,8 +849,8 @@ def run_watch(args: argparse.Namespace) -> int:
     while True:
         try:
             output = tmux_control.capture_text(args.pane, args.capture_lines, strip=True)
-        except Exception as exc:
-            output = str(exc)
+        except (Exception, SystemExit) as exc:
+            output = exception_text(exc)
             terminal = "failed"
             exit_code = 1
             write_worker_record(paths, args, kind=kind, status=terminal, extra={"error": output})
@@ -905,18 +924,6 @@ def run_watch(args: argparse.Namespace) -> int:
             )
             return 1
         sleep_interruptibly(args.interval)
-
-    write_worker_record(paths, args, kind=kind, status="cancelled")
-    write_worker_status(
-        paths,
-        args,
-        kind=kind,
-        status="cancelled",
-        started_at=started_at,
-        last_output="watch cancelled",
-        exit_code=1,
-    )
-    return 1
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:

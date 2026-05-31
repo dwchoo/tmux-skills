@@ -335,6 +335,27 @@ class TmuxQueueTests(unittest.TestCase):
         self.assertEqual(status["status"], "submitted")
         self.assertEqual(status["matched_required_rows"], ["configs/msec.toml:done"])
 
+    def test_queue_after_status_retries_when_send_idle_recheck_gets_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status_file = Path(tmp) / "status.tsv"
+            status_file.write_text("configs/msec.toml\tdone\n", encoding="utf-8")
+            args = self.status_args(tmp, status_file)
+            send_results = [
+                {"sent_to_pane": False, "reason": "busy", "idle_shell_check": {"ok": False, "reason": "busy"}},
+                {"sent_to_pane": True},
+            ]
+            with mock.patch.object(tmux_queue.tmux_control, "idle_shell_check", return_value={"ok": True}):
+                with mock.patch.object(tmux_queue.tmux_control, "send", side_effect=send_results) as send:
+                    code = tmux_queue.run_queue_after_status(args)
+
+            paths = tmux_state.state_paths(tmp)
+            status, error = tmux_state.read_json(tmux_state.status_path(paths, "queue"))
+
+        self.assertIsNone(error)
+        self.assertEqual(code, 0)
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(status["status"], "submitted")
+
     def test_queue_after_status_colon_spec_does_not_substring_match_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             status_file = Path(tmp) / "status.tsv"
@@ -539,6 +560,38 @@ class TmuxQueueTests(unittest.TestCase):
         self.assertIn("before command submission", status["last_output"])
         send.assert_not_called()
 
+    def test_queue_after_idle_retries_when_send_idle_recheck_gets_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                job_id="queue",
+                name=None,
+                pane="%1",
+                command_text="echo next",
+                command_file=None,
+                poll_seconds=0.001,
+                timeout_seconds=1.0,
+                workspace=tmp,
+                state_dir=None,
+                require_idle_shell=True,
+                strict_preflight=False,
+                bash_if_not_executable=False,
+            )
+            send_results = [
+                {"sent_to_pane": False, "reason": "busy", "idle_shell_check": {"ok": False, "reason": "busy"}},
+                {"sent_to_pane": True},
+            ]
+            with mock.patch.object(tmux_queue.tmux_control, "idle_shell_check", return_value={"ok": True}):
+                with mock.patch.object(tmux_queue.tmux_control, "send", side_effect=send_results) as send:
+                    code = tmux_queue.run_queue_after_idle(args)
+
+            paths = tmux_state.state_paths(tmp)
+            status, error = tmux_state.read_json(tmux_state.status_path(paths, "queue"))
+
+        self.assertIsNone(error)
+        self.assertEqual(code, 0)
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(status["status"], "submitted")
+
     def test_queue_after_idle_missing_command_file_records_failed_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "missing.sh"
@@ -712,6 +765,40 @@ class TmuxQueueTests(unittest.TestCase):
         self.assertEqual(status["error"], "actual send failure")
         self.assertEqual(status["last_output"], "actual send failure")
         self.assertEqual(status["diagnostic"], "kept")
+
+    def test_submit_command_records_send_system_exit_as_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            args = argparse.Namespace(
+                job_id="queue",
+                name=None,
+                pane="%1",
+                command_file=None,
+                poll_seconds=0.001,
+                workspace=tmp,
+                require_idle_shell=False,
+                strict_preflight=False,
+                bash_if_not_executable=False,
+            )
+
+            with mock.patch.object(tmux_queue.tmux_control, "send", side_effect=SystemExit(1)):
+                code = tmux_queue.submit_command(
+                    paths,
+                    args,
+                    started_at=tmux_state.utc_now(),
+                    kind="queue-after-idle",
+                    command_text="echo next",
+                    last_output="ready",
+                )
+
+            status = tmux_state.read_json(tmux_state.status_path(paths, "queue"))[0]
+
+        self.assertEqual(code, 1)
+        assert status is not None
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["error"], "SystemExit(1)")
+        self.assertEqual(status["last_output"], "SystemExit(1)")
 
     def test_submit_command_keeps_actual_send_result_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -910,6 +997,33 @@ class TmuxQueueTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(status["status"], "failed")
         self.assertIn("can't find pane", status["last_output"])
+
+    def test_queue_after_idle_records_system_exit_from_idle_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                job_id="queue",
+                name=None,
+                pane="%missing",
+                command_text="echo next",
+                command_file=None,
+                poll_seconds=0.001,
+                timeout_seconds=1.0,
+                workspace=tmp,
+                state_dir=None,
+                require_idle_shell=True,
+                strict_preflight=False,
+                bash_if_not_executable=False,
+            )
+            with mock.patch.object(tmux_queue.tmux_control, "idle_shell_check", side_effect=SystemExit(1)):
+                code = tmux_queue.run_queue_after_idle(args)
+
+            paths = tmux_state.state_paths(tmp)
+            status, error = tmux_state.read_json(tmux_state.status_path(paths, "queue"))
+
+        self.assertIsNone(error)
+        self.assertEqual(code, 1)
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["last_output"], "SystemExit(1)")
 
     def test_queue_after_idle_fails_when_pane_cannot_be_resolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

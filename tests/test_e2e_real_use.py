@@ -5,6 +5,7 @@ import json
 import re
 import shlex
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -158,6 +159,7 @@ class E2ERealUseTests(unittest.TestCase):
         self.assertIn("`cleanup_error`", text)
         self.assertIn("`e2e-cleanup-verification`", text)
         self.assertIn("`server_absent`", text)
+        self.assertIn("`worker_pids_signalled`", text)
         self.assertIn("isolated tmux server has been stopped", text)
         self.assertIn("Teardown, isolation, or cleanup failures still stop the run", text)
 
@@ -342,6 +344,66 @@ class E2ERealUseTests(unittest.TestCase):
 
         self.assertEqual(cancelled, ["terminal-job", "still-active"])
         self.assertEqual(harness.jobs, ["still-active"])
+
+    def test_tmux_queue_pids_for_workspace_filters_ps_output(self) -> None:
+        stdout = "\n".join(
+            [
+                "101 python3 /repo/scripts/tmux_queue.py queue-after-idle --job-id a --workspace /tmp/ws",
+                "102 python3 /repo/scripts/tmux_queue.py queue-after-idle --job-id b --workspace /tmp/other",
+                "103 python3 /repo/scripts/tmux_job.py exec --workspace /tmp/ws",
+                "104 python3 /repo/scripts/tmux_queue.py queue-after-status --workspace=/tmp/ws",
+                "105 python3 /repo/scripts/tmux_queue.py queue-after-idle --workspace /tmp/ws2",
+                "not-a-pid python3 /repo/scripts/tmux_queue.py queue-after-idle --workspace /tmp/ws",
+            ]
+        )
+        completed = e2e_real_use.subprocess.CompletedProcess(["ps"], 0, stdout=stdout, stderr="")
+
+        with mock.patch.object(e2e_real_use.subprocess, "run", return_value=completed):
+            with mock.patch.object(e2e_real_use.os, "getpid", return_value=999):
+                pids = e2e_real_use.tmux_queue_pids_for_workspace(Path("/tmp/ws"))
+
+        self.assertEqual(pids, [101, 104])
+
+    def test_tmux_queue_pids_for_workspace_matches_resolved_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            real = base / "real"
+            real.mkdir()
+            alias = base / "alias"
+            try:
+                alias.symlink_to(real, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlink unavailable: {exc}")
+            workspace = alias / "workspace"
+            workspace.mkdir()
+            resolved_workspace = workspace.resolve()
+            stdout = (
+                "201 python3 /repo/scripts/tmux_queue.py queue-after-idle "
+                f"--job-id a --workspace {resolved_workspace}"
+            )
+            completed = e2e_real_use.subprocess.CompletedProcess(["ps"], 0, stdout=stdout, stderr="")
+
+            with mock.patch.object(e2e_real_use.subprocess, "run", return_value=completed):
+                with mock.patch.object(e2e_real_use.os, "getpid", return_value=999):
+                    pids = e2e_real_use.tmux_queue_pids_for_workspace(workspace)
+
+        self.assertEqual(pids, [201])
+
+    def test_terminate_workspace_workers_signals_matching_pids(self) -> None:
+        harness = e2e_real_use.Harness.__new__(e2e_real_use.Harness)
+        harness.workspace = Path("/tmp/ws")
+
+        with mock.patch.object(e2e_real_use, "tmux_queue_pids_for_workspace", return_value=[101, 102]):
+            with mock.patch.object(e2e_real_use.os, "kill") as kill:
+                pids = harness.terminate_workspace_workers()
+
+        self.assertEqual(pids, [101, 102])
+        kill.assert_has_calls(
+            [
+                mock.call(101, e2e_real_use.signal.SIGTERM),
+                mock.call(102, e2e_real_use.signal.SIGTERM),
+            ]
+        )
 
     def test_run_scenarios_rejects_unknown_names_before_setup(self) -> None:
         with mock.patch.object(e2e_real_use, "Harness") as harness:

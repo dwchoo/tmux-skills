@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -78,6 +80,52 @@ def timeout_output_text(value: Any) -> str:
 def append_timeout_message(stderr: str, timeout: float) -> str:
     message = f"timed out after {timeout:.1f}s"
     return f"{stderr.rstrip()}\n{message}\n" if stderr else f"{message}\n"
+
+
+def workspace_match_texts(workspace: Path) -> set[str]:
+    return {str(workspace), str(workspace.expanduser().resolve())}
+
+
+def command_has_workspace_arg(command: str, workspace_texts: set[str]) -> bool:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = command.split()
+    for index, arg in enumerate(argv):
+        if arg == "--workspace" and index + 1 < len(argv) and argv[index + 1] in workspace_texts:
+            return True
+        if arg.startswith("--workspace=") and arg.split("=", 1)[1] in workspace_texts:
+            return True
+    return False
+
+
+def tmux_queue_pids_for_workspace(workspace: Path) -> list[int]:
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,command="],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        return []
+
+    workspace_texts = workspace_match_texts(workspace)
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_text, command = parts
+        if "tmux_queue.py" not in command or not command_has_workspace_arg(command, workspace_texts):
+            continue
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid != os.getpid():
+            pids.append(pid)
+    return pids
 
 
 @dataclass
@@ -477,10 +525,23 @@ class Harness:
     def server_exists(self) -> bool:
         return self.run(["tmux", "list-sessions"]).returncode == 0
 
+    def terminate_workspace_workers(self) -> list[int]:
+        signalled: list[int] = []
+        for pid in tmux_queue_pids_for_workspace(self.workspace):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                continue
+            signalled.append(pid)
+        return signalled
+
     def cleanup(self, *, remove_artifacts: bool = True) -> dict[str, Any]:
         self.cancel_active_jobs()
         self.run(["tmux", "kill-session", "-t", self.session])
         self.run(["tmux", "kill-server"])
+        worker_pids_signalled = self.terminate_workspace_workers()
         session_absent = not self.session_exists()
         server_absent = not self.server_exists()
         if remove_artifacts:
@@ -495,6 +556,7 @@ class Harness:
             "repo_runtime_artifacts": repo_artifacts,
             "removed_repo_runtime_artifacts": self.removed_repo_artifacts,
             "artifact_dir": str(self.base_dir),
+            "worker_pids_signalled": worker_pids_signalled,
         }
 
     def scenario_idle_continuation(self) -> dict[str, Any]:

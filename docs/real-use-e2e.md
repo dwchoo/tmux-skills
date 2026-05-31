@@ -65,7 +65,7 @@ Full-only scenarios:
 
 ## Scenario Matrix
 
-Each scenario runs against a temporary workspace, a temporary `TMUX_TMPDIR`, and an isolated tmux session. It calls `scripts/tmux_control.py` through subprocesses instead of importing internal functions.
+Each harness run uses a temporary workspace, a temporary `TMUX_TMPDIR`, and an isolated tmux session. Scenarios stay independent through unique job ids plus pre/post scenario cancellation and pane interruption. The harness calls `scripts/tmux_control.py` through subprocesses instead of importing internal functions.
 
 | Scenario | Workflow covered | Setup | Action | Required assertions |
 | --- | --- | --- | --- | --- |
@@ -98,7 +98,7 @@ Each scenario runs against a temporary workspace, a temporary `TMUX_TMPDIR`, and
 
 - Prefer public CLI subprocesses over internal Python calls.
 - Bound each harness subprocess call so a stuck helper reports a scenario failure instead of hanging the whole E2E run.
-- Keep each scenario independent by using temporary workspace state and unique job ids.
+- Keep each scenario independent with unique job ids, bounded subprocesses, active job cancellation, and pane interruption.
 - Make negative assertions explicit with consistent language: command must not submit, or output file is absent.
 - Verify state transitions, not just final files.
 - Use `smoke` for high-risk everyday flows and `all` for lifecycle, recovery, and safety edges.
@@ -134,8 +134,9 @@ On success, the harness verifies:
 
 - The isolated tmux session is gone.
 - The isolated tmux server has been stopped.
+- Workspace-scoped detached `tmux_queue.py` workers have been signalled if any survived tmux teardown.
 - The temporary directory was removed.
 - The repository has no `__pycache__` or `.pyc` artifacts.
 
 The harness removes Python runtime artifacts before cleanup verification. When `--keep-artifacts` is used, artifacts are kept only after failure.
-The cleanup summary exposes `session_absent`, `server_absent`, `temp_dir_removed`, and repository runtime artifact fields.
+The cleanup summary exposes `session_absent`, `server_absent`, `worker_pids_signalled`, `temp_dir_removed`, and repository runtime artifact fields.

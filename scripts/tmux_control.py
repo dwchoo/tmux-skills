@@ -553,8 +553,9 @@ def idle_shell_check(pane: str) -> dict[str, Any]:
     }
     try:
         prompt_output = capture_text(pane, 20, strip=True)
-    except Exception as exc:
-        return {"ok": False, "reason": f"could not capture pane output: {exc}", **diagnostics}
+    except (Exception, SystemExit) as exc:
+        error = repr(exc) if isinstance(exc, SystemExit) else str(exc)
+        return {"ok": False, "reason": f"could not capture pane output: {error}", **diagnostics}
     has_prompt = prompt_like(prompt_output)
     diagnostics["prompt_detected"] = has_prompt
 
