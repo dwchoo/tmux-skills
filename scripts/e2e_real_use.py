@@ -16,11 +16,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import tmux_state
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROL = ROOT / "scripts" / "tmux_control.py"
 HOOK = ROOT / "scripts" / "codex_tmux_hook.py"
 SKIP_EXIT_CODE = 77
+COMMAND_TIMEOUT_SECONDS = 30.0
+COMMAND_TIMEOUT_EXIT_CODE = 124
 
 SMOKE_SCENARIOS = [
     "idle-continuation",
@@ -34,7 +38,9 @@ SMOKE_SCENARIOS = [
 
 FULL_ONLY_SCENARIOS = [
     "busy-pane-wait",
+    "queue-command-file",
     "status-fail-blocks",
+    "duplicate-block",
     "allow-duplicate",
     "watch-duplicate-block",
     "watch-concurrent-race",
@@ -51,11 +57,27 @@ FULL_ONLY_SCENARIOS = [
 ]
 
 ALL_SCENARIOS = SMOKE_SCENARIOS + FULL_ONLY_SCENARIOS
-ACTIVE_MANAGED_STATUSES = {"starting", "running", "waiting", "waiting_status", "waiting_pane_idle"}
+
+
+def is_active_managed_job(job: dict[str, Any]) -> bool:
+    return tmux_state.is_active_managed_job(job) and not job.get("stale")
 
 
 def tmux_state_compatible_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def timeout_output_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def append_timeout_message(stderr: str, timeout: float) -> str:
+    message = f"timed out after {timeout:.1f}s"
+    return f"{stderr.rstrip()}\n{message}\n" if stderr else f"{message}\n"
 
 
 @dataclass
@@ -85,6 +107,49 @@ class ScenarioFailure(Exception):
         self.command = command
 
 
+def unexpected_failure(scenario: str, exc: Exception, *, step: str = "unexpected-exception") -> ScenarioFailure:
+    return ScenarioFailure(scenario, step, f"{type(exc).__name__}: {exc}")
+
+
+def safe_diagnostics(harness: "Harness", failure: ScenarioFailure) -> dict[str, Any]:
+    try:
+        return harness.diagnostics(failure)
+    except Exception as exc:
+        return {
+            "scenario": failure.scenario,
+            "step": failure.step,
+            "message": failure.message,
+            "diagnostics_error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def cleanup_failure_info(harness: "Harness", exc: Exception) -> dict[str, Any]:
+    return {
+        "session_absent": False,
+        "server_absent": False,
+        "temp_dir_removed": False,
+        "repo_runtime_artifacts": [],
+        "removed_repo_runtime_artifacts": list(getattr(harness, "removed_repo_artifacts", [])),
+        "artifact_dir": str(getattr(harness, "base_dir", "")),
+        "cleanup_error": f"{type(exc).__name__}: {exc}",
+    }
+
+
+def scenario_failure_result(
+    harness: "Harness",
+    *,
+    scenario: str,
+    failure: ScenarioFailure,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    return {
+        "scenario": scenario,
+        "status": "failed",
+        "elapsed_seconds": elapsed_seconds,
+        "failure": safe_diagnostics(harness, failure),
+    }
+
+
 class Harness:
     def __init__(self, *, keep_artifacts: bool = False) -> None:
         self.keep_artifacts = keep_artifacts
@@ -106,23 +171,33 @@ class Harness:
         self.remove_repo_runtime_artifacts()
 
     def run(self, args: list[str], *, cwd: Path = ROOT, input_text: str | None = None) -> CommandResult:
-        result = subprocess.run(
-            args,
-            cwd=str(cwd),
-            env=self.env,
-            input=input_text,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                args,
+                cwd=str(cwd),
+                env=self.env,
+                input=input_text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+            stdout = result.stdout
+            stderr = result.stderr
+            returncode = result.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout = timeout_output_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
+            stderr = append_timeout_message(timeout_output_text(getattr(exc, "stderr", None)), COMMAND_TIMEOUT_SECONDS)
+            returncode = COMMAND_TIMEOUT_EXIT_CODE
+
         parsed: Any = None
-        if result.stdout.strip():
+        if stdout.strip():
             try:
-                parsed = json.loads(result.stdout)
+                parsed = json.loads(stdout)
             except json.JSONDecodeError:
                 parsed = None
-        command = CommandResult(args=args, returncode=result.returncode, stdout=result.stdout, stderr=result.stderr, json_data=parsed)
+        command = CommandResult(args=args, returncode=returncode, stdout=stdout, stderr=stderr, json_data=parsed)
         self.last_command = command
         return command
 
@@ -140,7 +215,15 @@ class Harness:
         )
 
     def collect_process(self, proc: subprocess.Popen[str], args: list[str]) -> CommandResult:
-        stdout, stderr = proc.communicate()
+        try:
+            stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT_SECONDS)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            stderr = append_timeout_message(stderr, COMMAND_TIMEOUT_SECONDS)
+            returncode = COMMAND_TIMEOUT_EXIT_CODE
+
         parsed: Any = None
         if stdout.strip():
             try:
@@ -149,7 +232,7 @@ class Harness:
                 parsed = None
         command = CommandResult(
             args=self.control_args(args),
-            returncode=proc.returncode,
+            returncode=returncode,
             stdout=stdout,
             stderr=stderr,
             json_data=parsed,
@@ -270,23 +353,24 @@ class Harness:
         return jobs if isinstance(jobs, list) else []
 
     def active_jobs(self) -> list[dict[str, Any]]:
-        return [
-            job
-            for job in self.job_list()
-            if str(job.get("status") or "") in ACTIVE_MANAGED_STATUSES and not job.get("stale")
-        ]
+        return [job for job in self.job_list() if is_active_managed_job(job)]
 
-    def cancel_active_jobs(self) -> None:
+    def active_job_ids(self) -> list[str]:
         job_ids: list[str] = []
         for job in self.active_jobs():
             job_id = str(job.get("job_id") or "")
-            if job_id:
+            if job_id and job_id not in job_ids:
                 job_ids.append(job_id)
+        return job_ids
+
+    def cancel_active_jobs(self) -> None:
+        job_ids = self.active_job_ids()
         for job_id in self.jobs:
             if job_id not in job_ids:
                 job_ids.append(job_id)
         for job_id in reversed(job_ids):
             self.control(["job", "cancel", "--job-id", job_id, "--workspace", str(self.workspace)], step=f"cancel-{job_id}", check=False)
+        self.jobs = self.active_job_ids()
 
     def interrupt_pane(self) -> None:
         if self.pane:
@@ -390,10 +474,15 @@ class Harness:
     def session_exists(self) -> bool:
         return self.run(["tmux", "has-session", "-t", self.session]).returncode == 0
 
+    def server_exists(self) -> bool:
+        return self.run(["tmux", "list-sessions"]).returncode == 0
+
     def cleanup(self, *, remove_artifacts: bool = True) -> dict[str, Any]:
         self.cancel_active_jobs()
         self.run(["tmux", "kill-session", "-t", self.session])
+        self.run(["tmux", "kill-server"])
         session_absent = not self.session_exists()
+        server_absent = not self.server_exists()
         if remove_artifacts:
             shutil.rmtree(self.base_dir, ignore_errors=True)
         self.remove_repo_runtime_artifacts()
@@ -401,6 +490,7 @@ class Harness:
         temp_dir_removed = not self.base_dir.exists()
         return {
             "session_absent": session_absent,
+            "server_absent": server_absent,
             "temp_dir_removed": temp_dir_removed,
             "repo_runtime_artifacts": repo_artifacts,
             "removed_repo_runtime_artifacts": self.removed_repo_artifacts,
@@ -532,7 +622,7 @@ class Harness:
         active_same_key = [
             job
             for job in self.active_jobs()
-            if job.get("dedupe_key") == dedupe_key and str(job.get("status") or "") in ACTIVE_MANAGED_STATUSES
+            if job.get("dedupe_key") == dedupe_key
         ]
         if len(active_same_key) != 1:
             raise ScenarioFailure(
@@ -682,6 +772,41 @@ class Harness:
         self.wait_status("busy-e2e", "submitted", timeout=15.0)
         self.wait_file(output, "busy-ok")
         return {"job_id": "busy-e2e", "output": str(output)}
+
+    def scenario_queue_command_file(self) -> dict[str, Any]:
+        self.current_scenario = "queue-command-file"
+        job_id = "command-file-e2e"
+        command_file = self.workspace / "queued-command.sh"
+        output = self.workspace / "command-file.out"
+        command_file.write_text("printf file-ok > command-file.out\n", encoding="utf-8")
+        self.jobs.append(job_id)
+        self.control(
+            [
+                "queue-after-idle",
+                "--job-id",
+                job_id,
+                "--pane",
+                str(self.pane),
+                "--command-file",
+                str(command_file),
+                "--poll-seconds",
+                "0.1",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="start-command-file-queue",
+        )
+        final = self.wait_status(job_id, "submitted", timeout=10.0)
+        self.wait_file(output, "file-ok", timeout=5.0)
+        record = final.get("record") or {}
+        copied_command = Path(str(record.get("command_path") or ""))
+        if copied_command.resolve() == command_file.resolve():
+            raise ScenarioFailure(self.current_scenario, "command-copy", "command-file was not copied into managed state")
+        if not copied_command.exists():
+            raise ScenarioFailure(self.current_scenario, "command-copy-exists", "managed command copy does not exist")
+        if copied_command.read_text(encoding="utf-8") != command_file.read_text(encoding="utf-8"):
+            raise ScenarioFailure(self.current_scenario, "command-copy-content", "managed command copy changed content")
+        return {"job_id": job_id, "output": str(output), "command_path": str(copied_command)}
 
     def scenario_status_fail_blocks(self) -> dict[str, Any]:
         self.current_scenario = "status-fail-blocks"
@@ -842,9 +967,7 @@ class Harness:
         active_same_key = [
             job
             for job in self.active_jobs()
-            if job.get("kind") == "watch"
-            and job.get("dedupe_key") == dedupe_key
-            and str(job.get("status") or "") in ACTIVE_MANAGED_STATUSES
+            if tmux_state.token_text(job.get("kind")) == "watch" and job.get("dedupe_key") == dedupe_key
         ]
         if len(active_same_key) > 1:
             raise ScenarioFailure(
@@ -968,10 +1091,12 @@ class Harness:
         state_dir = self.workspace / ".codex" / "tmux-skills"
         corrupt_status = state_dir / "status" / "corrupt.json"
         corrupt_job = state_dir / "jobs" / "corrupt.json"
+        corrupt_encoding = state_dir / "jobs" / "corrupt-encoding.json"
         corrupt_status.parent.mkdir(parents=True, exist_ok=True)
         corrupt_job.parent.mkdir(parents=True, exist_ok=True)
         corrupt_status.write_text("{ not: valid json", encoding="utf-8")
         corrupt_job.write_text("{ not: valid json", encoding="utf-8")
+        corrupt_encoding.write_bytes(b"\xff\xfe{")
 
         listed = self.control(["job", "list", "--workspace", str(self.workspace)], step="job-list-corrupt", check=False)
         if listed.returncode != 0:
@@ -996,6 +1121,7 @@ class Harness:
             "run_status_path": (run.json_data or {}).get("status_path"),
             "corrupt_status": str(corrupt_status),
             "corrupt_job": str(corrupt_job),
+            "corrupt_encoding": str(corrupt_encoding),
         }
 
     def scenario_replace_rejects_foreign_pid(self) -> dict[str, Any]:
@@ -1110,7 +1236,7 @@ class Harness:
                 raise ScenarioFailure(self.current_scenario, "timeout-diagnostics", f"{source_name} missing matched_required_rows")
         if record.get("send_result") is not None or status.get("send_result") is not None:
             raise ScenarioFailure(self.current_scenario, "timeout-submit-contract", "timed out status wait recorded a send_result")
-        if record.get("status") == "submitted" or status.get("status") == "submitted":
+        if tmux_state.token_text(record.get("status")) == "submitted" or tmux_state.token_text(status.get("status")) == "submitted":
             raise ScenarioFailure(self.current_scenario, "timeout-submitted", "timed out status wait became submitted")
         if status.get("exit_code") != 1:
             raise ScenarioFailure(self.current_scenario, "timeout-exit-code", "timed out status wait did not record exit code 1")
@@ -1264,6 +1390,7 @@ SCENARIO_METHODS = {
     "watch-visibility": Harness.scenario_watch_visibility,
     "capture-strips-ansi": Harness.scenario_capture_strips_ansi,
     "busy-pane-wait": Harness.scenario_busy_pane_wait,
+    "queue-command-file": Harness.scenario_queue_command_file,
     "status-fail-blocks": Harness.scenario_status_fail_blocks,
     "allow-duplicate": Harness.scenario_allow_duplicate,
     "watch-duplicate-block": Harness.scenario_watch_duplicate_block,
@@ -1298,52 +1425,143 @@ def skip_result(json_output: bool) -> int:
     return SKIP_EXIT_CODE
 
 
+def unknown_scenario_summary(names: list[str], unknown: list[str]) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "scenario_count": len(names),
+        "selected_scenarios": names,
+        "results": [
+            {
+                "scenario": name,
+                "status": "failed",
+                "elapsed_seconds": 0.0,
+                "failure": {
+                    "scenario": name,
+                    "step": "unknown-scenario",
+                    "message": f"unknown scenario: {name}",
+                },
+            }
+            for name in unknown
+        ],
+        "artifacts_kept": False,
+        "artifact_dir": None,
+        "cleanup": None,
+    }
+
+
 def run_scenarios(names: list[str], *, keep_artifacts: bool, keep_going: bool = False) -> tuple[int, dict[str, Any]]:
+    unknown = [name for name in names if name not in SCENARIO_METHODS]
+    if unknown:
+        return 1, unknown_scenario_summary(names, unknown)
+
     harness = Harness(keep_artifacts=keep_artifacts)
     results: list[dict[str, Any]] = []
     status = "passed"
     exit_code = 0
     cleanup_info: dict[str, Any] | None = None
     try:
-        harness.setup_tmux()
-        for name in names:
-            method = SCENARIO_METHODS[name]
-            started = time.monotonic()
-            should_stop = False
-            try:
-                harness.before_scenario(name)
-                detail = method(harness)
-                results.append({"scenario": name, "status": "passed", "elapsed_seconds": round(time.monotonic() - started, 3), "detail": detail})
-            except ScenarioFailure as exc:
-                status = "failed"
-                exit_code = 1
-                results.append({"scenario": name, "status": "failed", "elapsed_seconds": round(time.monotonic() - started, 3), "failure": harness.diagnostics(exc)})
-                if not keep_going:
-                    should_stop = True
-            finally:
-                harness.after_scenario()
-            harness.before_scenario("teardown-check")
-            if should_stop:
-                break
-    finally:
-        if status == "passed" or not keep_artifacts:
-            cleanup_info = harness.cleanup(remove_artifacts=True)
+        try:
+            harness.setup_tmux()
+        except ScenarioFailure as exc:
+            status = "failed"
+            exit_code = 1
+            results.append(scenario_failure_result(harness, scenario=exc.scenario, failure=exc, elapsed_seconds=0.0))
+        except Exception as exc:
+            failure = unexpected_failure("setup", exc)
+            status = "failed"
+            exit_code = 1
+            results.append(scenario_failure_result(harness, scenario=failure.scenario, failure=failure, elapsed_seconds=0.0))
         else:
-            harness.cancel_active_jobs()
-            harness.run(["tmux", "kill-session", "-t", harness.session])
-            harness.remove_repo_runtime_artifacts()
-            cleanup_info = {
-                "session_absent": not harness.session_exists(),
-                "temp_dir_removed": False,
-                "repo_runtime_artifacts": harness.repo_runtime_artifacts(),
-                "removed_repo_runtime_artifacts": harness.removed_repo_artifacts,
-                "artifact_dir": str(harness.base_dir),
-            }
+            for name in names:
+                method = SCENARIO_METHODS[name]
+                started = time.monotonic()
+                should_stop = False
+                try:
+                    harness.before_scenario(name)
+                    detail = method(harness)
+                    results.append({"scenario": name, "status": "passed", "elapsed_seconds": round(time.monotonic() - started, 3), "detail": detail})
+                except ScenarioFailure as exc:
+                    status = "failed"
+                    exit_code = 1
+                    results.append(scenario_failure_result(harness, scenario=name, failure=exc, elapsed_seconds=round(time.monotonic() - started, 3)))
+                    if not keep_going:
+                        should_stop = True
+                except Exception as exc:
+                    status = "failed"
+                    exit_code = 1
+                    failure = unexpected_failure(name, exc)
+                    results.append(scenario_failure_result(harness, scenario=name, failure=failure, elapsed_seconds=round(time.monotonic() - started, 3)))
+                    if not keep_going:
+                        should_stop = True
+                try:
+                    harness.after_scenario()
+                except ScenarioFailure as exc:
+                    status = "failed"
+                    exit_code = 1
+                    results.append(scenario_failure_result(harness, scenario=exc.scenario, failure=exc, elapsed_seconds=0.0))
+                    should_stop = True
+                except Exception as exc:
+                    status = "failed"
+                    exit_code = 1
+                    failure = unexpected_failure(name, exc, step="after-scenario")
+                    results.append(scenario_failure_result(harness, scenario=name, failure=failure, elapsed_seconds=0.0))
+                    should_stop = True
+                try:
+                    harness.before_scenario("teardown-check")
+                except ScenarioFailure as exc:
+                    status = "failed"
+                    exit_code = 1
+                    results.append(scenario_failure_result(harness, scenario=exc.scenario, failure=exc, elapsed_seconds=0.0))
+                    should_stop = True
+                except Exception as exc:
+                    status = "failed"
+                    exit_code = 1
+                    failure = unexpected_failure(name, exc, step="teardown-check")
+                    results.append(scenario_failure_result(harness, scenario=name, failure=failure, elapsed_seconds=0.0))
+                    should_stop = True
+                if should_stop:
+                    break
+    finally:
+        try:
+            if status == "passed" or not keep_artifacts:
+                cleanup_info = harness.cleanup(remove_artifacts=True)
+            else:
+                harness.cancel_active_jobs()
+                harness.run(["tmux", "kill-session", "-t", harness.session])
+                harness.run(["tmux", "kill-server"])
+                harness.remove_repo_runtime_artifacts()
+                cleanup_info = {
+                    "session_absent": not harness.session_exists(),
+                    "server_absent": not harness.server_exists(),
+                    "temp_dir_removed": False,
+                    "repo_runtime_artifacts": harness.repo_runtime_artifacts(),
+                    "removed_repo_runtime_artifacts": harness.removed_repo_artifacts,
+                    "artifact_dir": str(harness.base_dir),
+                }
+        except Exception as exc:
+            status = "failed"
+            exit_code = 1
+            cleanup_info = cleanup_failure_info(harness, exc)
+            results.append(
+                {
+                    "scenario": "e2e-cleanup-verification",
+                    "status": "failed",
+                    "elapsed_seconds": 0.0,
+                    "failure": {
+                        "scenario": "e2e-cleanup-verification",
+                        "step": "cleanup-exception",
+                        "message": f"{type(exc).__name__}: {exc}",
+                        "cleanup": cleanup_info,
+                    },
+                }
+            )
 
     if status == "passed" and cleanup_info:
         cleanup_errors: list[str] = []
         if not cleanup_info.get("session_absent"):
             cleanup_errors.append("test tmux session still exists")
+        if not cleanup_info.get("server_absent"):
+            cleanup_errors.append("test tmux server still exists")
         if not cleanup_info.get("temp_dir_removed"):
             cleanup_errors.append("temp directory still exists")
         if cleanup_info.get("repo_runtime_artifacts"):
@@ -1379,10 +1597,19 @@ def run_scenarios(names: list[str], *, keep_artifacts: bool, keep_going: bool = 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run real-use E2E scenarios for tmux-skills")
     choices = ["smoke", "all", *SCENARIO_METHODS.keys()]
-    parser.add_argument("--scenario", choices=choices, default="smoke")
+    parser.add_argument(
+        "--scenario",
+        choices=choices,
+        default="smoke",
+        help="Scenario group or named scenario to run (default: smoke)",
+    )
     parser.add_argument("--json", action="store_true", help="Print machine-readable summary")
     parser.add_argument("--keep-artifacts", action="store_true", help="Keep temp artifacts after a failure")
-    parser.add_argument("--keep-going", action="store_true", help="Run all selected scenarios even if some fail; aggregate results")
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="Continue after scenario-body failures; stop on teardown or cleanup failures",
+    )
     return parser
 
 

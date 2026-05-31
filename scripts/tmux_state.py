@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import shlex
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,12 +17,19 @@ from typing import Any
 
 STATE_VERSION = 1
 TASK_VERSION = 2
-TERMINAL_STATUSES = {"succeeded", "failed", "matched", "timeout", "stopped", "submitted", "cancelled", "stale"}
 MANAGED_ACTIVE_STATUSES = {"starting", "running", "waiting", "waiting_status", "waiting_pane_idle"}
+MANAGED_TERMINAL_STATUSES = {"submitted", "failed", "timeout", "cancelled", "stale"}
+TERMINAL_STATUSES = {"succeeded", "matched", "stopped"} | MANAGED_TERMINAL_STATUSES
+FAILED_TRIGGER_STATUSES = {"failed", "timeout", "stopped", "cancelled", "stale"}
 RUNNING_STATUSES = {"pending", "running", "starting", "waiting", "waiting_status", "waiting_pane_idle"}
 TASK_STATUSES = {"waiting", "ready", "in_progress", "done", "blocked", "cancelled"}
-TASK_OPEN_STATUSES = {"waiting", "ready", "in_progress"}
+TASK_OPEN_STATUSES = {"waiting", "ready", "in_progress", "blocked"}
+TASK_TRIGGERS = {"succeeded", "failed", "terminal"}
+TASK_TRANSIENT_FIELDS = {"effective_status", "matched_status", "stale", "task_path"}
+MANAGED_TRANSIENT_FIELDS = {"pid_running", "pid_matches", "stale"}
+MANAGED_WORKER_ACTIONS = {"queue-after-idle", "queue-after-status", "watch"}
 DEFAULT_STALE_SECONDS = 30 * 60
+TASK_DISPLAY_TEXT_LIMIT = 800
 
 
 def utc_now() -> str:
@@ -101,7 +111,7 @@ def read_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
             data = json.load(handle)
     except FileNotFoundError:
         return None, None
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return None, str(exc)
 
     if not isinstance(data, dict):
@@ -111,7 +121,7 @@ def read_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
 
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -125,6 +135,27 @@ def command_preview(command_text: str, limit: int = 200) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 1] + "…"
+
+
+def one_line_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
+
+
+def token_text(value: Any) -> str:
+    return one_line_text(value).lower()
+
+
+def bounded_one_line_text(value: Any, *, limit: int = TASK_DISPLAY_TEXT_LIMIT, keep_tail: bool = False) -> str:
+    text = one_line_text(value)
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    if keep_tail:
+        return "..." + text[-(limit - 3) :]
+    return text[: limit - 3] + "..."
 
 
 def tail_text(text: str, limit: int = 4000) -> str:
@@ -143,6 +174,16 @@ def parse_time(value: Any) -> datetime | None:
     if result.tzinfo is None or result.tzinfo.utcoffset(result) is None:
         result = result.replace(tzinfo=timezone.utc)
     return result
+
+
+def path_mtime_utc(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        timestamp = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    except OSError:
+        return None
+    return timestamp.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def age_seconds(value: Any, *, now: datetime | None = None) -> float | None:
@@ -188,14 +229,16 @@ def build_status(
     ended_at: str | None = None,
 ) -> dict[str, Any]:
     now = utc_now()
+    kind_value = token_text(kind) or "job"
+    status_value = token_text(status) or "unknown"
     data: dict[str, Any] = {
         "version": STATE_VERSION,
-        "kind": kind,
+        "kind": kind_value,
         "id": item_id,
         "attempt": attempt,
         "event_id": None,
         "name": name,
-        "status": status,
+        "status": status_value,
         "exit_code": exit_code,
         "pane_id": pane_id,
         "command_preview": command_preview_text,
@@ -207,17 +250,20 @@ def build_status(
         "log_path": str(log_file) if log_file else None,
         "last_output": tail_text(last_output),
     }
-    if status in TERMINAL_STATUSES:
+    if status_value in TERMINAL_STATUSES:
         data["ended_at"] = ended_at or now
         data["event_id"] = terminal_event_id(data)
     return data
 
 
 def write_status(path: Path, data: dict[str, Any]) -> dict[str, Any]:
-    updated = dict(data)
-    updated["updated_at"] = utc_now()
+    explicit_ended_at = bool(data.get("ended_at"))
+    updated = normalize_status(data, path)
+    now = utc_now()
+    updated["updated_at"] = now
     if updated.get("status") in TERMINAL_STATUSES:
-        updated["ended_at"] = updated.get("ended_at") or updated["updated_at"]
+        if not explicit_ended_at:
+            updated["ended_at"] = now
         updated["event_id"] = terminal_event_id(updated)
     atomic_write_json(path, updated)
     return updated
@@ -238,25 +284,46 @@ def load_statuses(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]
 
 
 def normalize_status(status: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
-    item_id = str(status.get("id") or status.get("job_id") or (path.stem if path else "unknown"))
+    item_id = safe_id(str(path.stem if path else status.get("id") or status.get("job_id") or "unknown"))
+    file_timestamp = path_mtime_utc(path)
     normalized = dict(status)
     normalized.setdefault("version", STATE_VERSION)
     normalized["id"] = item_id
+    if "job_id" in normalized:
+        normalized["job_id"] = item_id
     normalized.setdefault("kind", "job")
+    normalized["kind"] = token_text(normalized.get("kind")) or "job"
     normalized.setdefault("attempt", 1)
     normalized.setdefault("event_id", None)
+    if normalized.get("event_id") is not None:
+        event_id = str(normalized["event_id"]).strip()
+        normalized["event_id"] = event_id or None
     normalized.setdefault("name", None)
     normalized.setdefault("status", "unknown")
+    normalized["status"] = token_text(normalized.get("status")) or "unknown"
     normalized.setdefault("exit_code", None)
     normalized.setdefault("pane_id", None)
     normalized.setdefault("command_preview", None)
+    if normalized["command_preview"] is not None:
+        normalized["command_preview"] = command_preview(str(normalized["command_preview"]))
     normalized.setdefault("cwd", None)
-    normalized.setdefault("started_at", normalized.get("updated_at"))
-    normalized.setdefault("updated_at", normalized.get("ended_at") or normalized.get("started_at"))
+    normalized.setdefault("started_at", normalized.get("updated_at") or file_timestamp)
+    normalized.setdefault("updated_at", normalized.get("ended_at") or normalized.get("started_at") or file_timestamp)
     normalized.setdefault("ended_at", None)
-    normalized.setdefault("status_path", str(path) if path else None)
+    if path:
+        normalized["status_path"] = str(path)
+    else:
+        normalized.setdefault("status_path", None)
     normalized.setdefault("log_path", None)
     normalized.setdefault("last_output", "")
+    normalized["last_output"] = tail_text(str(normalized["last_output"])) if normalized["last_output"] is not None else ""
+    if is_terminal(normalized):
+        normalized["ended_at"] = normalized.get("ended_at") or normalized.get("updated_at") or file_timestamp or utc_now()
+        if not normalized.get("event_id"):
+            normalized["event_id"] = terminal_event_id(normalized)
+    else:
+        normalized["ended_at"] = None
+        normalized["event_id"] = None
     return normalized
 
 
@@ -275,11 +342,11 @@ def load_statuses_normalized(root: Path) -> tuple[list[dict[str, Any]], list[dic
 
 
 def is_terminal(status: dict[str, Any]) -> bool:
-    return str(status.get("status") or "") in TERMINAL_STATUSES
+    return token_text(status.get("status")) in TERMINAL_STATUSES
 
 
 def is_active_managed_job(record: dict[str, Any]) -> bool:
-    return str(record.get("status") or "") in MANAGED_ACTIVE_STATUSES
+    return token_text(record.get("status")) in MANAGED_ACTIVE_STATUSES
 
 
 def managed_job_interval_seconds(record: dict[str, Any]) -> float:
@@ -287,11 +354,72 @@ def managed_job_interval_seconds(record: dict[str, Any]) -> float:
         interval = float(record.get("check_interval_seconds") or 0)
     except (TypeError, ValueError):
         interval = 0.0
-    return max(interval, 0.0)
+    if not math.isfinite(interval) or interval < 0:
+        return 0.0
+    return interval
 
 
 def managed_job_stale_threshold(record: dict[str, Any]) -> float:
     return max(3.0 * managed_job_interval_seconds(record), 300.0)
+
+
+def managed_job_pid(record: dict[str, Any]) -> int | None:
+    try:
+        pid = int(record.get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def pid_is_running(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def process_command_line(pid: int | None) -> str:
+    if not pid:
+        return ""
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+def managed_worker_command_matches(command_line: str, job_id: str) -> bool:
+    if not command_line or not job_id:
+        return False
+    try:
+        parts = shlex.split(command_line)
+    except ValueError:
+        return False
+    script_index = next((index for index, part in enumerate(parts) if Path(part).name == "tmux_queue.py"), None)
+    if script_index is None:
+        return False
+    if script_index + 1 >= len(parts) or parts[script_index + 1] not in MANAGED_WORKER_ACTIONS:
+        return False
+    for index, part in enumerate(parts[script_index + 2 :], start=script_index + 2):
+        if part == "--job-id" and index + 1 < len(parts):
+            return parts[index + 1] == job_id
+        if part.startswith("--job-id="):
+            return part.split("=", 1)[1] == job_id
+    return False
+
+
+def managed_worker_pid_matches(record: dict[str, Any]) -> bool:
+    pid = managed_job_pid(record)
+    command_line = process_command_line(pid)
+    return managed_worker_command_matches(command_line, str(record.get("job_id") or ""))
 
 
 def managed_job_stale_reason(
@@ -385,7 +513,7 @@ def build_task(
 
 
 def normalize_task(task: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
-    task_id = str(task.get("task_id") or task.get("id") or (path.stem if path else f"task-{uuid.uuid4().hex[:12]}"))
+    task_id = str(path.stem if path else task.get("task_id") or task.get("id") or f"task-{uuid.uuid4().hex[:12]}")
     normalized = dict(task)
     try:
         version = int(normalized.get("version") or TASK_VERSION)
@@ -393,15 +521,31 @@ def normalize_task(task: dict[str, Any], path: Path | None = None) -> dict[str, 
         version = TASK_VERSION
     normalized["version"] = version
     normalized["task_id"] = safe_id(task_id)
+    normalized["status"] = token_text(normalized.get("status")) or "waiting"
     if normalized.get("status") not in TASK_STATUSES:
         normalized["status"] = "waiting"
     normalized.setdefault("instruction", "")
     normalized.setdefault("summary", None)
     normalized.setdefault("intent", None)
     normalized.setdefault("after_job_id", None)
+    if normalized.get("after_job_id") is not None:
+        after_job_id = one_line_text(normalized.get("after_job_id"))
+        normalized["after_job_id"] = safe_id(after_job_id) if after_job_id else None
     normalized.setdefault("after_event_id", None)
+    if normalized.get("after_event_id") is not None:
+        after_event_id = str(normalized["after_event_id"]).strip()
+        normalized["after_event_id"] = after_event_id or None
     normalized.setdefault("trigger_on", "succeeded")
-    normalized.setdefault("evidence_paths", [])
+    normalized["trigger_on"] = token_text(normalized.get("trigger_on")) or "succeeded"
+    if normalized.get("trigger_on") not in TASK_TRIGGERS:
+        normalized["trigger_on"] = "succeeded"
+    evidence_paths = normalized.get("evidence_paths")
+    if isinstance(evidence_paths, list):
+        normalized["evidence_paths"] = [str(value) for value in evidence_paths if value]
+    elif isinstance(evidence_paths, str) and evidence_paths:
+        normalized["evidence_paths"] = [evidence_paths]
+    else:
+        normalized["evidence_paths"] = []
     normalized.setdefault("created_at", normalized.get("updated_at") or utc_now())
     normalized.setdefault("updated_at", normalized.get("created_at"))
     normalized.setdefault("claimed_at", None)
@@ -430,20 +574,35 @@ def load_tasks(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
 
 
 def normalize_managed_job(record: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
-    job_id = str(record.get("job_id") or record.get("id") or (path.stem if path else "unknown"))
+    job_id = safe_id(str(path.stem if path else record.get("job_id") or record.get("id") or "unknown"))
     normalized = dict(record)
     normalized.setdefault("version", STATE_VERSION)
     normalized["job_id"] = job_id
     normalized["id"] = job_id
     normalized.setdefault("kind", "job")
+    normalized["kind"] = token_text(normalized.get("kind")) or "job"
     normalized.setdefault("status", "unknown")
+    normalized["status"] = token_text(normalized.get("status")) or "unknown"
     normalized.setdefault("pane_id", None)
     normalized.setdefault("heartbeat_at", normalized.get("updated_at"))
     normalized.setdefault("updated_at", normalized.get("heartbeat_at"))
-    normalized.setdefault("status_path", None)
-    normalized.setdefault("log_path", None)
-    normalized.setdefault("job_path", str(path) if path else None)
+    if path:
+        root = path.parent.parent
+        normalized["status_path"] = str(root / "status" / f"{job_id}.json")
+        normalized["log_path"] = str(root / "logs" / f"{job_id}.log")
+        normalized["job_path"] = str(path)
+    else:
+        normalized.setdefault("status_path", None)
+        normalized.setdefault("log_path", None)
+        normalized.setdefault("job_path", None)
     return normalized
+
+
+def strip_managed_transient_fields(record: dict[str, Any]) -> None:
+    for key in MANAGED_TRANSIENT_FIELDS:
+        record.pop(key, None)
+    if token_text(record.get("status")) != "stale":
+        record.pop("stale_reason", None)
 
 
 def load_managed_jobs(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
@@ -460,32 +619,52 @@ def load_managed_jobs(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
     return jobs, errors
 
 
+def managed_job_with_effective_state(record: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(record)
+    pid = managed_job_pid(enriched)
+    pid_running = pid_is_running(pid) if pid else False
+    pid_matches = managed_worker_pid_matches(enriched) if pid_running else False
+    stale_reason = managed_job_stale_reason(enriched, pid_running=pid_running, pid_matches=pid_matches)
+    enriched["pid_running"] = pid_running
+    enriched["pid_matches"] = pid_matches
+    enriched["stale"] = bool(stale_reason)
+    if stale_reason:
+        enriched["stale_reason"] = stale_reason
+    else:
+        enriched.pop("stale_reason", None)
+    return enriched
+
+
 def write_task(paths: dict[str, Path], task: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_task(task)
+    for key in TASK_TRANSIENT_FIELDS:
+        normalized.pop(key, None)
     normalized["updated_at"] = utc_now()
     path = task_path(paths, normalized["task_id"])
     stored = dict(normalized)
-    stored.pop("task_path", None)
     atomic_write_json(path, stored)
     normalized["task_path"] = str(path)
     return normalized
 
 
 def status_matches_trigger(status: dict[str, Any], trigger_on: str) -> bool:
-    state = str(status.get("status") or "")
+    state = token_text(status.get("status"))
+    trigger_on = token_text(trigger_on)
     if trigger_on == "terminal":
         return state in TERMINAL_STATUSES
     if trigger_on == "succeeded":
         return state == "succeeded"
     if trigger_on == "failed":
-        return state in {"failed", "timeout", "stopped"}
+        return state in FAILED_TRIGGER_STATUSES
     return False
 
 
 def matching_status(task: dict[str, Any], statuses: list[dict[str, Any]]) -> dict[str, Any] | None:
-    trigger_on = str(task.get("trigger_on") or "succeeded")
+    trigger_on = token_text(task.get("trigger_on")) or "succeeded"
     after_event_id = task.get("after_event_id")
     after_job_id = task.get("after_job_id")
+    if not after_event_id and not after_job_id:
+        return None
     for status in statuses:
         if after_event_id and status.get("event_id") != after_event_id:
             continue
@@ -502,7 +681,7 @@ def effective_task_status(
     *,
     stale_seconds: int = DEFAULT_STALE_SECONDS,
 ) -> tuple[str, dict[str, Any] | None, bool]:
-    raw_status = str(task.get("status") or "waiting")
+    raw_status = token_text(task.get("status")) or "waiting"
     match = matching_status(task, statuses)
     effective = raw_status
     if raw_status == "waiting" and match:
@@ -543,6 +722,7 @@ def load_task_state(
     statuses, status_errors = load_statuses_normalized(paths["root"])
     jobs, job_errors = load_managed_jobs(paths["root"])
     tasks, task_errors = load_tasks(paths["root"])
+    jobs = [managed_job_with_effective_state(job) for job in jobs]
     enriched_tasks = [task_with_effective_state(task, statuses, stale_seconds=stale_seconds) for task in tasks]
     statuses.sort(key=sort_key, reverse=True)
     jobs.sort(key=lambda job: str(job.get("heartbeat_at") or job.get("updated_at") or ""), reverse=True)
@@ -568,8 +748,8 @@ def classify_task_state(state: dict[str, Any], *, max_items: int = 5) -> dict[st
         for task in tasks
         if task.get("effective_status") in {"blocked", "cancelled"} or task.get("stale")
     ]
-    running_statuses = [status for status in statuses if str(status.get("status") or "") in RUNNING_STATUSES]
-    active_jobs = [job for job in jobs if is_active_managed_job(job)]
+    running_statuses = [status for status in statuses if token_text(status.get("status")) in RUNNING_STATUSES]
+    active_jobs = [job for job in jobs if is_active_managed_job(job) and not job.get("stale")]
     recent_jobs = [status for status in statuses if is_terminal(status)]
     return {
         "workspace": state["workspace"],
@@ -584,5 +764,6 @@ def classify_task_state(state: dict[str, Any], *, max_items: int = 5) -> dict[st
 
 
 def task_summary_line(task: dict[str, Any]) -> str:
-    summary = task.get("summary") or task.get("instruction") or "(no instruction)"
-    return f"{task.get('task_id')} [{task.get('effective_status', task.get('status'))}] {summary}"
+    summary = bounded_one_line_text(task.get("summary") or task.get("instruction")) or "(no instruction)"
+    status = "stale" if task.get("stale") else one_line_text(task.get("effective_status") or task.get("status")) or "unknown"
+    return f"{task.get('task_id')} [{status}] {summary}"

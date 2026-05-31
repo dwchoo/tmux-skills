@@ -18,7 +18,7 @@ Codex skill for controlled tmux usage. It provides concise skill instructions, P
 - `scripts/tmux_queue.py`: managed watch and queue-after worker.
 - `scripts/tmux_monitor.py`: single-trigger pane monitor.
 - `scripts/codex_tmux_hook.py`: command hook status reader.
-- `.codex/tmux-skills/tasks/`: runtime follow-up task records created by `task` and `run --next-instruction`.
+- `.codex/tmux-skills/tasks/`: runtime follow-up task records created by anchored `task add` and `run --next-instruction`.
 - `.codex/tmux-skills/jobs/`: managed background worker records created by `watch` and queue commands.
 
 ## Documentation

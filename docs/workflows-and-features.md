@@ -22,6 +22,7 @@ The preferred flow is:
 | Pane discovery | Find stable pane ids instead of relying on visual pane positions. | `list`, `current`, `resolve` | `SKILL.md` |
 | Safe send | Avoid injecting commands into busy panes or non-executable scripts by accident. | `send --require-idle-shell`, `send --strict-preflight`, `send --bash-if-not-executable` | `managed-workers.md` |
 | Long-running jobs | Run work with command files, logs, status JSON, and optional follow-up tasks. | `run --command`, `run --next-instruction` | `SKILL.md`, `references/WORKFLOWS.md` |
+| Pane monitor | Watch a pane until one match, idle-shell event, timeout, or stop signal writes terminal status. | `monitor --match-regex`, `monitor --idle-shell` | `references/WORKFLOWS.md` |
 | Managed watch | Keep an active pane visible to hooks without raw shell watcher processes. | `watch`, `watch status`, `watch cancel` | `managed-workers.md` |
 | Queue after idle | Submit the next command only after a busy pane returns to an idle shell. | `queue-after-idle` | `managed-workers.md` |
 | Queue after status | Submit the next command after a status TSV reaches required rows and the target pane is idle. | `queue-after-status` | `managed-workers.md` |
@@ -74,18 +75,24 @@ python scripts/tmux_control.py run \
   --next-instruction 'Inspect the training result and choose the next experiment.'
 ```
 
+Use `--next-instruction-file PATH` for longer follow-up text; the path and file content must be nonblank. Use `--next-on succeeded|failed|terminal` when the task should become ready on a different terminal result. `failed` matches unsuccessful terminal states: `failed`, `timeout`, `stopped`, `cancelled`, and `stale`; use `terminal` when any terminal state should wake the task.
+
 Expected records:
 
 - Command file under `.codex/tmux-skills/commands`.
 - Log file under `.codex/tmux-skills/logs`.
 - Status JSON under `.codex/tmux-skills/status`.
 - Optional follow-up task under `.codex/tmux-skills/tasks`.
+- If the wrapper receives SIGINT or SIGTERM, it stops the child process group and records terminal status `stopped`.
+- If the wrapper command cannot be sent to the pane, the job records `failed`; follow-up tasks configured for `failed` or `terminal` become ready, while `succeeded` follow-ups are cancelled.
 
 Resume behavior:
 
 - Hooks can surface terminal events or ready tasks.
-- A fresh session should inspect tasks explicitly with `task load --for-skill`.
+- A fresh session should inspect tasks explicitly with `task load --for-skill`; the report includes ready, running, blocked, and stale work. Running managed entries include their kind and pane.
 - Follow-up tasks do not execute while Codex is absent.
+- Task JSON files store canonical task fields only; derived fields such as `effective_status`, `matched_status`, and `stale` are read-time output.
+- Text task summaries label stale in-progress tasks as `stale`; JSON output keeps the stored status plus the derived `stale` flag.
 
 ## Workflow: Queue a Command After a Busy Pane Becomes Idle
 
@@ -104,6 +111,8 @@ Expected lifecycle:
 1. Worker record starts under `.codex/tmux-skills/jobs`.
 2. The worker heartbeats while the pane is busy.
 3. Once the pane is idle, the command is submitted.
+
+Use `--command-file PATH` instead of `--command TEXT` for long or multi-line queued commands.
 
 Use `job cancel --job-id next-train` if the queued command is no longer wanted.
 
@@ -186,9 +195,11 @@ See [`managed-workers.md`](managed-workers.md) for the stale threshold and exact
 | Queue after status only after required TSV rows | `status-chain` |
 | Status-ready command waits for busy pane idle | `status-chain-waits-for-busy-pane` |
 | Concurrent duplicate prevention across two CLI starts | `concurrent-duplicate-race` |
+| Sequential duplicate rejection | `duplicate-block` |
 | Strict script preflight avoids accidental send | `preflight-strict` |
 | Active watch appears in hook context | `watch-visibility` |
 | Busy pane queue does not submit prematurely | `busy-pane-wait` |
+| Queued command files are copied and submitted | `queue-command-file` |
 | Fail rows block queue submission | `status-fail-blocks` |
 | Intentional parallel duplicate metadata | `allow-duplicate` |
 | Watch duplicate behavior matches queue duplicate behavior | `watch-duplicate-block` |

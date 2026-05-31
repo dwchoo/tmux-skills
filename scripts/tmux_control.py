@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -133,6 +134,46 @@ def parse_int(value: str) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def positive_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite positive number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return number
+
+
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return number
+
+
+def split_percent(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer from 1 to 99") from exc
+    if number < 1 or number > 99:
+        raise argparse.ArgumentTypeError("must be an integer from 1 to 99")
+    return number
 
 
 def process_index() -> tuple[dict[int, list[tuple[int, str]]], dict[int, tuple[int, str]]]:
@@ -502,8 +543,6 @@ def idle_shell_check(pane: str) -> dict[str, Any]:
     command = str(info.get("current_command") or "")
     pane_pid = parse_int(str(info.get("pane_pid") or ""))
     immediate_count, summary, descendant_count = descendant_processes(pane_pid)
-    prompt_output = capture_text(pane, 20, strip=True)
-    has_prompt = prompt_like(prompt_output)
     diagnostics = {
         "pane_id": info.get("pane_id", pane),
         "current_command": command,
@@ -511,8 +550,13 @@ def idle_shell_check(pane: str) -> dict[str, Any]:
         "child_process_count": immediate_count,
         "descendant_process_count": descendant_count,
         "descendant_summary": summary,
-        "prompt_detected": has_prompt,
     }
+    try:
+        prompt_output = capture_text(pane, 20, strip=True)
+    except Exception as exc:
+        return {"ok": False, "reason": f"could not capture pane output: {exc}", **diagnostics}
+    has_prompt = prompt_like(prompt_output)
+    diagnostics["prompt_detected"] = has_prompt
 
     if command not in SHELL_COMMANDS:
         return {"ok": False, "reason": f"pane foreground command is not an idle shell: {command}", **diagnostics}
@@ -544,18 +588,43 @@ def script_preflight(command_text: str, cwd: str | None = None) -> dict[str, Any
     if not resolved.exists() or resolved.is_dir() or os.access(resolved, os.X_OK):
         return {"ok": True, "warnings": [], "script_path": str(resolved)}
 
-    warning = f"preflight_warning: {first} is not executable; use 'bash {first}' or chmod +x."
+    bash_target = str(resolved) if first.startswith("~") else first
+    warning = f"preflight_warning: {first} is not executable; use 'bash {bash_target}' or chmod +x."
     return {
         "ok": False,
         "warnings": [warning],
         "script_path": str(resolved),
-        "bash_command": " ".join(["bash", shlex.quote(first), *(shlex.quote(part) for part in parts[1:])]),
+        "bash_command": " ".join(["bash", shlex.quote(bash_target), *(shlex.quote(part) for part in parts[1:])]),
     }
+
+
+def needs_script_preflight_cwd(command_text: str) -> bool:
+    try:
+        parts = shlex.split(command_text, posix=True)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    first = parts[0]
+    if first in {"bash", "sh", "zsh", "fish", "dash", "ksh"}:
+        return False
+    return first.startswith("./") or first.startswith("../") or first.endswith(".sh")
+
+
+def send_preflight_cwd(args: argparse.Namespace) -> str | None:
+    explicit = getattr(args, "cwd", None)
+    if explicit:
+        return str(explicit)
+    if not needs_script_preflight_cwd(args.command_text):
+        return None
+    info = current_info(args.pane)
+    current_path = (info or {}).get("current_path")
+    return str(current_path) if current_path else None
 
 
 def send(args: argparse.Namespace) -> dict[str, Any]:
     guard: dict[str, Any] | None = None
-    preflight = script_preflight(args.command_text, getattr(args, "cwd", None))
+    preflight = script_preflight(args.command_text, send_preflight_cwd(args))
     command_text = args.command_text
     if not preflight.get("ok"):
         if getattr(args, "bash_if_not_executable", False) and preflight.get("bash_command"):
@@ -603,7 +672,11 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def truncate_text(text: str, max_chars: int | None) -> tuple[str, bool, int]:
-    if max_chars is None or len(text) <= max_chars:
+    if max_chars is None:
+        return text, False, 0
+    if max_chars <= 0:
+        return "", bool(text), len(text)
+    if len(text) <= max_chars:
         return text, False, 0
     return text[-max_chars:], True, len(text) - max_chars
 
@@ -649,18 +722,75 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
     cwd = Path(args.cwd).expanduser().resolve() if args.cwd else paths["workspace"]
-    item_id = tmux_state.safe_id(args.job_id or f"job-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}")
+    job_id_arg = getattr(args, "job_id", None)
+    if job_id_arg is not None and not tmux_state.one_line_text(job_id_arg):
+        die("run requires nonblank --job-id when provided")
+    item_id = tmux_state.safe_id(job_id_arg or f"job-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}")
     attempt = next_attempt(paths, item_id)
-
-    if args.command_file:
-        command_text = Path(args.command_file).expanduser().read_text(encoding="utf-8")
-    else:
-        command_text = args.command_text
-
     cmd_file = tmux_state.command_path(paths, item_id)
     status_file = tmux_state.status_path(paths, item_id)
     log_file = tmux_state.log_path(paths, item_id)
-    write_command_file(cmd_file, command_text)
+
+    def finalize_start_failure(reason: str, command_preview_text: str | None) -> dict[str, Any]:
+        failed = tmux_state.build_status(
+            kind="job",
+            item_id=item_id,
+            attempt=attempt,
+            name=args.name,
+            status="failed",
+            pane_id=args.pane,
+            command_preview_text=command_preview_text,
+            cwd=str(cwd),
+            status_file=status_file,
+            log_file=log_file,
+            exit_code=1,
+            last_output=reason,
+        )
+        tmux_state.write_status(status_file, failed)
+        return {
+            "job_id": item_id,
+            "attempt": attempt,
+            "pane_id": args.pane,
+            "sent": False,
+            "reason": reason,
+            "status": "failed",
+            "command_path": str(cmd_file),
+            "status_path": str(status_file),
+            "log_path": str(log_file),
+            "workspace": str(paths["workspace"]),
+            "state_dir": str(paths["root"]),
+            "next_task": None,
+        }
+
+    command_file_arg = getattr(args, "command_file", None)
+    try:
+        if command_file_arg is not None:
+            if not tmux_state.one_line_text(command_file_arg):
+                return finalize_start_failure("command file path is blank", None)
+            source_command_file = Path(str(command_file_arg)).expanduser()
+            command_text = source_command_file.read_text(encoding="utf-8")
+        else:
+            command_text = "" if getattr(args, "command_text", None) is None else str(args.command_text)
+    except Exception as exc:
+        return finalize_start_failure(
+            f"could not read command file: {exc}",
+            str(Path(str(command_file_arg)).expanduser()),
+        )
+
+    if not tmux_state.one_line_text(command_text):
+        return finalize_start_failure("command is blank", tmux_state.command_preview(command_text))
+
+    try:
+        next_instruction = read_text_arg(getattr(args, "next_instruction", None), getattr(args, "next_instruction_file", None))
+    except Exception as exc:
+        return finalize_start_failure(f"could not read next instruction: {exc}", tmux_state.command_preview(command_text))
+    if next_instruction is not None and not tmux_state.one_line_text(next_instruction):
+        return finalize_start_failure("next instruction is blank", tmux_state.command_preview(command_text))
+
+    try:
+        write_command_file(cmd_file, command_text)
+    except Exception as exc:
+        return finalize_start_failure(f"could not write command file: {exc}", tmux_state.command_preview(command_text))
 
     pending = tmux_state.build_status(
         kind="job",
@@ -699,7 +829,6 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
     if args.name:
         argv.extend(["--name", args.name])
 
-    next_instruction = read_text_arg(getattr(args, "next_instruction", None), getattr(args, "next_instruction_file", None))
     next_task: dict[str, Any] | None = None
     if next_instruction:
         next_task = tmux_state.build_task(
@@ -738,13 +867,17 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
             exit_code=1,
             last_output=f"command was not sent to pane: {reason}",
         )
-        tmux_state.write_status(status_file, failed)
+        failed = tmux_state.write_status(status_file, failed)
         if next_task is not None:
-            next_task["status"] = "cancelled"
-            next_task["blocked_reason"] = "job command was not sent to pane"
-            next_task = tmux_state.write_task(paths, next_task)
-            if result is not None:
-                result["next_task"] = next_task
+            if tmux_state.status_matches_trigger(failed, str(next_task.get("trigger_on") or "succeeded")):
+                if result is not None:
+                    result["next_task"] = next_task
+            else:
+                next_task["status"] = "cancelled"
+                next_task["blocked_reason"] = "job command was not sent to pane"
+                next_task = tmux_state.write_task(paths, next_task)
+                if result is not None:
+                    result["next_task"] = next_task
         if result is not None:
             result["status"] = "failed"
         return result
@@ -774,6 +907,8 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def monitor(args: argparse.Namespace) -> dict[str, Any]:
+    if not tmux_state.one_line_text(getattr(args, "pane", None)):
+        die("monitor requires nonblank --pane")
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
     monitor_id = tmux_state.safe_id(f"monitor-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}")
@@ -801,13 +936,44 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
     if args.timeout_seconds is not None:
         argv.extend(["--timeout-seconds", str(args.timeout_seconds)])
 
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=tmux_env())
+    status_path = tmux_state.status_path(paths, monitor_id)
+    log_path = tmux_state.log_path(paths, monitor_id)
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=tmux_env())
+    except Exception as exc:
+        reason = f"monitor worker failed to start: {exc}"
+        failed = tmux_state.build_status(
+            kind="monitor",
+            item_id=monitor_id,
+            attempt=1,
+            name=getattr(args, "name", None),
+            status="failed",
+            pane_id=args.pane,
+            command_preview_text=args.match_regex or ("idle-shell" if args.idle_shell else "monitor"),
+            cwd=str(paths["workspace"]),
+            status_file=status_path,
+            log_file=log_path,
+            exit_code=1,
+            last_output=reason,
+        )
+        tmux_state.write_status(status_path, failed)
+        return {
+            "monitor_id": monitor_id,
+            "started": False,
+            "reason": reason,
+            "pane_id": args.pane,
+            "status_path": str(status_path),
+            "log_path": str(log_path),
+            "workspace": str(paths["workspace"]),
+            "state_dir": str(paths["root"]),
+        }
     return {
         "monitor_id": monitor_id,
+        "started": True,
         "pid": proc.pid,
         "pane_id": args.pane,
-        "status_path": str(tmux_state.status_path(paths, monitor_id)),
-        "log_path": str(tmux_state.log_path(paths, monitor_id)),
+        "status_path": str(status_path),
+        "log_path": str(log_path),
         "workspace": str(paths["workspace"]),
         "state_dir": str(paths["root"]),
     }
@@ -845,6 +1011,36 @@ def resolve_status_arg(paths: dict[str, Path], status_file: str | None) -> str |
 
 def canonical_row_specs(rows: list[str] | None) -> list[str]:
     return sorted(row.strip() for row in (rows or []) if row and row.strip())
+
+
+def validate_row_specs(rows: list[str] | None, flag_name: str) -> None:
+    for row in rows or []:
+        if not tmux_state.one_line_text(row):
+            die(f"{flag_name} is blank")
+
+
+def validate_optional_status_file(args: argparse.Namespace, command_name: str) -> None:
+    if getattr(args, "status_file", None) is not None and not tmux_state.one_line_text(args.status_file):
+        die(f"{command_name} requires nonblank --status-file when provided")
+
+
+def validate_managed_identity(args: argparse.Namespace) -> None:
+    if not tmux_state.one_line_text(getattr(args, "job_id", None)):
+        die("managed worker requires nonblank --job-id")
+    if not tmux_state.one_line_text(getattr(args, "pane", None)):
+        die("managed worker requires nonblank --pane")
+
+
+def require_job_id(value: Any) -> str:
+    if not tmux_state.one_line_text(value):
+        die("job command requires nonblank --job-id")
+    return tmux_state.safe_id(str(value))
+
+
+def require_task_id(value: Any) -> str:
+    if not tmux_state.one_line_text(value):
+        die("task command requires nonblank --task-id")
+    return tmux_state.safe_id(str(value))
 
 
 def managed_dedupe_payload(
@@ -902,14 +1098,23 @@ def lock_dir_is_stale(lock_dir: Path, stale_seconds: float) -> bool:
 
 
 @contextlib.contextmanager
-def registry_lock(paths: dict[str, Path], *, timeout_seconds: float = LOCK_TIMEOUT_SECONDS, stale_seconds: float = LOCK_STALE_SECONDS) -> Any:
-    lock_dir = tmux_state.job_registry_lock_path(paths)
+def directory_lock(
+    lock_dir: Path,
+    *,
+    timeout_seconds: float = LOCK_TIMEOUT_SECONDS,
+    stale_seconds: float = LOCK_STALE_SECONDS,
+    description: str = "lock",
+) -> Any:
     deadline = time.monotonic() + timeout_seconds
     acquired = False
     while True:
         try:
             lock_dir.mkdir(parents=True)
-            tmux_state.atomic_write_json(lock_dir / "owner.json", lock_metadata())
+            try:
+                tmux_state.atomic_write_json(lock_dir / "owner.json", lock_metadata())
+            except BaseException:
+                shutil.rmtree(lock_dir, ignore_errors=True)
+                raise
             acquired = True
             break
         except FileExistsError:
@@ -917,7 +1122,7 @@ def registry_lock(paths: dict[str, Path], *, timeout_seconds: float = LOCK_TIMEO
                 shutil.rmtree(lock_dir, ignore_errors=True)
                 continue
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for managed job registry lock: {lock_dir}")
+                raise TimeoutError(f"timed out waiting for {description}: {lock_dir}")
             time.sleep(0.05)
     try:
         yield
@@ -926,49 +1131,30 @@ def registry_lock(paths: dict[str, Path], *, timeout_seconds: float = LOCK_TIMEO
             shutil.rmtree(lock_dir, ignore_errors=True)
 
 
+@contextlib.contextmanager
+def registry_lock(paths: dict[str, Path], *, timeout_seconds: float = LOCK_TIMEOUT_SECONDS, stale_seconds: float = LOCK_STALE_SECONDS) -> Any:
+    with directory_lock(
+        tmux_state.job_registry_lock_path(paths),
+        timeout_seconds=timeout_seconds,
+        stale_seconds=stale_seconds,
+        description="managed job registry lock",
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def task_lock(paths: dict[str, Path], task_id: str) -> Any:
+    lock_dir = paths["tasks"] / f".{tmux_state.safe_id(task_id)}.lock"
+    with directory_lock(lock_dir, description=f"task lock {tmux_state.safe_id(task_id)}"):
+        yield
+
+
 def pid_is_running(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def process_command_line(pid: int | None) -> str:
-    if not pid:
-        return ""
-    result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "command="],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    return result.stdout.strip()
-
-
-def managed_worker_pid_matches(record: dict[str, Any]) -> bool:
-    pid = parse_int(str(record.get("pid") or ""))
-    command_line = process_command_line(pid)
-    return "tmux_queue.py" in command_line and str(record.get("job_id") or "") in command_line
+    return tmux_state.pid_is_running(pid)
 
 
 def annotate_job_record(record: dict[str, Any]) -> dict[str, Any]:
-    annotated = dict(record)
-    pid = parse_int(str(annotated.get("pid") or ""))
-    pid_running = pid_is_running(pid)
-    pid_matches = managed_worker_pid_matches(annotated) if pid_running else False
-    stale_reason = tmux_state.managed_job_stale_reason(annotated, pid_running=pid_running, pid_matches=pid_matches)
-    annotated["pid_running"] = pid_running
-    annotated["pid_matches"] = pid_matches
-    annotated["stale"] = bool(stale_reason)
-    if stale_reason:
-        annotated["stale_reason"] = stale_reason
-    return annotated
+    return tmux_state.managed_job_with_effective_state(record)
 
 
 def load_job_records(paths: dict[str, Path], kind: str | None = None) -> list[dict[str, Any]]:
@@ -978,11 +1164,10 @@ def load_job_records(paths: dict[str, Path], kind: str | None = None) -> list[di
         if error or not data:
             records.append({"job_path": str(path), "error": error or "empty job record"})
             continue
-        record_kind = str(data.get("kind") or "")
-        if kind and record_kind != kind and not record_kind.startswith(f"{kind}-"):
+        record = tmux_state.normalize_managed_job(data, path)
+        if not job_kind_matches(str(record.get("kind") or ""), kind):
             continue
-        data["job_path"] = str(path)
-        records.append(annotate_job_record(data))
+        records.append(annotate_job_record(record))
     records.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
     return records
 
@@ -1028,8 +1213,8 @@ def write_managed_job_record(
     record: dict[str, Any] = {
         "version": 1,
         "job_id": job_id,
-        "kind": kind,
-        "status": status,
+        "kind": tmux_state.token_text(kind) or "job",
+        "status": tmux_state.token_text(status) or "unknown",
         "pid": pid,
         "pane_id": pane_id,
         "command_path": command_path_value,
@@ -1043,16 +1228,74 @@ def write_managed_job_record(
     }
     if extra:
         record.update(extra)
+    record["kind"] = tmux_state.token_text(kind) or "job"
+    record["status"] = tmux_state.token_text(status) or "unknown"
+    tmux_state.strip_managed_transient_fields(record)
     tmux_state.atomic_write_json(path, record)
+    return record
+
+
+def write_managed_start_failure(
+    paths: dict[str, Path],
+    *,
+    job_id: str,
+    kind: str,
+    pane_id: str | None,
+    name: str | None,
+    reason: str,
+    command_path_value: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    merged_extra = {**(extra or {}), "error": reason}
+    record = write_managed_job_record(
+        paths,
+        job_id=job_id,
+        kind=kind,
+        pid=0,
+        pane_id=pane_id,
+        status="failed",
+        command_path_value=command_path_value,
+        extra=merged_extra,
+    )
+    status_path = tmux_state.status_path(paths, job_id)
+    status = tmux_state.build_status(
+        kind=kind,
+        item_id=job_id,
+        attempt=1,
+        name=name,
+        status="failed",
+        pane_id=pane_id,
+        command_preview_text=str(command_path_value or kind),
+        cwd=str(paths["workspace"]),
+        status_file=status_path,
+        log_file=tmux_state.log_path(paths, job_id),
+        exit_code=1,
+        last_output=reason,
+    )
+    status.update(merged_extra)
+    status["kind"] = tmux_state.token_text(kind) or "job"
+    status["status"] = "failed"
+    status["exit_code"] = 1
+    status["last_output"] = reason
+    tmux_state.write_status(status_path, status)
     return record
 
 
 def command_text_for_worker(args: argparse.Namespace) -> tuple[str | None, str | None]:
     if getattr(args, "command_text", None) is not None:
-        return str(args.command_text), None
-    if getattr(args, "command_file", None):
-        command_file = Path(args.command_file).expanduser().resolve()
-        return command_file.read_text(encoding="utf-8"), str(command_file)
+        command_text = str(args.command_text)
+        if not tmux_state.one_line_text(command_text):
+            raise ValueError("command is blank")
+        return command_text, None
+    command_file_arg = getattr(args, "command_file", None)
+    if command_file_arg is not None:
+        if not tmux_state.one_line_text(command_file_arg):
+            raise ValueError("command file path is blank")
+        command_file = Path(str(command_file_arg)).expanduser().resolve()
+        command_text = command_file.read_text(encoding="utf-8")
+        if not tmux_state.one_line_text(command_text):
+            raise ValueError("command is blank")
+        return command_text, str(command_file)
     return None, None
 
 
@@ -1062,24 +1305,113 @@ def check_interval_seconds(args: argparse.Namespace, worker_action: str) -> floa
     return float(getattr(args, "poll_seconds", 2.0))
 
 
+def terminate_started_process(proc: Any, *, timeout_seconds: float = 5.0) -> None:
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=timeout_seconds)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str) -> dict[str, Any]:
+    validate_managed_identity(args)
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
     item_id = tmux_state.safe_id(args.job_id)
     record_path = tmux_state.job_path(paths, item_id)
-    command_text, source_command_path = command_text_for_worker(args)
-    payload = managed_dedupe_payload(paths, args, kind=kind, command_text=command_text)
-    dedupe_key = managed_dedupe_key(payload)
     owner = owner_identity(args)
     interval = check_interval_seconds(args, worker_action)
-    command_path_value: str | None = source_command_path
 
     script_dir = Path(__file__).resolve().parent
     try:
         with registry_lock(paths):
             existing, _error = tmux_state.read_json(record_path)
-            existing = annotate_job_record(existing) if existing else None
-            if existing and tmux_state.is_active_managed_job(existing) and not existing.get("stale"):
+            existing = annotate_job_record(tmux_state.normalize_managed_job(existing, record_path)) if existing else None
+            existing_active = bool(existing and tmux_state.is_active_managed_job(existing) and not existing.get("stale"))
+
+            try:
+                command_text, source_command_path = command_text_for_worker(args)
+            except Exception as exc:
+                command_file_arg = getattr(args, "command_file", None)
+                command_path_value = (
+                    str(Path(str(command_file_arg)).expanduser())
+                    if command_file_arg is not None and tmux_state.one_line_text(command_file_arg)
+                    else None
+                )
+                if isinstance(exc, ValueError):
+                    reason = str(exc)
+                else:
+                    reason = f"could not read managed worker command file: {exc}"
+                if existing_active:
+                    if not getattr(args, "replace", False):
+                        return duplicate_result(
+                            item_id,
+                            dedupe_key=str(existing.get("dedupe_key") or ""),
+                            existing=existing,
+                            reason="managed job already appears active; use --replace or cancel it first",
+                        )
+                    return {
+                        "job_id": item_id,
+                        "kind": kind,
+                        "started": False,
+                        "duplicate": False,
+                        "dedupe_key": str(existing.get("dedupe_key") or ""),
+                        "pane_id": getattr(args, "pane", None),
+                        "job_path": str(record_path),
+                        "status_path": str(tmux_state.status_path(paths, item_id)),
+                        "log_path": str(tmux_state.log_path(paths, item_id)),
+                        "workspace": str(paths["workspace"]),
+                        "state_dir": str(paths["root"]),
+                        "reason": reason,
+                        "existing": existing,
+                    }
+                record = write_managed_start_failure(
+                    paths,
+                    job_id=item_id,
+                    kind=kind,
+                    pane_id=getattr(args, "pane", None),
+                    name=getattr(args, "name", None),
+                    reason=reason,
+                    command_path_value=command_path_value,
+                )
+                return {
+                    "job_id": item_id,
+                    "kind": kind,
+                    "started": False,
+                    "duplicate": False,
+                    "dedupe_key": None,
+                    "pane_id": getattr(args, "pane", None),
+                    "job_path": str(record_path),
+                    "status_path": str(tmux_state.status_path(paths, item_id)),
+                    "log_path": str(tmux_state.log_path(paths, item_id)),
+                    "workspace": str(paths["workspace"]),
+                    "state_dir": str(paths["root"]),
+                    "reason": reason,
+                    "record": record,
+                }
+
+            payload = managed_dedupe_payload(paths, args, kind=kind, command_text=command_text)
+            dedupe_key = managed_dedupe_key(payload)
+            command_path_value: str | None = source_command_path
+
+            if existing_active:
                 if not getattr(args, "replace", False):
                     return duplicate_result(
                         item_id,
@@ -1089,24 +1421,37 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
                     )
                 existing_pid = parse_int(str(existing.get("pid") or ""))
                 if existing_pid and pid_is_running(existing_pid):
-                    if not managed_worker_pid_matches(existing):
+                    if not tmux_state.managed_worker_pid_matches(existing):
                         return {
                             "job_id": item_id,
                             "started": False,
                             "reason": "existing pid is running but no longer looks like this tmux-skills worker",
                             "existing": existing,
                         }
-                    os.kill(existing_pid, signal.SIGTERM)
-                    deadline = time.monotonic() + 5.0
-                    while pid_is_running(existing_pid) and time.monotonic() < deadline:
-                        time.sleep(0.05)
-                    if pid_is_running(existing_pid):
+                    signal_sent = False
+                    try:
+                        os.kill(existing_pid, signal.SIGTERM)
+                        signal_sent = True
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError as exc:
                         return {
                             "job_id": item_id,
                             "started": False,
-                            "reason": "existing managed job did not stop after SIGTERM",
+                            "reason": f"could not signal existing managed job: {exc}",
                             "existing": existing,
                         }
+                    if signal_sent:
+                        deadline = time.monotonic() + 5.0
+                        while pid_is_running(existing_pid) and time.monotonic() < deadline:
+                            time.sleep(0.05)
+                        if pid_is_running(existing_pid):
+                            return {
+                                "job_id": item_id,
+                                "started": False,
+                                "reason": "existing managed job did not stop after SIGTERM",
+                                "existing": existing,
+                            }
 
             duplicate = active_duplicate_record(paths, dedupe_key=dedupe_key, item_id=item_id)
             duplicate_allowed = bool(getattr(args, "allow_duplicate", False))
@@ -1121,7 +1466,38 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
 
             if command_text is not None:
                 command_path = tmux_state.command_path(paths, item_id)
-                write_command_file(command_path, command_text)
+                try:
+                    write_command_file(command_path, command_text)
+                except Exception as exc:
+                    reason = f"could not write managed worker command file: {exc}"
+                    failure_record: dict[str, Any] | None = None
+                    try:
+                        failure_record = write_managed_start_failure(
+                            paths,
+                            job_id=item_id,
+                            kind=kind,
+                            pane_id=args.pane,
+                            name=getattr(args, "name", None),
+                            reason=reason,
+                            command_path_value=str(command_path),
+                        )
+                    except Exception:
+                        failure_record = None
+                    return {
+                        "job_id": item_id,
+                        "kind": kind,
+                        "started": False,
+                        "duplicate": False,
+                        "dedupe_key": dedupe_key,
+                        "pane_id": args.pane,
+                        "job_path": str(record_path),
+                        "status_path": str(tmux_state.status_path(paths, item_id)),
+                        "log_path": str(tmux_state.log_path(paths, item_id)),
+                        "workspace": str(paths["workspace"]),
+                        "state_dir": str(paths["root"]),
+                        "reason": reason,
+                        "record": failure_record,
+                    }
                 command_path_value = str(command_path)
             elif command_path_value:
                 command_path_value = str(Path(command_path_value).expanduser().resolve())
@@ -1173,28 +1549,122 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
             }
             if duplicate_allowed and duplicate_of:
                 record_extra.update({"duplicate_allowed": True, "duplicate_of": duplicate_of})
-            write_managed_job_record(
-                paths,
-                job_id=item_id,
-                kind=kind,
-                pid=0,
-                pane_id=args.pane,
-                status="starting",
-                command_path_value=command_path_value,
-                extra=record_extra,
-            )
-            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=tmux_env())
+            try:
+                write_managed_job_record(
+                    paths,
+                    job_id=item_id,
+                    kind=kind,
+                    pid=0,
+                    pane_id=args.pane,
+                    status="starting",
+                    command_path_value=command_path_value,
+                    extra=record_extra,
+                )
+            except Exception as exc:
+                reason = f"managed worker state update failed before start: {exc}"
+                return {
+                    "job_id": item_id,
+                    "kind": kind,
+                    "started": False,
+                    "duplicate": False,
+                    "dedupe_key": dedupe_key,
+                    "pane_id": args.pane,
+                    "job_path": str(record_path),
+                    "status_path": str(tmux_state.status_path(paths, item_id)),
+                    "log_path": str(tmux_state.log_path(paths, item_id)),
+                    "workspace": str(paths["workspace"]),
+                    "state_dir": str(paths["root"]),
+                    "reason": reason,
+                    "record": None,
+                }
+            try:
+                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=tmux_env())
+            except Exception as exc:
+                reason = f"managed worker failed to start: {exc}"
+                record: dict[str, Any] | None = None
+                try:
+                    record = write_managed_start_failure(
+                        paths,
+                        job_id=item_id,
+                        kind=kind,
+                        pane_id=args.pane,
+                        name=getattr(args, "name", None),
+                        reason=reason,
+                        command_path_value=command_path_value,
+                        extra=record_extra,
+                    )
+                except Exception:
+                    try:
+                        record_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                return {
+                    "job_id": item_id,
+                    "kind": kind,
+                    "started": False,
+                    "duplicate": False,
+                    "dedupe_key": dedupe_key,
+                    "pane_id": args.pane,
+                    "job_path": str(record_path),
+                    "status_path": str(tmux_state.status_path(paths, item_id)),
+                    "log_path": str(tmux_state.log_path(paths, item_id)),
+                    "workspace": str(paths["workspace"]),
+                    "state_dir": str(paths["root"]),
+                    "reason": reason,
+                    "record": record,
+                }
             status = "running" if kind == "watch" else "waiting"
-            record = write_managed_job_record(
-                paths,
-                job_id=item_id,
-                kind=kind,
-                pid=proc.pid,
-                pane_id=args.pane,
-                status=status,
-                command_path_value=command_path_value,
-                extra=record_extra,
-            )
+            try:
+                record = write_managed_job_record(
+                    paths,
+                    job_id=item_id,
+                    kind=kind,
+                    pid=proc.pid,
+                    pane_id=args.pane,
+                    status=status,
+                    command_path_value=command_path_value,
+                    extra=record_extra,
+                )
+            except Exception as exc:
+                terminate_started_process(proc)
+                reason = f"managed worker state update failed after start: {exc}"
+                failure_record: dict[str, Any] | None = None
+                try:
+                    failure_record = write_managed_start_failure(
+                        paths,
+                        job_id=item_id,
+                        kind=kind,
+                        pane_id=args.pane,
+                        name=getattr(args, "name", None),
+                        reason=reason,
+                        command_path_value=command_path_value,
+                        extra=record_extra,
+                    )
+                except Exception:
+                    failure_record = None
+                    try:
+                        record_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                return {
+                    "job_id": item_id,
+                    "kind": kind,
+                    "started": False,
+                    "duplicate": False,
+                    "dedupe_key": dedupe_key,
+                    "pane_id": args.pane,
+                    "job_path": str(record_path),
+                    "status_path": str(tmux_state.status_path(paths, item_id)),
+                    "log_path": str(tmux_state.log_path(paths, item_id)),
+                    "workspace": str(paths["workspace"]),
+                    "state_dir": str(paths["root"]),
+                    "reason": reason,
+                    "record": failure_record,
+                }
     except TimeoutError as exc:
         return {"job_id": item_id, "started": False, "reason": str(exc)}
 
@@ -1221,17 +1691,30 @@ def job_list(args: argparse.Namespace, kind: str | None = None) -> dict[str, Any
     return {"jobs": load_job_records(paths, kind), "workspace": str(paths["workspace"]), "state_dir": str(paths["root"])}
 
 
+def job_kind_matches(actual: str | None, expected: str | None) -> bool:
+    if not expected:
+        return True
+    actual_kind = tmux_state.token_text(actual)
+    expected_kind = tmux_state.token_text(expected)
+    return actual_kind == expected_kind or actual_kind.startswith(f"{expected_kind}-")
+
+
 def job_status(args: argparse.Namespace, kind: str | None = None) -> dict[str, Any]:
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
-    item_id = tmux_state.safe_id(args.job_id)
-    record, record_error = tmux_state.read_json(tmux_state.job_path(paths, item_id))
+    item_id = require_job_id(args.job_id)
+    record_path = tmux_state.job_path(paths, item_id)
+    status_path = tmux_state.status_path(paths, item_id)
+    record, record_error = tmux_state.read_json(record_path)
     if record:
-        record = annotate_job_record(record)
-    status, status_error = tmux_state.read_json(tmux_state.status_path(paths, item_id))
-    record_kind = str((record or {}).get("kind") or "")
-    if kind and record and record_kind != kind and not record_kind.startswith(f"{kind}-"):
+        record = annotate_job_record(tmux_state.normalize_managed_job(record, record_path))
+    status, status_error = tmux_state.read_json(status_path)
+    if status:
+        status = tmux_state.normalize_status(status, status_path)
+    if record and not job_kind_matches(str(record.get("kind") or ""), kind):
         return {"job_id": item_id, "found": False, "reason": f"job is not a {kind} job", "record": record}
+    if not record and status and not job_kind_matches(str(status.get("kind") or ""), kind):
+        return {"job_id": item_id, "found": False, "reason": f"status is not a {kind} job", "status": status}
     return {
         "job_id": item_id,
         "found": bool(record or status),
@@ -1239,44 +1722,57 @@ def job_status(args: argparse.Namespace, kind: str | None = None) -> dict[str, A
         "record_error": record_error,
         "status": status,
         "status_error": status_error,
-        "pid_running": pid_is_running(parse_int(str((record or {}).get("pid") or ""))),
+        "pid_running": bool((record or {}).get("pid_running")),
     }
 
 
 def job_cancel(args: argparse.Namespace, kind: str | None = None) -> dict[str, Any]:
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
-    item_id = tmux_state.safe_id(args.job_id)
+    item_id = require_job_id(args.job_id)
     record_path = tmux_state.job_path(paths, item_id)
     record, error = tmux_state.read_json(record_path)
     if error or not record:
         return {"job_id": item_id, "cancelled": False, "reason": error or "job record not found"}
-    record_kind = str(record.get("kind") or "")
-    if kind and record_kind != kind and not record_kind.startswith(f"{kind}-"):
+    record = tmux_state.normalize_managed_job(record, record_path)
+    record_kind = tmux_state.token_text(record.get("kind")) or "job"
+    if not job_kind_matches(record_kind, kind):
         return {"job_id": item_id, "cancelled": False, "reason": f"job is not a {kind} job", "record": record}
 
+    record_status = tmux_state.token_text(record.get("status"))
+    if record_status in tmux_state.TERMINAL_STATUSES:
+        return {"job_id": item_id, "cancelled": False, "reason": f"job already {record_status}", "record": record}
     pid = parse_int(str(record.get("pid") or ""))
     running = pid_is_running(pid)
-    record_status = str(record.get("status") or "")
-    if not running and record_status in tmux_state.TERMINAL_STATUSES:
-        return {"job_id": item_id, "cancelled": False, "reason": f"job already {record_status}", "record": record}
     if running and pid:
-        if not managed_worker_pid_matches(record):
+        if not tmux_state.managed_worker_pid_matches(record):
             return {
                 "job_id": item_id,
                 "cancelled": False,
                 "reason": "recorded pid is running but no longer looks like this tmux-skills worker",
                 "record": record,
             }
-        os.kill(pid, signal.SIGTERM)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            running = False
+        except PermissionError as exc:
+            return {
+                "job_id": item_id,
+                "cancelled": False,
+                "reason": f"could not signal recorded pid: {exc}",
+                "record": record,
+            }
 
     now = tmux_state.utc_now()
-    record.update({"status": "cancelled", "updated_at": now, "heartbeat_at": now, "pid_running": pid_is_running(pid)})
+    record.update({"status": "cancelled", "updated_at": now, "heartbeat_at": now})
+    tmux_state.strip_managed_transient_fields(record)
     tmux_state.atomic_write_json(record_path, record)
 
     status_file = tmux_state.status_path(paths, item_id)
     status, _status_error = tmux_state.read_json(status_file)
     if status:
+        status = tmux_state.normalize_status(status, status_file)
         status.update(
             {
                 "status": "cancelled",
@@ -1286,7 +1782,6 @@ def job_cancel(args: argparse.Namespace, kind: str | None = None) -> dict[str, A
                 "last_output": "cancelled by tmux_control.py",
             }
         )
-        status["event_id"] = tmux_state.terminal_event_id(status)
     else:
         status = tmux_state.build_status(
             kind=record_kind or "job",
@@ -1302,7 +1797,7 @@ def job_cancel(args: argparse.Namespace, kind: str | None = None) -> dict[str, A
             exit_code=1,
             last_output="cancelled by tmux_control.py",
         )
-    tmux_state.write_status(status_file, status)
+    status = tmux_state.write_status(status_file, status)
     return {"job_id": item_id, "cancelled": True, "signal_sent": running, "record": record, "status": status}
 
 
@@ -1333,12 +1828,15 @@ def job_gc(args: argparse.Namespace) -> dict[str, Any]:
         stored, error = tmux_state.read_json(record_path)
         if error or not stored:
             continue
+        stored = tmux_state.normalize_managed_job(stored, record_path)
         stored.update({"status": "stale", "updated_at": now, "heartbeat_at": now, "stale_reason": stale_reason})
+        tmux_state.strip_managed_transient_fields(stored)
         tmux_state.atomic_write_json(record_path, stored)
 
         status_path = tmux_state.status_path(paths, job_id)
         status, _status_error = tmux_state.read_json(status_path)
         if status:
+            status = tmux_state.normalize_status(status, status_path)
             status.update({"status": "stale", "exit_code": 1, "last_output": stale_reason, "stale_reason": stale_reason})
         else:
             status = tmux_state.build_status(
@@ -1369,38 +1867,64 @@ def watch(args: argparse.Namespace) -> dict[str, Any]:
         return job_cancel(args, "watch")
     if not args.job_id or not args.pane:
         die("watch start requires --job-id and --pane")
+    validate_managed_identity(args)
+    validate_optional_status_file(args, "watch")
     return start_managed_worker(args, "watch", "watch")
 
 
 def queue_after_idle(args: argparse.Namespace) -> dict[str, Any]:
+    validate_managed_identity(args)
     return start_managed_worker(args, "queue-after-idle", "queue-after-idle")
 
 
 def queue_after_status(args: argparse.Namespace) -> dict[str, Any]:
-    if not args.require_row:
+    validate_managed_identity(args)
+    if not tmux_state.one_line_text(getattr(args, "status_file", None)):
+        die("queue-after-status requires nonblank --status-file")
+    validate_row_specs(getattr(args, "require_row", None), "--require-row")
+    validate_row_specs(getattr(args, "fail_row", None), "--fail-row")
+    if not canonical_row_specs(getattr(args, "require_row", None)):
         die("queue-after-status requires at least one --require-row")
     return start_managed_worker(args, "queue-after-status", "queue-after-status")
 
 
 def read_text_arg(text: str | None, path: str | None) -> str | None:
-    if path:
+    if text is not None and path is not None:
+        raise ValueError("provide only one of text or path")
+    if path is not None:
+        if not tmux_state.one_line_text(path):
+            raise ValueError("file path is blank")
         return Path(path).expanduser().read_text(encoding="utf-8")
     return text
 
 
 def task_add(args: argparse.Namespace) -> dict[str, Any]:
+    if args.task_id is not None and not tmux_state.one_line_text(args.task_id):
+        die("task add requires nonblank --task-id when provided")
+    after_job = tmux_state.one_line_text(args.after_job) if args.after_job is not None else None
+    after_event = str(args.after_event).strip() if args.after_event is not None else None
+    instruction = str(args.instruction)
+    after_job = after_job or None
+    after_event = after_event or None
+    if bool(after_job) == bool(after_event):
+        die("task add requires exactly one of --after-job or --after-event")
+    if not tmux_state.one_line_text(instruction):
+        die("task add requires a non-empty --instruction")
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
     task = tmux_state.build_task(
         task_id=args.task_id,
-        instruction=args.instruction,
+        instruction=instruction,
         summary=args.summary,
         intent=args.intent,
-        after_job_id=args.after_job,
-        after_event_id=args.after_event,
+        after_job_id=after_job,
+        after_event_id=after_event,
         trigger_on=args.trigger_on,
     )
-    return tmux_state.write_task(paths, task)
+    with task_lock(paths, task["task_id"]):
+        if tmux_state.task_path(paths, task["task_id"]).exists():
+            die(f"task already exists: {task['task_id']}")
+        return tmux_state.write_task(paths, task)
 
 
 def task_state(args: argparse.Namespace, *, create: bool = False) -> tuple[dict[str, Path], dict[str, Any]]:
@@ -1426,9 +1950,10 @@ def task_list(args: argparse.Namespace) -> Any:
 
 
 def safe_commands(paths: dict[str, Path]) -> list[str]:
+    task_state_args = f"--workspace {shlex.quote(str(paths['workspace']))} --state-dir {shlex.quote(str(paths['root']))}"
     return [
-        f"python scripts/tmux_control.py task load --for-skill --workspace {shlex.quote(str(paths['workspace']))}",
-        f"python scripts/tmux_control.py task next --json --workspace {shlex.quote(str(paths['workspace']))}",
+        f"python scripts/tmux_control.py task load --for-skill {task_state_args}",
+        f"python scripts/tmux_control.py task next --json {task_state_args}",
         f"python scripts/tmux_control.py list",
     ]
 
@@ -1452,10 +1977,35 @@ def task_load_data(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def task_item_tail(item: dict[str, Any], limit: int = 400) -> str:
-    tail = str(item.get("last_output") or "").strip()
-    if len(tail) > limit:
-        return tail[-limit:]
-    return tail
+    return tmux_state.bounded_one_line_text(item.get("last_output"), limit=limit, keep_tail=True)
+
+
+def task_load_text(value: Any, *, limit: int = tmux_state.TASK_DISPLAY_TEXT_LIMIT) -> str:
+    return tmux_state.bounded_one_line_text(value, limit=limit)
+
+
+def task_load_running_line(item: dict[str, Any]) -> str:
+    identifier = task_load_text(item.get("id") or item.get("job_id") or item.get("task_id") or "unknown")
+    status = task_load_text(item.get("status") or item.get("effective_status"))
+    parts = [identifier]
+    if status:
+        parts.append(status)
+    if item.get("kind"):
+        parts.append(f"kind={task_load_text(item.get('kind'))}")
+    if item.get("pane_id"):
+        parts.append(f"pane={task_load_text(item.get('pane_id'))}")
+    return " ".join(parts)
+
+
+def task_load_recent_job_line(job: dict[str, Any], *, include_log: bool = False) -> str:
+    identifier = task_load_text(job.get("id") or "unknown")
+    status = task_load_text(job.get("status"))
+    line = f"- {identifier} {status}".rstrip()
+    if job.get("exit_code") is not None:
+        line += f" exit={task_load_text(job.get('exit_code'))}"
+    if include_log and job.get("log_path"):
+        line += f" log={task_load_text(job.get('log_path'))}"
+    return line
 
 
 def render_task_load(data: dict[str, Any], *, for_skill: bool = False) -> str:
@@ -1467,9 +2017,7 @@ def render_task_load(data: dict[str, Any], *, for_skill: bool = False) -> str:
         ]
         if data["recent_jobs"]:
             for job in data["recent_jobs"]:
-                line = f"- {job.get('id')} {job.get('status')}"
-                if job.get("exit_code") is not None:
-                    line += f" exit={job.get('exit_code')}"
+                line = task_load_recent_job_line(job)
                 tail = task_item_tail(job)
                 if tail:
                     line += f" tail={tail}"
@@ -1478,19 +2026,30 @@ def render_task_load(data: dict[str, Any], *, for_skill: bool = False) -> str:
             lines.append("- No terminal jobs recorded.")
         lines.extend(["", "## Current state"])
         for item in data["running"]:
-            lines.append(f"- {item.get('id') or item.get('task_id')} {item.get('status') or item.get('effective_status')}")
+            lines.append(f"- {task_load_running_line(item)}")
         if not data["running"]:
             lines.append("- No running work recorded.")
         lines.extend(["", "## Next actionable instruction"])
         if data["ready_tasks"]:
             for task in data["ready_tasks"]:
-                lines.append(f"- task_id={task.get('task_id')}: {task.get('instruction')}")
+                lines.append(f"- task_id={task.get('task_id')}: {tmux_state.bounded_one_line_text(task.get('instruction'))}")
         else:
             lines.append("- No ready task.")
+        lines.extend(["", "## Blocked or stale"])
+        if data["blocked"]:
+            lines.extend(f"- {tmux_state.task_summary_line(task)}" for task in data["blocked"])
+        else:
+            lines.append("- None")
         lines.extend(["", "## Evidence files"])
-        lines.extend(f"- {path}" for path in data["evidence_files"][:10])
+        lines.extend(f"- {task_load_text(path)}" for path in data["evidence_files"][:10])
         if not data["evidence_files"]:
             lines.append("- None")
+        if data.get("errors"):
+            lines.extend(["", "## State warnings"])
+            lines.extend(
+                f"- Skipped unreadable state file: {task_load_text(error.get('path'))} ({task_load_text(error.get('error'))})"
+                for error in data["errors"][:10]
+            )
         lines.extend(["", "## Safe commands to inspect"])
         lines.extend(f"- `{command}`" for command in data["safe_commands"])
         lines.extend(["", "## Do not auto-run", "- Loading this report must not claim tasks or execute follow-up work."])
@@ -1510,17 +2069,12 @@ def render_task_load(data: dict[str, Any], *, for_skill: bool = False) -> str:
         lines.append("- None")
     lines.extend(["", "## Running Work"])
     for item in data["running"]:
-        lines.append(f"- {item.get('id') or item.get('task_id')} {item.get('status') or item.get('effective_status')}")
+        lines.append(f"- {task_load_running_line(item)}")
     if not data["running"]:
         lines.append("- None")
     lines.extend(["", "## Recent Jobs"])
     for job in data["recent_jobs"]:
-        line = f"- {job.get('id')} {job.get('status')}"
-        if job.get("exit_code") is not None:
-            line += f" exit={job.get('exit_code')}"
-        if job.get("log_path"):
-            line += f" log={job.get('log_path')}"
-        lines.append(line)
+        lines.append(task_load_recent_job_line(job, include_log=True))
     if not data["recent_jobs"]:
         lines.append("- None")
     lines.extend(["", "## Blocked or Stale"])
@@ -1528,9 +2082,15 @@ def render_task_load(data: dict[str, Any], *, for_skill: bool = False) -> str:
     if not data["blocked"]:
         lines.append("- None")
     lines.extend(["", "## Evidence Files"])
-    lines.extend(f"- {path}" for path in data["evidence_files"][:10])
+    lines.extend(f"- {task_load_text(path)}" for path in data["evidence_files"][:10])
     if not data["evidence_files"]:
         lines.append("- None")
+    if data.get("errors"):
+        lines.extend(["", "## State Warnings"])
+        lines.extend(
+            f"- Skipped unreadable state file: {task_load_text(error.get('path'))} ({task_load_text(error.get('error'))})"
+            for error in data["errors"][:10]
+        )
     lines.extend(["", "## Safe Commands"])
     lines.extend(f"- `{command}`" for command in data["safe_commands"])
     return "\n".join(lines)
@@ -1553,35 +2113,48 @@ def task_next(args: argparse.Namespace) -> Any:
 
 
 def find_task(paths: dict[str, Path], task_id: str) -> dict[str, Any]:
-    task, error = tmux_state.read_json(tmux_state.task_path(paths, task_id))
+    item_id = require_task_id(task_id)
+    task, error = tmux_state.read_json(tmux_state.task_path(paths, item_id))
     if error or not task:
-        die(f"could not load task {task_id}: {error or 'not found'}")
-    return tmux_state.normalize_task(task, tmux_state.task_path(paths, task_id))
+        die(f"could not load task {item_id}: {error or 'not found'}")
+    task = dict(task)
+    task["task_id"] = item_id
+    return tmux_state.normalize_task(task, tmux_state.task_path(paths, item_id))
 
 
 def task_claim(args: argparse.Namespace) -> dict[str, Any]:
-    paths, state = task_state(args)
-    task = find_task(paths, args.task_id)
-    enriched = tmux_state.task_with_effective_state(task, state["statuses"])
-    if enriched.get("effective_status") != "ready" and not (args.reclaim_stale and enriched.get("stale")):
-        die(f"task is not ready: {args.task_id}")
-    enriched["status"] = "in_progress"
-    enriched["claimed_at"] = tmux_state.utc_now()
-    enriched["blocked_reason"] = None
-    return tmux_state.write_task(paths, enriched)
+    paths = tmux_state.state_paths(args.workspace, args.state_dir)
+    tmux_state.ensure_state_dirs(paths)
+    item_id = require_task_id(args.task_id)
+    with task_lock(paths, item_id):
+        state = tmux_state.load_task_state(paths)
+        task = find_task(paths, item_id)
+        enriched = tmux_state.task_with_effective_state(task, state["statuses"])
+        if enriched.get("effective_status") != "ready" and not (args.reclaim_stale and enriched.get("stale")):
+            die(f"task is not ready: {item_id}")
+        enriched["status"] = "in_progress"
+        enriched["claimed_at"] = tmux_state.utc_now()
+        enriched["completed_at"] = None
+        enriched["blocked_reason"] = None
+        return tmux_state.write_task(paths, enriched)
 
 
 def task_finish(args: argparse.Namespace, status: str) -> dict[str, Any]:
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
-    task = find_task(paths, args.task_id)
-    task["status"] = status
-    task["completed_at"] = tmux_state.utc_now() if status in {"done", "cancelled"} else task.get("completed_at")
-    if status == "blocked":
-        task["blocked_reason"] = args.note
-    elif args.note:
-        task["summary"] = args.note
-    return tmux_state.write_task(paths, task)
+    item_id = require_task_id(args.task_id)
+    with task_lock(paths, item_id):
+        task = find_task(paths, item_id)
+        task["status"] = status
+        if status == "blocked":
+            task["completed_at"] = None
+            task["blocked_reason"] = args.note
+        else:
+            task["completed_at"] = tmux_state.utc_now() if status in {"done", "cancelled"} else task.get("completed_at")
+            task["blocked_reason"] = None
+            if args.note:
+                task["summary"] = args.note
+        return tmux_state.write_task(paths, task)
 
 
 def resolve(args: argparse.Namespace) -> dict[str, Any]:
@@ -1596,8 +2169,13 @@ def resolve(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.pane_index is None and args.ordinal is None:
         if not args.target:
-            target = current_window_target() if args.current_window or inside_tmux() else None
-            if target is None:
+            if args.current_window:
+                if not inside_tmux():
+                    die("--current-window requires running inside tmux")
+                target = current_window_target()
+            elif inside_tmux():
+                target = current_window_target()
+            else:
                 die("resolve without --target requires running inside tmux")
         else:
             target = args.target
@@ -1690,8 +2268,8 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_parser.add_argument("--target", help="tmux target such as %%3, SESSION:WINDOW, or SESSION:WINDOW.PANE")
     resolve_parser.add_argument("--current-window", action="store_true", help="Limit pane-index/ordinal lookup to the current window")
     resolve_group = resolve_parser.add_mutually_exclusive_group()
-    resolve_group.add_argument("--pane-index", type=int, help="tmux pane_index value, usually 0-based")
-    resolve_group.add_argument("--ordinal", type=int, help="Human 1-based pane number within the selected window")
+    resolve_group.add_argument("--pane-index", type=nonnegative_int, help="tmux pane_index value, usually 0-based")
+    resolve_group.add_argument("--ordinal", type=positive_int, help="Human 1-based pane number within the selected window")
 
     spawn_parser = subparsers.add_parser("spawn", help="Create a pane for long-running work")
     spawn_parser.add_argument("--target", help="tmux target such as SESSION:WINDOW")
@@ -1699,7 +2277,7 @@ def build_parser() -> argparse.ArgumentParser:
     orientation = spawn_parser.add_mutually_exclusive_group()
     orientation.add_argument("--vertical", action="store_true", help="Split vertically")
     orientation.add_argument("--horizontal", action="store_true", help="Split horizontally")
-    spawn_parser.add_argument("--percent", type=int, help="Pane size percentage")
+    spawn_parser.add_argument("--percent", type=split_percent, help="Pane size percentage from 1 to 99")
 
     new_window_parser = subparsers.add_parser("new-window", help="Create a tmux window")
     new_window_parser.add_argument("--cwd", required=True, help="Working directory for the new window")
@@ -1728,9 +2306,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     capture_parser = subparsers.add_parser("capture", help="Capture pane output")
     capture_parser.add_argument("--pane", required=True, help="Stable tmux pane ID, such as %%3")
-    capture_parser.add_argument("--lines", type=int, default=200, help="Number of recent lines")
+    capture_parser.add_argument("--lines", type=positive_int, default=200, help="Number of recent lines")
     capture_parser.add_argument("--strip-ansi", action="store_true", help="Remove ANSI/control escape sequences from output")
-    capture_parser.add_argument("--max-chars", type=int, help="Return only the last N characters after optional ANSI stripping")
+    capture_parser.add_argument("--max-chars", type=nonnegative_int, help="Return only the last N characters after optional ANSI stripping")
 
     run_parser = subparsers.add_parser("run", help="Run a long-running command through the status wrapper")
     run_parser.add_argument("--pane", required=True, help="Stable tmux pane ID, such as %%3")
@@ -1743,8 +2321,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--workspace")
     run_parser.add_argument("--state-dir")
     run_parser.add_argument("--require-idle-shell", action="store_true")
-    run_parser.add_argument("--next-instruction", help="Codex instruction to make ready after this job finishes")
-    run_parser.add_argument("--next-instruction-file", help="File containing the follow-up Codex instruction")
+    next_instruction_group = run_parser.add_mutually_exclusive_group()
+    next_instruction_group.add_argument("--next-instruction", help="Codex instruction to make ready after this job finishes")
+    next_instruction_group.add_argument("--next-instruction-file", help="File containing the follow-up Codex instruction")
     run_parser.add_argument(
         "--next-on",
         choices=["succeeded", "failed", "terminal"],
@@ -1756,9 +2335,9 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser.add_argument("--pane", required=True, help="Stable tmux pane ID, such as %%3")
     monitor_parser.add_argument("--match-regex")
     monitor_parser.add_argument("--idle-shell", action="store_true")
-    monitor_parser.add_argument("--timeout-seconds", type=float)
-    monitor_parser.add_argument("--poll-seconds", type=float, default=2.0)
-    monitor_parser.add_argument("--lines", type=int, default=200)
+    monitor_parser.add_argument("--timeout-seconds", type=positive_float)
+    monitor_parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
+    monitor_parser.add_argument("--lines", type=positive_int, default=200)
     monitor_parser.add_argument("--workspace")
     monitor_parser.add_argument("--state-dir")
 
@@ -1766,10 +2345,10 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("watch_action", nargs="?", choices=["start", "list", "status", "cancel"], default="start")
     watch_parser.add_argument("--job-id")
     watch_parser.add_argument("--pane", help="Stable tmux pane ID, such as %%3")
-    watch_parser.add_argument("--interval", type=float, default=180.0)
-    watch_parser.add_argument("--capture-lines", type=int, default=80)
+    watch_parser.add_argument("--interval", type=positive_float, default=180.0)
+    watch_parser.add_argument("--capture-lines", type=positive_int, default=80)
     watch_parser.add_argument("--status-file")
-    watch_parser.add_argument("--timeout-seconds", type=float)
+    watch_parser.add_argument("--timeout-seconds", type=positive_float)
     watch_parser.add_argument("--name")
     watch_parser.add_argument("--workspace")
     watch_parser.add_argument("--state-dir")
@@ -1780,9 +2359,11 @@ def build_parser() -> argparse.ArgumentParser:
     queue_idle_parser = subparsers.add_parser("queue-after-idle", help="Submit a command after a pane becomes an idle shell")
     queue_idle_parser.add_argument("--job-id", required=True)
     queue_idle_parser.add_argument("--pane", "--then-pane", dest="pane", required=True, help="Stable tmux pane ID, such as %%3")
-    queue_idle_parser.add_argument("--command", "--then-command", dest="command_text", required=True)
-    queue_idle_parser.add_argument("--poll-seconds", "--interval", dest="poll_seconds", type=float, default=2.0)
-    queue_idle_parser.add_argument("--timeout-seconds", type=float)
+    queue_idle_command = queue_idle_parser.add_mutually_exclusive_group(required=True)
+    queue_idle_command.add_argument("--command", "--then-command", dest="command_text")
+    queue_idle_command.add_argument("--command-file")
+    queue_idle_parser.add_argument("--poll-seconds", "--interval", dest="poll_seconds", type=positive_float, default=2.0)
+    queue_idle_parser.add_argument("--timeout-seconds", type=positive_float)
     queue_idle_parser.add_argument("--then-require-idle-shell", dest="require_idle_shell", action="store_true", default=True)
     queue_idle_parser.add_argument("--strict-preflight", action="store_true")
     queue_idle_parser.add_argument("--bash-if-not-executable", action="store_true")
@@ -1796,12 +2377,14 @@ def build_parser() -> argparse.ArgumentParser:
     queue_status_parser = subparsers.add_parser("queue-after-status", help="Submit a command after status-file rows are satisfied")
     queue_status_parser.add_argument("--job-id", required=True)
     queue_status_parser.add_argument("--pane", "--then-pane", dest="pane", required=True, help="Stable tmux pane ID, such as %%3")
-    queue_status_parser.add_argument("--command", "--then-command", dest="command_text", required=True)
+    queue_status_command = queue_status_parser.add_mutually_exclusive_group(required=True)
+    queue_status_command.add_argument("--command", "--then-command", dest="command_text")
+    queue_status_command.add_argument("--command-file")
     queue_status_parser.add_argument("--status-file", required=True)
     queue_status_parser.add_argument("--require-row", action="append", default=[])
     queue_status_parser.add_argument("--fail-row", action="append", default=[])
-    queue_status_parser.add_argument("--poll-seconds", "--interval", dest="poll_seconds", type=float, default=2.0)
-    queue_status_parser.add_argument("--timeout-seconds", type=float)
+    queue_status_parser.add_argument("--poll-seconds", "--interval", dest="poll_seconds", type=positive_float, default=2.0)
+    queue_status_parser.add_argument("--timeout-seconds", type=positive_float)
     queue_status_parser.add_argument("--then-require-idle-shell", dest="require_idle_shell", action="store_true")
     queue_status_parser.add_argument("--no-require-idle-shell", dest="require_idle_shell", action="store_false")
     queue_status_parser.set_defaults(require_idle_shell=True)
@@ -1838,8 +2421,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     task_add_parser = task_subparsers.add_parser("add", help="Add a Codex follow-up task")
     task_add_parser.add_argument("--task-id")
-    task_add_parser.add_argument("--after-job")
-    task_add_parser.add_argument("--after-event")
+    task_anchor_group = task_add_parser.add_mutually_exclusive_group(required=True)
+    task_anchor_group.add_argument("--after-job")
+    task_anchor_group.add_argument("--after-event")
     task_add_parser.add_argument("--trigger-on", choices=["succeeded", "failed", "terminal"], required=True)
     task_add_parser.add_argument("--instruction", required=True)
     task_add_parser.add_argument("--summary")
@@ -1856,7 +2440,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_load_parser = task_subparsers.add_parser("load", help="Load a skill-friendly task report")
     task_load_parser.add_argument("--for-skill", action="store_true")
     task_load_parser.add_argument("--json", action="store_true")
-    task_load_parser.add_argument("--max-items", type=int, default=5)
+    task_load_parser.add_argument("--max-items", type=positive_int, default=5)
     task_load_parser.add_argument("--workspace")
     task_load_parser.add_argument("--state-dir")
 
@@ -1916,7 +2500,10 @@ def main() -> None:
     elif args.action == "monitor":
         if not args.match_regex and not args.idle_shell and args.timeout_seconds is None:
             die("monitor requires --match-regex, --idle-shell, or --timeout-seconds")
-        print_json(monitor(args))
+        result = monitor(args)
+        print_json(result)
+        if not result.get("started"):
+            raise SystemExit(2)
     elif args.action == "watch":
         if args.watch_action in {"status", "cancel"} and not args.job_id:
             die(f"watch {args.watch_action} requires --job-id")

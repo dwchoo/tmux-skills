@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import os
 import signal
 import sys
@@ -26,6 +27,26 @@ def raise_worker_terminated(signum: int, _frame: object) -> None:
     raise WorkerTerminatedBySignal(signum)
 
 
+def positive_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite positive number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return number
+
+
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def command_hash(command_text: str | None) -> str | None:
     if command_text is None:
         return None
@@ -33,9 +54,47 @@ def command_hash(command_text: str | None) -> str | None:
 
 
 def read_command(args: argparse.Namespace) -> str:
-    if args.command_file:
-        return Path(args.command_file).expanduser().read_text(encoding="utf-8")
-    return args.command_text or ""
+    command_file_arg = getattr(args, "command_file", None)
+    if command_file_arg is not None:
+        if not tmux_state.one_line_text(command_file_arg):
+            raise ValueError("command file path is blank")
+        command_text = Path(str(command_file_arg)).expanduser().read_text(encoding="utf-8")
+    else:
+        command_text = "" if getattr(args, "command_text", None) is None else str(args.command_text)
+    if not tmux_state.one_line_text(command_text):
+        raise ValueError("command is blank")
+    return command_text
+
+
+def fail_command_read(
+    paths: dict[str, Path],
+    args: argparse.Namespace,
+    *,
+    started_at: str,
+    kind: str,
+    error: Exception,
+) -> int:
+    command_file_arg = getattr(args, "command_file", None)
+    command_path = (
+        str(Path(str(command_file_arg)).expanduser())
+        if command_file_arg is not None and tmux_state.one_line_text(command_file_arg)
+        else None
+    )
+    if isinstance(error, ValueError):
+        detail = str(error)
+    elif command_path:
+        detail = f"could not read command file {command_path}: {error}"
+    else:
+        detail = f"could not read command: {error}"
+    return fail_worker(
+        paths,
+        args,
+        started_at=started_at,
+        kind=kind,
+        command_text=None,
+        last_output=detail,
+        extra={"error": detail},
+    )
 
 
 def resolve_status_file(paths: dict[str, Path], status_file: str | None) -> Path | None:
@@ -45,6 +104,33 @@ def resolve_status_file(paths: dict[str, Path], status_file: str | None) -> Path
     if path.is_absolute():
         return path.resolve()
     return (paths["workspace"] / path).resolve()
+
+
+def required_status_file(paths: dict[str, Path], status_file: str | None) -> Path:
+    if status_file is None or not tmux_state.one_line_text(status_file):
+        raise ValueError("status file path is blank")
+    resolved = resolve_status_file(paths, str(status_file))
+    if resolved is None:
+        raise ValueError("status file path is blank")
+    return resolved
+
+
+def nonblank_row_specs(rows: list[str] | None, flag_name: str) -> list[str]:
+    specs: list[str] = []
+    for row in rows or []:
+        spec = str(row).strip()
+        if not tmux_state.one_line_text(spec):
+            raise ValueError(f"{flag_name} is blank")
+        specs.append(spec)
+    return specs
+
+
+def optional_status_file(paths: dict[str, Path], status_file: str | None, command_name: str) -> Path | None:
+    if status_file is None:
+        return None
+    if not tmux_state.one_line_text(status_file):
+        raise ValueError(f"{command_name} requires nonblank --status-file when provided")
+    return resolve_status_file(paths, status_file)
 
 
 def write_worker_record(
@@ -65,8 +151,8 @@ def write_worker_record(
     record: dict[str, Any] = {
         "version": 1,
         "job_id": job_id,
-        "kind": kind,
-        "status": status,
+        "kind": tmux_state.token_text(kind) or "job",
+        "status": tmux_state.token_text(status) or "unknown",
         "pid": os.getpid(),
         "pane_id": getattr(args, "pane", None),
         "command_hash": command_hash(command_text),
@@ -88,6 +174,9 @@ def write_worker_record(
         record["check_interval_seconds"] = float(check_interval)
     if extra:
         record.update(extra)
+    record["kind"] = tmux_state.token_text(kind) or "job"
+    record["status"] = tmux_state.token_text(status) or "unknown"
+    tmux_state.strip_managed_transient_fields(record)
     tmux_state.atomic_write_json(record_path, record)
     return record
 
@@ -125,14 +214,19 @@ def write_worker_status(
     data["heartbeat_at"] = tmux_state.utc_now()
     if extra:
         data.update(extra)
-    tmux_state.write_status(status_file, data)
-    return data
+    data["kind"] = tmux_state.token_text(kind) or "job"
+    data["status"] = tmux_state.token_text(status) or "unknown"
+    return tmux_state.write_status(status_file, data)
 
 
 def sleep_interruptibly(seconds: float) -> None:
     deadline = time.monotonic() + max(0.0, seconds)
     while time.monotonic() < deadline:
         time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+
+
+def timed_out(started: float, timeout_seconds: float | None) -> bool:
+    return timeout_seconds is not None and time.monotonic() - started >= timeout_seconds
 
 
 def status_rows(status_file: Path) -> list[str]:
@@ -142,11 +236,14 @@ def status_rows(status_file: Path) -> list[str]:
 
 
 def row_matches_spec(line: str, spec: str) -> bool:
+    spec = str(spec).strip()
+    if not tmux_state.one_line_text(spec):
+        return False
     if ":" not in spec:
         return spec in line
     key, expected = spec.rsplit(":", 1)
     fields = [field.strip() for field in line.split("\t")]
-    return (key in fields and expected in fields) or (key in line and expected in line)
+    return key in fields and expected in fields
 
 
 def parse_assignment_spec(spec: str) -> dict[str, str] | None:
@@ -214,10 +311,16 @@ def fail_worker(
 
 
 def active_worker_state(record: dict[str, Any] | None, status: dict[str, Any] | None) -> bool:
-    states = [str(data.get("status") or "") for data in (record, status) if data]
-    if any(state in tmux_state.TERMINAL_STATUSES for state in states):
+    record_state = tmux_state.token_text((record or {}).get("status"))
+    if record_state in tmux_state.TERMINAL_STATUSES:
         return False
-    return any(state in tmux_state.MANAGED_ACTIVE_STATUSES for state in states)
+    if record_state in tmux_state.MANAGED_ACTIVE_STATUSES:
+        return True
+
+    status_state = tmux_state.token_text((status or {}).get("status"))
+    if status_state in tmux_state.TERMINAL_STATUSES:
+        return False
+    return status_state in tmux_state.MANAGED_ACTIVE_STATUSES
 
 
 def terminalize_active_worker(
@@ -238,11 +341,13 @@ def terminalize_active_worker(
 
     now = tmux_state.utc_now()
     merged_extra = extra or {}
-    kind = str((record or {}).get("kind") or (status or {}).get("kind") or getattr(args, "action", None) or "job")
+    kind = tmux_state.token_text((record or {}).get("kind") or (status or {}).get("kind") or getattr(args, "action", None)) or "job"
     pane_id = (record or {}).get("pane_id") or (status or {}).get("pane_id") or getattr(args, "pane", None)
     log_file = tmux_state.log_path(paths, job_id)
 
     record_data = dict(record or {})
+    if "id" in record_data:
+        record_data["id"] = job_id
     record_data.update(
         {
             "version": record_data.get("version", 1),
@@ -260,11 +365,14 @@ def terminalize_active_worker(
             **merged_extra,
         }
     )
+    record_data["kind"] = kind
+    record_data["status"] = tmux_state.token_text(terminal_status) or "unknown"
     record_data.setdefault("created_at", now)
+    tmux_state.strip_managed_transient_fields(record_data)
     tmux_state.atomic_write_json(record_path, record_data)
 
     if status:
-        status_data = dict(status)
+        status_data = tmux_state.normalize_status(status, status_file)
         status_data.update(
             {
                 "status": terminal_status,
@@ -275,6 +383,8 @@ def terminalize_active_worker(
                 **merged_extra,
             }
         )
+        status_data["kind"] = kind
+        status_data["status"] = tmux_state.token_text(terminal_status) or "unknown"
     else:
         status_data = tmux_state.build_status(
             kind=kind,
@@ -292,6 +402,8 @@ def terminalize_active_worker(
             last_output=last_output,
         )
         status_data.update(merged_extra)
+        status_data["kind"] = kind
+        status_data["status"] = tmux_state.token_text(terminal_status) or "unknown"
     tmux_state.write_status(status_file, status_data)
 
 
@@ -301,12 +413,28 @@ def safety_cancel_last_output(args: argparse.Namespace) -> str:
     return "cancelled before command submission"
 
 
+def cancel_active_worker_safely(paths: dict[str, Path], args: argparse.Namespace, job_id: str) -> None:
+    try:
+        terminalize_active_worker(
+            paths,
+            args,
+            job_id=job_id,
+            terminal_status="cancelled",
+            last_output=safety_cancel_last_output(args),
+        )
+    except BaseException:
+        pass
+
+
 def run_worker_safely(
     args: argparse.Namespace,
     paths: dict[str, Path],
     job_id: str,
     worker: Callable[[argparse.Namespace], int],
 ) -> int:
+    identity_error = reject_invalid_worker_identity(args)
+    if identity_error is not None:
+        return identity_error
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     previous_sigint = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGTERM, raise_worker_terminated)
@@ -314,16 +442,10 @@ def run_worker_safely(
     try:
         return worker(args)
     except WorkerTerminatedBySignal:
-        try:
-            terminalize_active_worker(
-                paths,
-                args,
-                job_id=job_id,
-                terminal_status="cancelled",
-                last_output=safety_cancel_last_output(args),
-            )
-        except BaseException:
-            pass
+        cancel_active_worker_safely(paths, args, job_id)
+        return 1
+    except KeyboardInterrupt:
+        cancel_active_worker_safely(paths, args, job_id)
         return 1
     except BaseException as exc:
         try:
@@ -366,7 +488,6 @@ def submit_command(
         require_idle_shell=args.require_idle_shell,
         strict_preflight=args.strict_preflight,
         bash_if_not_executable=args.bash_if_not_executable,
-        cwd=str(paths["workspace"]),
     )
     try:
         result = tmux_control.send(send_args)
@@ -379,13 +500,14 @@ def submit_command(
             kind=kind,
             command_text=command_text,
             last_output=error,
-            extra={"error": error, **(extra or {})},
+            extra={**(extra or {}), "error": error},
         )
     status = "submitted" if result.get("sent_to_pane") else "failed"
+    status_token = tmux_state.token_text(status)
     merged_extra = {
+        **(extra or {}),
         "send_result": result,
         "command_hash": command_hash(command_text),
-        **(extra or {}),
     }
     write_worker_record(paths, args, kind=kind, status=status, command_text=command_text, extra=merged_extra)
     write_worker_status(
@@ -396,19 +518,25 @@ def submit_command(
         started_at=started_at,
         command_text=command_text,
         last_output=last_output or str(result.get("reason") or ""),
-        exit_code=0 if status == "submitted" else 1,
+        exit_code=0 if status_token == "submitted" else 1,
         extra=merged_extra,
     )
-    return 0 if status == "submitted" else 1
+    return 0 if status_token == "submitted" else 1
 
 
 def run_queue_after_idle(args: argparse.Namespace) -> int:
+    identity_error = reject_invalid_worker_identity(args)
+    if identity_error is not None:
+        return identity_error
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
     started_at = tmux_state.utc_now()
-    command_text = read_command(args)
-    started = time.monotonic()
     kind = "queue-after-idle"
+    try:
+        command_text = read_command(args)
+    except Exception as exc:
+        return fail_command_read(paths, args, started_at=started_at, kind=kind, error=exc)
+    started = time.monotonic()
     write_worker_record(paths, args, kind=kind, status="waiting_pane_idle", command_text=command_text)
 
     while True:
@@ -436,6 +564,20 @@ def run_queue_after_idle(args: argparse.Namespace) -> int:
                 extra={"idle_shell_check": guard},
             )
         if guard.get("ok"):
+            if timed_out(started, args.timeout_seconds):
+                write_worker_record(paths, args, kind=kind, status="timeout", command_text=command_text, extra={"idle_shell_check": guard})
+                write_worker_status(
+                    paths,
+                    args,
+                    kind=kind,
+                    status="timeout",
+                    started_at=started_at,
+                    command_text=command_text,
+                    last_output="timed out before command submission",
+                    exit_code=1,
+                    extra={"idle_shell_check": guard},
+                )
+                return 1
             return submit_command(
                 paths,
                 args,
@@ -445,7 +587,7 @@ def run_queue_after_idle(args: argparse.Namespace) -> int:
                 last_output="pane is idle; submitted command",
                 extra={"idle_shell_check": guard},
             )
-        if args.timeout_seconds is not None and time.monotonic() - started >= args.timeout_seconds:
+        if timed_out(started, args.timeout_seconds):
             write_worker_record(paths, args, kind=kind, status="timeout", command_text=command_text, extra={"idle_shell_check": guard})
             write_worker_status(
                 paths,
@@ -487,19 +629,50 @@ def run_queue_after_idle(args: argparse.Namespace) -> int:
 
 
 def run_queue_after_status(args: argparse.Namespace) -> int:
+    identity_error = reject_invalid_worker_identity(args)
+    if identity_error is not None:
+        return identity_error
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
     started_at = tmux_state.utc_now()
-    command_text = read_command(args)
-    started = time.monotonic()
     kind = "queue-after-status"
-    observed_file = resolve_status_file(paths, args.status_file)
-    required = args.require_row or []
-    fail_rows = args.fail_row or []
+    try:
+        command_text = read_command(args)
+    except Exception as exc:
+        return fail_command_read(paths, args, started_at=started_at, kind=kind, error=exc)
+    try:
+        observed_file = required_status_file(paths, args.status_file)
+        required = nonblank_row_specs(args.require_row, "--require-row")
+        if not required:
+            raise ValueError("queue-after-status requires at least one --require-row")
+        fail_rows = nonblank_row_specs(args.fail_row, "--fail-row")
+    except ValueError as exc:
+        return fail_worker(
+            paths,
+            args,
+            started_at=started_at,
+            kind=kind,
+            command_text=command_text,
+            last_output=str(exc),
+            extra={"error": str(exc)},
+        )
+    started = time.monotonic()
     write_worker_record(paths, args, kind=kind, status="waiting_status", command_text=command_text, extra={"observed_status_file": str(observed_file)})
 
     while True:
-        rows = status_rows(observed_file) if observed_file else []
+        try:
+            rows = status_rows(observed_file) if observed_file else []
+        except OSError as exc:
+            error = f"could not read status file {observed_file}: {exc}"
+            return fail_worker(
+                paths,
+                args,
+                started_at=started_at,
+                kind=kind,
+                command_text=command_text,
+                last_output=error,
+                extra={"observed_status_file": str(observed_file), "error": error},
+            )
         matched_required = specs_matching(rows, required)
         matched_failed = specs_matching(rows, fail_rows)
         extra = {
@@ -550,6 +723,21 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
                     extra={**extra, "idle_shell_check": guard},
                 )
             if guard.get("ok"):
+                if timed_out(started, args.timeout_seconds):
+                    timeout_extra = {**extra, "idle_shell_check": guard}
+                    write_worker_record(paths, args, kind=kind, status="timeout", command_text=command_text, extra=timeout_extra)
+                    write_worker_status(
+                        paths,
+                        args,
+                        kind=kind,
+                        status="timeout",
+                        started_at=started_at,
+                        command_text=command_text,
+                        last_output="timed out before command submission",
+                        exit_code=1,
+                        extra=timeout_extra,
+                    )
+                    return 1
                 return submit_command(
                     paths,
                     args,
@@ -578,7 +766,7 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
             extra=extra,
         )
 
-        if args.timeout_seconds is not None and time.monotonic() - started >= args.timeout_seconds:
+        if timed_out(started, args.timeout_seconds):
             write_worker_record(paths, args, kind=kind, status="timeout", command_text=command_text, extra=extra)
             write_worker_status(
                 paths,
@@ -610,14 +798,34 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
 
 
 def run_watch(args: argparse.Namespace) -> int:
+    identity_error = reject_invalid_worker_identity(args)
+    if identity_error is not None:
+        return identity_error
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
     started_at = tmux_state.utc_now()
     started = time.monotonic()
     kind = "watch"
-    observed_file = resolve_status_file(paths, args.status_file)
+    try:
+        observed_file = optional_status_file(paths, args.status_file, "watch")
+    except ValueError as exc:
+        return fail_worker(
+            paths,
+            args,
+            started_at=started_at,
+            kind=kind,
+            command_text=None,
+            last_output=str(exc),
+            extra={"error": str(exc)},
+        )
     log_file = tmux_state.log_path(paths, args.job_id)
-    write_worker_record(paths, args, kind=kind, status="running", extra={"observed_status_file": str(observed_file) if observed_file else None})
+    write_worker_record(
+        paths,
+        args,
+        kind=kind,
+        status="running",
+        extra={"observed_status_file": str(observed_file) if observed_file else None},
+    )
 
     while True:
         try:
@@ -641,8 +849,32 @@ def run_watch(args: argparse.Namespace) -> int:
 
         observed_tail = ""
         if observed_file and observed_file.exists():
-            observed_tail = tmux_state.tail_text(observed_file.read_text(encoding="utf-8", errors="replace"))
-        log_file.write_text(output, encoding="utf-8")
+            try:
+                observed_tail = tmux_state.tail_text(observed_file.read_text(encoding="utf-8", errors="replace"))
+            except OSError as exc:
+                error = f"could not read observed status file {observed_file}: {exc}"
+                return fail_worker(
+                    paths,
+                    args,
+                    started_at=started_at,
+                    kind=kind,
+                    command_text=None,
+                    last_output=error,
+                    extra={"observed_status_file": str(observed_file), "error": error},
+                )
+        try:
+            log_file.write_text(output, encoding="utf-8")
+        except OSError as exc:
+            error = f"could not write watch log file {log_file}: {exc}"
+            return fail_worker(
+                paths,
+                args,
+                started_at=started_at,
+                kind=kind,
+                command_text=None,
+                last_output=error,
+                extra={"error": error},
+            )
         extra = {
             "capture_lines": args.capture_lines,
             "observed_status_file": str(observed_file) if observed_file else None,
@@ -659,7 +891,7 @@ def run_watch(args: argparse.Namespace) -> int:
             extra=extra,
         )
 
-        if args.timeout_seconds is not None and time.monotonic() - started >= args.timeout_seconds:
+        if timed_out(started, args.timeout_seconds):
             write_worker_record(paths, args, kind=kind, status="timeout", extra=extra)
             write_worker_status(
                 paths,
@@ -695,29 +927,47 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--name")
 
 
+def validate_worker_identity(args: argparse.Namespace) -> None:
+    if not tmux_state.one_line_text(getattr(args, "job_id", None)):
+        raise ValueError("managed worker requires nonblank --job-id")
+    if not tmux_state.one_line_text(getattr(args, "pane", None)):
+        raise ValueError("managed worker requires nonblank --pane")
+
+
+def reject_invalid_worker_identity(args: argparse.Namespace) -> int | None:
+    try:
+        validate_worker_identity(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Managed tmux-skills worker")
     subparsers = parser.add_subparsers(dest="action", required=True)
 
     idle_parser = subparsers.add_parser("queue-after-idle")
     add_common(idle_parser)
-    idle_parser.add_argument("--command", dest="command_text")
-    idle_parser.add_argument("--command-file")
-    idle_parser.add_argument("--poll-seconds", type=float, default=2.0)
-    idle_parser.add_argument("--timeout-seconds", type=float)
+    idle_command = idle_parser.add_mutually_exclusive_group(required=True)
+    idle_command.add_argument("--command", dest="command_text")
+    idle_command.add_argument("--command-file")
+    idle_parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
+    idle_parser.add_argument("--timeout-seconds", type=positive_float)
     idle_parser.add_argument("--require-idle-shell", action="store_true", default=True)
     idle_parser.add_argument("--strict-preflight", action="store_true")
     idle_parser.add_argument("--bash-if-not-executable", action="store_true")
 
     status_parser = subparsers.add_parser("queue-after-status")
     add_common(status_parser)
-    status_parser.add_argument("--command", dest="command_text")
-    status_parser.add_argument("--command-file")
+    status_command = status_parser.add_mutually_exclusive_group(required=True)
+    status_command.add_argument("--command", dest="command_text")
+    status_command.add_argument("--command-file")
     status_parser.add_argument("--status-file", required=True)
     status_parser.add_argument("--require-row", action="append", default=[])
     status_parser.add_argument("--fail-row", action="append", default=[])
-    status_parser.add_argument("--poll-seconds", type=float, default=2.0)
-    status_parser.add_argument("--timeout-seconds", type=float)
+    status_parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
+    status_parser.add_argument("--timeout-seconds", type=positive_float)
     status_parser.add_argument("--require-idle-shell", action="store_true", default=True)
     status_parser.add_argument("--no-require-idle-shell", dest="require_idle_shell", action="store_false")
     status_parser.add_argument("--strict-preflight", action="store_true")
@@ -725,29 +975,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     watch_parser = subparsers.add_parser("watch")
     add_common(watch_parser)
-    watch_parser.add_argument("--interval", type=float, default=180.0)
-    watch_parser.add_argument("--capture-lines", type=int, default=80)
+    watch_parser.add_argument("--interval", type=positive_float, default=180.0)
+    watch_parser.add_argument("--capture-lines", type=positive_int, default=80)
     watch_parser.add_argument("--status-file")
-    watch_parser.add_argument("--timeout-seconds", type=float)
+    watch_parser.add_argument("--timeout-seconds", type=positive_float)
 
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.action in {"queue-after-idle", "queue-after-status"} and not (args.command_text or args.command_file):
-        print(f"{args.action} requires --command or --command-file", file=sys.stderr)
+    try:
+        validate_worker_identity(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
         raise SystemExit(2)
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     job_id = tmux_state.safe_id(args.job_id)
     if args.action == "queue-after-idle":
         raise SystemExit(run_worker_safely(args, paths, job_id, run_queue_after_idle))
     if args.action == "queue-after-status":
-        if not args.require_row:
-            print("queue-after-status requires at least one --require-row", file=sys.stderr)
+        try:
+            args.require_row = nonblank_row_specs(args.require_row, "--require-row")
+            if not args.require_row:
+                raise ValueError("queue-after-status requires at least one --require-row")
+            args.fail_row = nonblank_row_specs(args.fail_row, "--fail-row")
+            required_status_file(paths, args.status_file)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
             raise SystemExit(2)
         raise SystemExit(run_worker_safely(args, paths, job_id, run_queue_after_status))
     if args.action == "watch":
+        try:
+            optional_status_file(paths, args.status_file, "watch")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(2)
         raise SystemExit(run_worker_safely(args, paths, job_id, run_watch))
     raise SystemExit(2)
 

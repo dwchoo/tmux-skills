@@ -35,6 +35,7 @@ class TmuxIntegrationTests(unittest.TestCase):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        subprocess.run(["tmux", "kill-server"], env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.tmp.cleanup()
 
     def tmux(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -63,6 +64,17 @@ class TmuxIntegrationTests(unittest.TestCase):
         if result.returncode != 0:
             self.fail(f"tmux_control failed with {result.returncode}: stdout={result.stdout!r} stderr={result.stderr!r}")
         return json.loads(result.stdout)
+
+    def wait_for_pane_cwd(self, pane: str, expected: Path) -> dict[str, object]:
+        expected_path = expected.resolve()
+        last: dict[str, object] | None = None
+        for _ in range(50):
+            last = self.run_control(["current", "--target", pane])
+            current_path = Path(str(last["current"]["current_path"])).resolve()
+            if current_path == expected_path:
+                return last
+            subprocess.run(["sleep", "0.1"], check=True)
+        self.fail(f"pane cwd did not become {expected_path}: last={last!r}")
 
     def start_session(self) -> str:
         self.tmux(["new-session", "-d", "-s", self.session, "-c", str(self.workspace)])
@@ -104,7 +116,7 @@ class TmuxIntegrationTests(unittest.TestCase):
         result = self.run_control(["new-window", "--cwd", str(self.workspace), "--workspace", str(self.workspace)])
         self.assertEqual(result["session_name"], f"codex-{self.workspace.name}")
         pane = str(result["pane_id"])
-        current = self.run_control(["current", "--target", pane])
+        current = self.wait_for_pane_cwd(pane, self.workspace)
         self.assertEqual(Path(current["current"]["current_path"]).resolve(), self.workspace.resolve())
 
     def test_new_window_outside_tmux_first_window_uses_requested_name(self) -> None:

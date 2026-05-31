@@ -44,3 +44,6 @@ timeout = 5
 - Hooks read status files written by `tmux_job.py` and `tmux_monitor.py`, plus follow-up tasks under `.codex/tmux-skills/tasks`.
 - A fresh startup should not auto-run prior work. Use `python scripts/tmux_control.py task load --for-skill` to inspect old work explicitly.
 - Hooks do not wake a dormant Codex thread by themselves. `Stop` can continue an active turn; `SessionStart` resume/compact injects ready task context when a prior Codex CLI session is resumed.
+- `codex_tmux_hook.py stop` treats empty, malformed, or non-object stdin as empty input, and returns no block when Codex sends `stop_hook_active: true`.
+- Hook output compacts multiline status fields, managed job fields, and ready task instructions, and bounds long text so a large task file cannot dominate Codex hook context.
+- Add `--state-dir PATH` to the hook commands when the workspace uses a custom tmux-skills state directory.

@@ -18,7 +18,7 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 7. Capture results with `python scripts/tmux_control.py capture --pane <pane_id> --lines 200`; add `--strip-ansi` for tqdm/color/control-heavy output.
 8. For long-running commands, use `python scripts/tmux_control.py run --pane <pane_id> --command '<command>'` so completion/failure is recorded under `.codex/tmux-skills`.
 9. For delayed checks or follow-up submissions, use managed `watch`, `queue-after-idle`, or `queue-after-status` instead of raw shell `sleep` watchers.
-10. Add resume-only follow-up instructions with `run --next-instruction TEXT` or `task add`.
+10. Add resume-only follow-up instructions with `run --next-instruction TEXT`, `run --next-instruction-file PATH`, or anchored `task add --after-job JOB_ID|--after-event EVENT_ID`.
 11. Summarize the important output and continue with code edits or further tmux commands only when the result supports it.
 
 ## Target Selection
@@ -41,7 +41,8 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 - If `send` warns that a script is not executable, use `bash path/to/script.sh`, `--bash-if-not-executable`, or fix the executable bit deliberately.
 - Capture output before diagnosing failures, changing code, or claiming completion.
 - Use `capture --strip-ansi` for progress bars, colored output, or terminal-control-heavy logs.
-- Use `capture --max-chars N` when output is large; truncation happens after optional ANSI stripping.
+- Use `capture --max-chars N` when output is large; truncation happens after optional ANSI stripping. `N` must be non-negative, and `0` intentionally omits captured output while reporting truncation metadata.
+- Use positive integers for line-count flags such as `--lines` and `--capture-lines`.
 - Avoid raw `tmux send-keys` unless the helper script is unavailable.
 
 ## Reading Output
@@ -59,7 +60,7 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 - Use `queue-after-idle` when the next command should run only after a busy pane returns to an idle shell.
 - Use `queue-after-status` when a status TSV must reach required row states before the next command is submitted.
 - Cancel managed background workers with `watch cancel --job-id ID` or `job cancel --job-id ID`.
-- `run --next-instruction` and `task add` store Codex instructions in `.codex/tmux-skills/tasks`; they do not execute while Codex is absent.
+- `run --next-instruction`, `run --next-instruction-file`, and anchored `task add` store Codex instructions in `.codex/tmux-skills/tasks`; they do not execute while Codex is absent.
 - Codex hooks do not directly observe independent tmux jobs. Use `SessionStart`, `UserPromptSubmit`, and `Stop` command hooks to read status files.
 - `SessionStart` resume/compact context can expose ready follow-up tasks. A new startup should use explicit `task load --for-skill` instead of auto-running prior work.
 - `Stop` can continue a current turn for an unacknowledged terminal event or ready task; hooks do not wake a dormant thread by themselves.
@@ -79,22 +80,26 @@ This quick reference lists common paths; run `python scripts/tmux_control.py COM
 ```bash
 python scripts/tmux_control.py list
 python scripts/tmux_control.py current [--target TARGET]
-python scripts/tmux_control.py resolve [--target TARGET] [--current-window] [--pane-index N|--ordinal N]
-python scripts/tmux_control.py spawn [--target SESSION:WINDOW] [--cwd PATH] [--vertical|--horizontal] [--percent N]
+python scripts/tmux_control.py resolve [--target TARGET] [--current-window] [--pane-index 0..|--ordinal 1..]
+python scripts/tmux_control.py spawn [--target SESSION:WINDOW] [--cwd PATH] [--vertical|--horizontal] [--percent 1..99]
 python scripts/tmux_control.py new-window --cwd PATH [--target SESSION] [--name NAME]
-python scripts/tmux_control.py send --pane PANE_ID --command TEXT [--require-idle-shell] [--strict-preflight] [--bash-if-not-executable] [--enter|--no-enter]
-python scripts/tmux_control.py run --pane PANE_ID (--command TEXT|--command-file PATH) [--job-id ID] [--next-instruction TEXT]
-python scripts/tmux_control.py watch --job-id ID --pane PANE_ID [--interval N] [--capture-lines N] [--replace] [--allow-duplicate]
-python scripts/tmux_control.py watch list|status|cancel [--job-id ID]
-python scripts/tmux_control.py queue-after-idle --job-id ID (--pane|--then-pane) PANE_ID (--command|--then-command) TEXT [--interval N|--poll-seconds N] [--then-require-idle-shell] [--replace] [--allow-duplicate]
-python scripts/tmux_control.py queue-after-status --job-id ID --status-file PATH --require-row KEY:VALUE|key=value,... (--pane|--then-pane) PANE_ID (--command|--then-command) TEXT [--interval N|--poll-seconds N] [--then-require-idle-shell] [--replace] [--allow-duplicate]
-python scripts/tmux_control.py job list|status|cancel|gc [--job-id ID] [--stale] [--dry-run]
+python scripts/tmux_control.py send --pane PANE_ID --command TEXT [--require-idle-shell] [--strict-preflight] [--bash-if-not-executable] (--enter|--no-enter)
+python scripts/tmux_control.py run --pane PANE_ID (--command TEXT|--command-file PATH) [--job-id ID] [(--next-instruction TEXT|--next-instruction-file PATH)] [--next-on succeeded|failed|terminal]
+python scripts/tmux_control.py watch --job-id ID --pane PANE_ID [--interval N] [--capture-lines N] [--status-file PATH] [--timeout-seconds N] [--replace] [--allow-duplicate]
+python scripts/tmux_control.py watch list
+python scripts/tmux_control.py watch status|cancel --job-id ID
+python scripts/tmux_control.py queue-after-idle --job-id ID (--pane|--then-pane) PANE_ID ((--command|--then-command) TEXT|--command-file PATH) [--interval N|--poll-seconds N] [--timeout-seconds N] [--then-require-idle-shell] [--replace] [--allow-duplicate]
+python scripts/tmux_control.py queue-after-status --job-id ID --status-file PATH --require-row KEY:VALUE|key=value,... (--pane|--then-pane) PANE_ID ((--command|--then-command) TEXT|--command-file PATH) [--interval N|--poll-seconds N] [--timeout-seconds N] [--then-require-idle-shell|--no-require-idle-shell] [--replace] [--allow-duplicate]
+python scripts/tmux_control.py job list
+python scripts/tmux_control.py job status|cancel --job-id ID
+python scripts/tmux_control.py job gc --stale [--dry-run]
 python scripts/e2e_real_use.py --scenario smoke
 python scripts/e2e_real_use.py --scenario all --json
-python scripts/tmux_control.py task load [--for-skill] [--json]
+python scripts/tmux_control.py task load [--for-skill] [--json] [--max-items N]
 python scripts/tmux_control.py task next [--json]
 python scripts/tmux_control.py task claim --task-id TASK_ID
-python scripts/tmux_control.py monitor --pane PANE_ID [--match-regex REGEX] [--idle-shell]
+python scripts/tmux_control.py task add [--task-id TASK_ID] (--after-job JOB_ID|--after-event EVENT_ID) --trigger-on succeeded|failed|terminal --instruction TEXT
+python scripts/tmux_control.py monitor --pane PANE_ID [--match-regex REGEX] [--idle-shell] [--timeout-seconds N]
 python scripts/tmux_control.py capture --pane PANE_ID [--lines N] [--strip-ansi] [--max-chars N]
 ```
 

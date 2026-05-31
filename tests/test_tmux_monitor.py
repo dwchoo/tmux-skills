@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import io
+import os
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -58,6 +61,112 @@ class TmuxMonitorTests(unittest.TestCase):
             with mock.patch.object(tmux_monitor, "capture_pane", return_value="~/repo\n$"):
                 code = tmux_monitor.run_monitor(self.args(tmp, idle_shell=True, timeout_seconds=5))
         self.assertEqual(code, 0)
+
+    def test_rejects_blank_identity_before_status_write(self) -> None:
+        cases = [
+            ({"monitor_id": ""}, "monitor requires nonblank --monitor-id"),
+            ({"pane": " "}, "monitor requires nonblank --pane"),
+        ]
+        for overrides, message in cases:
+            with self.subTest(message=message):
+                with tempfile.TemporaryDirectory() as tmp:
+                    with mock.patch.object(tmux_monitor.sys, "stderr", io.StringIO()) as stderr:
+                        with mock.patch.object(tmux_monitor, "capture_pane") as capture:
+                            code = tmux_monitor.run_monitor(self.args(tmp, **overrides))
+                    paths = tmux_state.state_paths(tmp)
+
+                self.assertEqual(code, 2)
+                self.assertIn(message, stderr.getvalue())
+                capture.assert_not_called()
+                self.assertFalse(tmux_state.status_path(paths, "job").exists())
+                self.assertFalse(tmux_state.status_path(paths, "mon").exists())
+
+    def test_invalid_regex_records_failed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            code = tmux_monitor.run_monitor(self.args(tmp, match_regex="[", timeout_seconds=5))
+
+            paths = tmux_state.state_paths(tmp)
+            status, error = tmux_state.read_json(tmux_state.status_path(paths, "mon"))
+
+        self.assertIsNone(error)
+        self.assertEqual(code, 1)
+        self.assertEqual(status["status"], "failed")
+        self.assertIn("unterminated", status["last_output"])
+
+    def test_log_write_failure_records_clear_failed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            tmux_state.log_path(paths, "mon").mkdir()
+
+            with mock.patch.object(tmux_monitor, "capture_pane", return_value="hello"):
+                code = tmux_monitor.run_monitor(self.args(tmp, match_regex="hello", timeout_seconds=5))
+
+            status, error = tmux_state.read_json(tmux_state.status_path(paths, "mon"))
+
+        self.assertIsNone(error)
+        self.assertEqual(code, 1)
+        assert status is not None
+        self.assertEqual(status["status"], "failed")
+        self.assertIn("could not write monitor log file", status["last_output"])
+
+    def test_sigterm_records_stopped_status_and_restores_handler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+            def terminate_monitor(_pane: str, _lines: int) -> str:
+                os.kill(os.getpid(), signal.SIGTERM)
+                return "should not return"
+
+            with mock.patch.object(tmux_monitor, "capture_pane", side_effect=terminate_monitor):
+                code = tmux_monitor.run_monitor(self.args(tmp, match_regex="never", timeout_seconds=5))
+
+            paths = tmux_state.state_paths(tmp)
+            status, error = tmux_state.read_json(tmux_state.status_path(paths, "mon"))
+
+        self.assertIsNone(error)
+        self.assertEqual(code, 1)
+        assert status is not None
+        self.assertEqual(status["status"], "stopped")
+        self.assertEqual(status["exit_code"], 1)
+        self.assertTrue(status["event_id"])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous_sigterm)
+
+    def test_parser_rejects_nonpositive_polling_values(self) -> None:
+        parser = tmux_monitor.build_parser()
+        invalid_commands = [
+            ["--monitor-id", "mon", "--pane", "%1", "--timeout-seconds", "1", "--poll-seconds", "0"],
+            ["--monitor-id", "mon", "--pane", "%1", "--timeout-seconds", "-1"],
+            ["--monitor-id", "mon", "--pane", "%1", "--timeout-seconds", "nan"],
+            ["--monitor-id", "mon", "--pane", "%1", "--timeout-seconds", "1", "--poll-seconds", "inf"],
+        ]
+        for command in invalid_commands:
+            with self.subTest(command=command):
+                with mock.patch.object(tmux_monitor.sys, "stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args(command)
+
+    def test_parser_rejects_nonpositive_line_counts(self) -> None:
+        parser = tmux_monitor.build_parser()
+        invalid_commands = [
+            ["--monitor-id", "mon", "--pane", "%1", "--timeout-seconds", "1", "--lines", "0"],
+            ["--monitor-id", "mon", "--pane", "%1", "--timeout-seconds", "1", "--lines", "-1"],
+        ]
+        for command in invalid_commands:
+            with self.subTest(command=command):
+                with mock.patch.object(tmux_monitor.sys, "stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args(command)
+
+    def test_main_requires_at_least_one_trigger_condition(self) -> None:
+        argv = ["tmux_monitor.py", "--monitor-id", "mon", "--pane", "%1"]
+        with mock.patch.object(tmux_monitor.sys, "argv", argv):
+            with mock.patch.object(tmux_monitor.sys, "stderr", io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    tmux_monitor.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("monitor requires --match-regex, --idle-shell, or --timeout-seconds", stderr.getvalue())
 
 
 if __name__ == "__main__":

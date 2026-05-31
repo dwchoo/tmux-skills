@@ -119,6 +119,576 @@ class TmuxTaskTests(unittest.TestCase):
             cancelled = json.loads(self.cli(["task", "cancel", "--task-id", cancelled_add["task_id"]], tmp).stdout)
             self.assertEqual(cancelled["status"], "cancelled")
 
+    def test_task_finish_clears_stale_state_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            added = json.loads(
+                self.cli(
+                    [
+                        "task",
+                        "add",
+                        "--after-job",
+                        "job",
+                        "--trigger-on",
+                        "succeeded",
+                        "--instruction",
+                        "Inspect metadata",
+                    ],
+                    tmp,
+                ).stdout
+            )
+
+            blocked = json.loads(self.cli(["task", "blocked", "--task-id", added["task_id"], "--note", "needs input"], tmp).stdout)
+            done = json.loads(self.cli(["task", "done", "--task-id", added["task_id"], "--note", "finished"], tmp).stdout)
+            blocked_again = json.loads(self.cli(["task", "blocked", "--task-id", added["task_id"], "--note", "reopened"], tmp).stdout)
+
+        self.assertEqual(blocked["blocked_reason"], "needs input")
+        self.assertIsNone(blocked["completed_at"])
+        self.assertIsNone(done["blocked_reason"])
+        self.assertIsNotNone(done["completed_at"])
+        self.assertEqual(done["summary"], "finished")
+        self.assertEqual(blocked_again["blocked_reason"], "reopened")
+        self.assertIsNone(blocked_again["completed_at"])
+
+    def test_task_list_keeps_blocked_tasks_visible_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            blocked = tmux_state.build_task(
+                task_id="blocked",
+                instruction="Resolve blocked work",
+                summary=None,
+                intent=None,
+                after_job_id=None,
+                after_event_id=None,
+                trigger_on="terminal",
+            )
+            blocked["status"] = "blocked"
+            blocked["blocked_reason"] = "needs input"
+            tmux_state.write_task(paths, blocked)
+            cancelled = tmux_state.build_task(
+                task_id="cancelled",
+                instruction="Ignore cancelled work",
+                summary=None,
+                intent=None,
+                after_job_id=None,
+                after_event_id=None,
+                trigger_on="terminal",
+            )
+            cancelled["status"] = "cancelled"
+            tmux_state.write_task(paths, cancelled)
+
+            default_output = self.cli(["task", "list"], tmp).stdout
+            all_output = self.cli(["task", "list", "--all"], tmp).stdout
+
+        self.assertIn("blocked [blocked] Resolve blocked work", default_output)
+        self.assertNotIn("cancelled [cancelled] Ignore cancelled work", default_output)
+        self.assertIn("cancelled [cancelled] Ignore cancelled work", all_output)
+
+    def test_task_next_uses_oldest_ready_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            older = tmux_state.build_task(
+                task_id="older",
+                instruction="Handle older ready task",
+                summary=None,
+                intent=None,
+                after_job_id="job",
+                after_event_id=None,
+                trigger_on="succeeded",
+            )
+            newer = tmux_state.build_task(
+                task_id="newer",
+                instruction="Handle newer ready task",
+                summary=None,
+                intent=None,
+                after_job_id="job",
+                after_event_id=None,
+                trigger_on="succeeded",
+            )
+            older["updated_at"] = "2026-05-30T00:00:00Z"
+            newer["updated_at"] = "2026-05-30T00:01:00Z"
+            tmux_state.atomic_write_json(tmux_state.task_path(paths, "older"), older)
+            tmux_state.atomic_write_json(tmux_state.task_path(paths, "newer"), newer)
+
+            next_task = json.loads(self.cli(["task", "next", "--json"], tmp).stdout)
+
+        self.assertEqual(next_task["task_id"], "older")
+
+    def test_task_finish_writes_under_task_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            task = tmux_state.build_task(
+                task_id="task",
+                instruction="Finish under lock",
+                summary=None,
+                intent=None,
+                after_job_id=None,
+                after_event_id=None,
+                trigger_on="terminal",
+            )
+            task["status"] = "in_progress"
+            tmux_state.write_task(paths, task)
+            lock_active = False
+
+            class FakeLock:
+                def __enter__(self) -> None:
+                    nonlocal lock_active
+                    lock_active = True
+
+                def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+                    nonlocal lock_active
+                    lock_active = False
+
+            def fake_task_lock(_paths: dict[str, Path], task_id: str) -> FakeLock:
+                self.assertEqual(task_id, "task")
+                return FakeLock()
+
+            original_write_task = tmux_control.tmux_state.write_task
+
+            def checking_write_task(_paths: dict[str, Path], updated: dict[str, object]) -> dict[str, object]:
+                self.assertTrue(lock_active)
+                return original_write_task(_paths, updated)
+
+            args = argparse.Namespace(task_id="task", note="finished", workspace=tmp, state_dir=None)
+            with mock.patch.object(tmux_control, "task_lock", side_effect=fake_task_lock):
+                with mock.patch.object(tmux_control.tmux_state, "write_task", side_effect=checking_write_task):
+                    result = tmux_control.task_finish(args, "done")
+
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["summary"], "finished")
+
+    def test_task_claim_rejects_blank_task_id_without_claiming_default_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            task = tmux_state.build_task(
+                task_id="job",
+                instruction="Do not claim by blank id",
+                summary=None,
+                intent=None,
+                after_job_id="job",
+                after_event_id=None,
+                trigger_on="succeeded",
+            )
+            tmux_state.write_task(paths, task)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CONTROL),
+                    "task",
+                    "claim",
+                    "--task-id",
+                    "",
+                    "--workspace",
+                    tmp,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            stored = tmux_state.read_json(tmux_state.task_path(paths, "job"))[0]
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("task command requires nonblank --task-id", result.stderr)
+        assert stored is not None
+        self.assertEqual(stored["status"], "waiting")
+
+    def test_task_finish_rejects_blank_task_id_without_finishing_default_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            task = tmux_state.build_task(
+                task_id="job",
+                instruction="Do not finish by blank id",
+                summary=None,
+                intent=None,
+                after_job_id=None,
+                after_event_id=None,
+                trigger_on="terminal",
+            )
+            task["status"] = "in_progress"
+            tmux_state.write_task(paths, task)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CONTROL),
+                    "task",
+                    "done",
+                    "--task-id",
+                    " ",
+                    "--workspace",
+                    tmp,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            stored = tmux_state.read_json(tmux_state.task_path(paths, "job"))[0]
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("task command requires nonblank --task-id", result.stderr)
+        assert stored is not None
+        self.assertEqual(stored["status"], "in_progress")
+
+    def test_task_add_requires_job_or_event_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CONTROL),
+                    "task",
+                    "add",
+                    "--trigger-on",
+                    "terminal",
+                    "--instruction",
+                    "Unanchored task",
+                    "--workspace",
+                    tmp,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--after-job", result.stderr)
+        self.assertIn("--after-event", result.stderr)
+
+    def test_task_add_rejects_blank_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = [
+                ("--after-job", "   "),
+                ("--after-event", "\t"),
+            ]
+            results = []
+            for flag, value in cases:
+                results.append(
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(CONTROL),
+                            "task",
+                            "add",
+                            flag,
+                            value,
+                            "--trigger-on",
+                            "terminal",
+                            "--instruction",
+                            "Blank anchored task",
+                            "--workspace",
+                            tmp,
+                        ],
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                )
+            paths = tmux_state.state_paths(tmp)
+            task_files = list(paths["tasks"].glob("*.json")) if paths["tasks"].exists() else []
+
+        for result in results:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--after-job", result.stderr)
+            self.assertIn("--after-event", result.stderr)
+        self.assertEqual(task_files, [])
+
+    def test_task_add_rejects_blank_instruction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CONTROL),
+                    "task",
+                    "add",
+                    "--after-job",
+                    "job",
+                    "--trigger-on",
+                    "terminal",
+                    "--instruction",
+                    " \n\t ",
+                    "--workspace",
+                    tmp,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            paths = tmux_state.state_paths(tmp)
+            task_files = list(paths["tasks"].glob("*.json")) if paths["tasks"].exists() else []
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-empty --instruction", result.stderr)
+        self.assertEqual(task_files, [])
+
+    def test_task_add_rejects_blank_task_id_without_creating_default_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CONTROL),
+                    "task",
+                    "add",
+                    "--task-id",
+                    " \n\t ",
+                    "--after-job",
+                    "job",
+                    "--trigger-on",
+                    "terminal",
+                    "--instruction",
+                    "Do not create a default task",
+                    "--workspace",
+                    tmp,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            paths = tmux_state.state_paths(tmp)
+            task_files = list(paths["tasks"].glob("*.json")) if paths["tasks"].exists() else []
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("task add requires nonblank --task-id when provided", result.stderr)
+        self.assertEqual(task_files, [])
+
+    def test_task_add_rejects_both_job_and_event_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CONTROL),
+                    "task",
+                    "add",
+                    "--after-job",
+                    "job",
+                    "--after-event",
+                    "event",
+                    "--trigger-on",
+                    "terminal",
+                    "--instruction",
+                    "Ambiguous task",
+                    "--workspace",
+                    tmp,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not allowed with argument", result.stderr)
+
+    def test_task_add_after_job_matches_sanitized_job_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, tmux_state.safe_id("job with space"))
+
+            added = json.loads(
+                self.cli(
+                    [
+                        "task",
+                        "add",
+                        "--after-job",
+                        "job with space",
+                        "--trigger-on",
+                        "succeeded",
+                        "--instruction",
+                        "Inspect spaced job",
+                    ],
+                    tmp,
+                ).stdout
+            )
+            next_result = json.loads(self.cli(["task", "next", "--json"], tmp).stdout)
+
+        self.assertEqual(added["after_job_id"], "job-with-space")
+        self.assertEqual(next_result["task_id"], added["task_id"])
+        self.assertEqual(next_result["effective_status"], "ready")
+
+    def test_task_add_rejects_duplicate_task_id_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            original = tmux_state.build_task(
+                task_id="same-task",
+                instruction="Original instruction",
+                summary=None,
+                intent=None,
+                after_job_id="job",
+                after_event_id=None,
+                trigger_on="succeeded",
+            )
+            tmux_state.write_task(paths, original)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CONTROL),
+                    "task",
+                    "add",
+                    "--task-id",
+                    "same task",
+                    "--after-job",
+                    "job",
+                    "--trigger-on",
+                    "succeeded",
+                    "--instruction",
+                    "Replacement instruction",
+                    "--workspace",
+                    tmp,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            stored = tmux_state.read_json(tmux_state.task_path(paths, "same-task"))[0]
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("task already exists: same-task", result.stderr)
+        assert stored is not None
+        self.assertEqual(stored["instruction"], "Original instruction")
+
+    def test_task_add_writes_under_task_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_active = False
+
+            class FakeLock:
+                def __enter__(self) -> None:
+                    nonlocal lock_active
+                    lock_active = True
+
+                def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+                    nonlocal lock_active
+                    lock_active = False
+
+            def fake_task_lock(_paths: dict[str, Path], task_id: str) -> FakeLock:
+                self.assertEqual(task_id, "same-task")
+                return FakeLock()
+
+            def fake_write_task(_paths: dict[str, Path], task: dict[str, object]) -> dict[str, object]:
+                self.assertTrue(lock_active)
+                return dict(task)
+
+            args = argparse.Namespace(
+                task_id="same task",
+                after_job="job",
+                after_event=None,
+                trigger_on="succeeded",
+                instruction="Add under lock",
+                summary=None,
+                intent=None,
+                workspace=tmp,
+                state_dir=None,
+            )
+            with mock.patch.object(tmux_control, "task_lock", side_effect=fake_task_lock):
+                with mock.patch.object(tmux_control.tmux_state, "write_task", side_effect=fake_write_task):
+                    result = tmux_control.task_add(args)
+
+        self.assertEqual(result["task_id"], "same-task")
+        self.assertEqual(result["instruction"], "Add under lock")
+
+    def test_concurrent_claim_allows_only_one_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            task = tmux_state.build_task(
+                task_id="task",
+                instruction="Claim once",
+                summary=None,
+                intent=None,
+                after_job_id="job",
+                after_event_id=None,
+                trigger_on="succeeded",
+            )
+            tmux_state.write_task(paths, task)
+            command = [
+                sys.executable,
+                str(CONTROL),
+                "task",
+                "claim",
+                "--task-id",
+                "task",
+                "--workspace",
+                tmp,
+            ]
+            procs = [subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
+            results = []
+            for proc in procs:
+                stdout, stderr = proc.communicate(timeout=10)
+                results.append((proc.returncode, stdout, stderr))
+
+        self.assertEqual(sum(1 for returncode, _stdout, _stderr in results if returncode == 0), 1)
+        self.assertEqual(sum(1 for returncode, _stdout, _stderr in results if returncode != 0), 1)
+        self.assertTrue(any("task is not ready" in stderr for _returncode, _stdout, stderr in results))
+
+    def test_task_claim_does_not_persist_derived_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            task = tmux_state.build_task(
+                task_id="task",
+                instruction="Claim canonically",
+                summary=None,
+                intent=None,
+                after_job_id="job",
+                after_event_id=None,
+                trigger_on="succeeded",
+            )
+            tmux_state.write_task(paths, task)
+
+            claimed = json.loads(self.cli(["task", "claim", "--task-id", "task"], tmp).stdout)
+            stored = tmux_state.read_json(tmux_state.task_path(paths, "task"))[0]
+
+        self.assertEqual(claimed["status"], "in_progress")
+        assert stored is not None
+        for key in ("effective_status", "matched_status", "stale", "task_path"):
+            self.assertNotIn(key, stored)
+
+    def test_task_claim_preserves_requested_file_id_for_mismatched_json_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            task = tmux_state.build_task(
+                task_id="wrong-id",
+                instruction="Claim by file id",
+                summary=None,
+                intent=None,
+                after_job_id="job",
+                after_event_id=None,
+                trigger_on="succeeded",
+            )
+            tmux_state.atomic_write_json(tmux_state.task_path(paths, "file-id"), task)
+
+            claimed = json.loads(self.cli(["task", "claim", "--task-id", "file id"], tmp).stdout)
+            stored = tmux_state.read_json(tmux_state.task_path(paths, "file-id"))[0]
+
+        self.assertEqual(claimed["task_id"], "file-id")
+        self.assertEqual(claimed["status"], "in_progress")
+        assert stored is not None
+        self.assertEqual(stored["task_id"], "file-id")
+        self.assertEqual(stored["status"], "in_progress")
+        self.assertFalse(tmux_state.task_path(paths, "wrong-id").exists())
+
     def test_task_load_is_read_only_and_for_skill_has_required_sections(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = tmux_state.state_paths(tmp)
@@ -144,12 +714,218 @@ class TmuxTaskTests(unittest.TestCase):
                 "What happened",
                 "Current state",
                 "Next actionable instruction",
+                "Blocked or stale",
                 "Evidence files",
                 "Safe commands to inspect",
                 "Do not auto-run",
             ):
                 self.assertIn(heading, output)
             self.assertIn("Continue analysis", output)
+
+    def test_task_load_reports_managed_running_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            tmux_state.atomic_write_json(
+                tmux_state.job_path(paths, "watch"),
+                {
+                    "job_id": "watch",
+                    "kind": "watch",
+                    "status": "running",
+                    "pid": 0,
+                    "pane_id": "%2\nextra",
+                    "heartbeat_at": tmux_state.utc_now(),
+                    "updated_at": tmux_state.utc_now(),
+                    "check_interval_seconds": 1,
+                },
+            )
+
+            plain = self.cli(["task", "load"], tmp).stdout
+            for_skill = self.cli(["task", "load", "--for-skill"], tmp).stdout
+
+        expected = "- watch running kind=watch pane=%2 extra"
+        self.assertIn(expected, plain)
+        self.assertIn(expected, for_skill)
+        self.assertNotIn("\nextra", plain)
+        self.assertNotIn("\nextra", for_skill)
+
+    def test_task_load_for_skill_compacts_multiline_display_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            status_file = tmux_state.status_path(paths, "job")
+            status = tmux_state.build_status(
+                kind="job",
+                item_id="job",
+                attempt=1,
+                name="job",
+                status="succeeded",
+                pane_id="%1",
+                command_preview_text="echo ok",
+                cwd=str(paths["workspace"]),
+                status_file=status_file,
+                log_file=tmux_state.log_path(paths, "job"),
+                exit_code=0,
+                last_output="line one\nline two",
+            )
+            tmux_state.write_status(status_file, status)
+            task = tmux_state.build_task(
+                task_id="task",
+                instruction="Inspect first line\nthen inspect second line",
+                summary=None,
+                intent=None,
+                after_job_id="job",
+                after_event_id=None,
+                trigger_on="succeeded",
+            )
+            tmux_state.write_task(paths, task)
+
+            output = self.cli(["task", "load", "--for-skill"], tmp).stdout
+
+        self.assertIn("tail=line one line two", output)
+        self.assertIn("task_id=task: Inspect first line then inspect second line", output)
+        self.assertNotIn("\nline two", output)
+        self.assertNotIn("\nthen inspect second line", output)
+
+    def test_task_load_compacts_multiline_recent_job_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            status_file = tmux_state.status_path(paths, "legacy")
+            tmux_state.atomic_write_json(
+                status_file,
+                {
+                    "id": "legacy",
+                    "kind": "job",
+                    "status": "succeeded",
+                    "exit_code": "2\n3",
+                    "log_path": "logs/one.log\nlogs/two.log",
+                    "last_output": "done",
+                    "updated_at": tmux_state.utc_now(),
+                },
+            )
+
+            plain = self.cli(["task", "load"], tmp).stdout
+            for_skill = self.cli(["task", "load", "--for-skill"], tmp).stdout
+
+        self.assertIn("exit=2 3", plain)
+        self.assertIn("log=logs/one.log logs/two.log", plain)
+        self.assertIn("exit=2 3", for_skill)
+        self.assertNotIn("\n3", plain)
+        self.assertNotIn("\nlogs/two.log", plain)
+        self.assertNotIn("\n3", for_skill)
+
+    def test_task_load_for_skill_bounds_long_instruction_display(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            long_instruction = "Inspect prefix " + ("x" * 1000) + " suffix should be omitted"
+            task = tmux_state.build_task(
+                task_id="task",
+                instruction=long_instruction,
+                summary=None,
+                intent=None,
+                after_job_id="job",
+                after_event_id=None,
+                trigger_on="succeeded",
+            )
+            tmux_state.write_task(paths, task)
+
+            text_output = self.cli(["task", "load", "--for-skill"], tmp).stdout
+            json_output = json.loads(self.cli(["task", "load", "--json"], tmp).stdout)
+
+        self.assertIn("Inspect prefix", text_output)
+        self.assertIn("...", text_output)
+        self.assertNotIn("suffix should be omitted", text_output)
+        self.assertEqual(json_output["ready_tasks"][0]["instruction"], long_instruction)
+
+    def test_task_load_rejects_nonpositive_max_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CONTROL),
+                    "task",
+                    "load",
+                    "--json",
+                    "--max-items",
+                    "0",
+                    "--workspace",
+                    tmp,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("positive integer", result.stderr)
+
+    def test_task_load_limits_ready_tasks_by_max_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            for index in range(3):
+                task = tmux_state.build_task(
+                    task_id=f"task-{index}",
+                    instruction=f"Task {index}",
+                    summary=None,
+                    intent=None,
+                    after_job_id="job",
+                    after_event_id=None,
+                    trigger_on="succeeded",
+                )
+                tmux_state.write_task(paths, task)
+
+            data = json.loads(self.cli(["task", "load", "--json", "--max-items", "2"], tmp).stdout)
+
+        self.assertEqual(len(data["ready_tasks"]), 2)
+        self.assertGreaterEqual(len(data["all_tasks"]), 3)
+
+    def test_task_load_safe_commands_preserve_custom_state_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "custom-state"
+            paths = tmux_state.state_paths(tmp, str(state_dir))
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            task = tmux_state.build_task(
+                task_id="task",
+                instruction="Inspect custom state",
+                summary=None,
+                intent=None,
+                after_job_id="job",
+                after_event_id=None,
+                trigger_on="succeeded",
+            )
+            tmux_state.write_task(paths, task)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CONTROL),
+                    "task",
+                    "load",
+                    "--json",
+                    "--workspace",
+                    tmp,
+                    "--state-dir",
+                    str(state_dir),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            data = json.loads(result.stdout)
+
+        task_commands = [command for command in data["safe_commands"] if " task " in command]
+        self.assertTrue(task_commands)
+        for command in task_commands:
+            self.assertIn("--state-dir", command)
+            self.assertIn(str(state_dir), command)
 
     def test_json_load_handles_old_status_and_corrupt_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,6 +938,20 @@ class TmuxTaskTests(unittest.TestCase):
             data = json.loads(result.stdout)
             self.assertEqual(data["recent_jobs"][0]["id"], "old")
             self.assertEqual(len(data["errors"]), 1)
+
+    def test_text_load_reports_unreadable_state_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            (paths["status"] / "bad.json").write_text("{", encoding="utf-8")
+
+            plain = self.cli(["task", "load"], tmp).stdout
+            for_skill = self.cli(["task", "load", "--for-skill"], tmp).stdout
+
+        self.assertIn("State Warnings", plain)
+        self.assertIn("Skipped unreadable state file", plain)
+        self.assertIn("State warnings", for_skill)
+        self.assertIn("Skipped unreadable state file", for_skill)
 
     def test_load_tasks_tolerates_corrupt_task_object(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -194,6 +984,76 @@ class TmuxTaskTests(unittest.TestCase):
             self.assertIn("good", state_by_id)
             self.assertEqual(state_by_id["bad"]["version"], tmux_state.TASK_VERSION)
 
+    def test_load_tasks_normalizes_legacy_string_evidence_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            status = self.write_status(paths, "job")
+            tmux_state.atomic_write_json(
+                tmux_state.task_path(paths, "legacy"),
+                {
+                    "task_id": "legacy",
+                    "status": "waiting",
+                    "instruction": "Inspect legacy evidence",
+                    "after_job_id": "job",
+                    "trigger_on": "succeeded",
+                    "evidence_paths": "legacy.log",
+                },
+            )
+
+            data = json.loads(self.cli(["task", "load", "--json"], tmp).stdout)
+
+        ready = data["ready_tasks"][0]
+        self.assertEqual(ready["task_id"], "legacy")
+        self.assertIn("legacy.log", ready["evidence_paths"])
+        self.assertIn("legacy.log", data["evidence_files"])
+        self.assertNotIn("l", data["evidence_files"])
+        self.assertIn(status["status_path"], ready["evidence_paths"])
+
+    def test_task_with_invalid_legacy_trigger_defaults_to_succeeded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            self.write_status(paths, "job")
+            tmux_state.atomic_write_json(
+                tmux_state.task_path(paths, "legacy-trigger"),
+                {
+                    "task_id": "legacy-trigger",
+                    "status": "waiting",
+                    "instruction": "Inspect legacy trigger",
+                    "after_job_id": "job",
+                    "trigger_on": "success",
+                },
+            )
+
+            data = json.loads(self.cli(["task", "next", "--json"], tmp).stdout)
+
+        self.assertEqual(data["task_id"], "legacy-trigger")
+        self.assertEqual(data["trigger_on"], "succeeded")
+        self.assertEqual(data["effective_status"], "ready")
+
+    def test_task_with_padded_legacy_after_event_id_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            status = self.write_status(paths, "job")
+            tmux_state.atomic_write_json(
+                tmux_state.task_path(paths, "legacy-event"),
+                {
+                    "task_id": "legacy-event",
+                    "status": "waiting",
+                    "instruction": "Inspect legacy event",
+                    "after_event_id": f" {status['event_id']} ",
+                    "trigger_on": "succeeded",
+                },
+            )
+
+            data = json.loads(self.cli(["task", "next", "--json"], tmp).stdout)
+
+        self.assertEqual(data["task_id"], "legacy-event")
+        self.assertEqual(data["after_event_id"], status["event_id"])
+        self.assertEqual(data["effective_status"], "ready")
+
     def test_stale_in_progress_and_reclaim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = tmux_state.state_paths(tmp)
@@ -210,12 +1070,21 @@ class TmuxTaskTests(unittest.TestCase):
             )
             task["status"] = "in_progress"
             task["claimed_at"] = old
+            task["completed_at"] = old
+            task["blocked_reason"] = "old block"
             tmux_state.write_task(paths, task)
 
             load = json.loads(self.cli(["task", "load", "--json"], tmp).stdout)
+            text_load = self.cli(["task", "load"], tmp).stdout
+            for_skill_load = self.cli(["task", "load", "--for-skill"], tmp).stdout
             self.assertEqual(load["blocked"][0]["task_id"], "stale")
             claimed = json.loads(self.cli(["task", "claim", "--task-id", "stale", "--reclaim-stale"], tmp).stdout)
             self.assertEqual(claimed["status"], "in_progress")
+            self.assertIsNone(claimed["completed_at"])
+            self.assertIsNone(claimed["blocked_reason"])
+            self.assertIn("stale [stale] Resume stale", text_load)
+            self.assertIn("## Blocked or stale", for_skill_load)
+            self.assertIn("stale [stale] Resume stale", for_skill_load)
 
     def test_run_next_instruction_creates_waiting_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -249,6 +1118,37 @@ class TmuxTaskTests(unittest.TestCase):
             self.assertEqual(task["status"], "waiting")
             self.assertEqual(task["after_job_id"], "job-next")
             self.assertEqual(task["instruction"], "Summarize the result")
+
+    def test_run_next_instruction_file_creates_waiting_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            instruction_file = Path(tmp) / "next.txt"
+            instruction_file.write_text("Inspect file result\nChoose the next run\n", encoding="utf-8")
+
+            args = argparse.Namespace(
+                pane="%1",
+                command_text="printf ok",
+                command_file=None,
+                job_id="job-next-file",
+                name="job",
+                cwd=tmp,
+                workspace=tmp,
+                state_dir=None,
+                require_idle_shell=False,
+                next_instruction=None,
+                next_instruction_file=str(instruction_file),
+                next_on="terminal",
+            )
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                result = tmux_control.run_job(args)
+
+            self.assertTrue(result["next_task"])
+            task_id = result["next_task"]["task_id"]
+            paths = tmux_state.state_paths(tmp)
+            task = tmux_state.read_json(tmux_state.task_path(paths, task_id))[0]
+            self.assertEqual(task["status"], "waiting")
+            self.assertEqual(task["after_job_id"], "job-next-file")
+            self.assertEqual(task["trigger_on"], "terminal")
+            self.assertEqual(task["instruction"], "Inspect file result\nChoose the next run\n")
 
 
 if __name__ == "__main__":

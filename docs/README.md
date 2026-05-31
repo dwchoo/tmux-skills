@@ -6,6 +6,7 @@ This directory is the LLM wiki for tmux-skills. It is the canonical place for de
 
 | Task | Start here |
 | --- | --- |
+| Start as an LLM agent | [`../llms.txt`](../llms.txt) |
 | Understand the repo quickly | [`../README.md`](../README.md) |
 | Operate tmux safely as an agent | [`../SKILL.md`](../SKILL.md) |
 | Maintain this LLM wiki | [`llm-wiki-style-guide.md`](llm-wiki-style-guide.md) |
@@ -19,6 +20,7 @@ This directory is the LLM wiki for tmux-skills. It is the canonical place for de
 
 - `README.md` is for project orientation, requirements, file map, and verification entry points.
 - `SKILL.md` is the agent operating guide: target selection, safe command execution, and quick helper commands.
+- `llms.txt` is the LLM entry point and document map.
 - `docs/workflows-and-features.md` is canonical for the desired operating flow and feature map.
 - `docs/llm-wiki-style-guide.md` is canonical for writing and maintaining this LLM wiki.
 - `docs/managed-workers.md` is canonical for managed worker contracts.
