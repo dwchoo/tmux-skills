@@ -27,6 +27,7 @@ from tmux_text import prompt_like, strip_ansi
 
 
 FIELD_SEP = "\x1f"
+TMUX_ESCAPED_FIELD_SEP = "\\037"
 PANE_FIELDS = [
     "#{session_name}",
     "#{window_index}",
@@ -66,6 +67,18 @@ CURRENT_FORMAT = FIELD_SEP.join(CURRENT_FIELDS)
 SPAWN_FORMAT = FIELD_SEP.join(["#{session_name}", "#{window_id}", "#{pane_id}"])
 NEW_WINDOW_FORMAT = FIELD_SEP.join(["#{session_name}", "#{window_id}", "#{window_index}", "#{pane_id}"])
 SHELL_COMMANDS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "mksh"}
+
+
+def split_tmux_fields(line: str) -> list[str]:
+    """Split tmux format output across tmux versions.
+
+    tmux 3.4 prints control separators in format output as octal escapes
+    (``\037``) rather than the literal unit separator used in the format
+    string. Keep FIELD_SEP as the in-memory delimiter so tabs and common
+    punctuation remain valid inside fields, but accept tmux's escaped form
+    when parsing real command output.
+    """
+    return line.replace(TMUX_ESCAPED_FIELD_SEP, FIELD_SEP).split(FIELD_SEP)
 
 
 def default_tmux_tmpdir() -> Path:
@@ -234,7 +247,7 @@ def enrich_pane_processes(pane: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_current_line(line: str) -> dict[str, Any] | None:
-    parts = line.split(FIELD_SEP)
+    parts = split_tmux_fields(line)
     if len(parts) != len(CURRENT_FIELDS):
         return None
     (
@@ -276,7 +289,7 @@ def parse_current_line(line: str) -> dict[str, Any] | None:
 
 
 def parse_pane_line(line: str, *, current_pane_id: str | None = None) -> dict[str, Any] | None:
-    parts = line.split(FIELD_SEP)
+    parts = split_tmux_fields(line)
     if len(parts) != len(PANE_FIELDS):
         return None
     (
@@ -458,7 +471,7 @@ def spawn(args: argparse.Namespace) -> dict[str, Any]:
             target,
         ]
     )
-    session_name, window_id, pane_id = result.stdout.strip().split(FIELD_SEP)
+    session_name, window_id, pane_id = split_tmux_fields(result.stdout.strip())
     return {
         "session_name": session_name,
         "window_id": window_id,
@@ -515,7 +528,7 @@ def new_window(args: argparse.Namespace) -> dict[str, Any]:
             target,
         ]
     )
-    session_name, window_id, window_index, pane_id = result.stdout.strip().split(FIELD_SEP)
+    session_name, window_id, window_index, pane_id = split_tmux_fields(result.stdout.strip())
     return {
         "session_name": session_name,
         "window_id": window_id,

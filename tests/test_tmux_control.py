@@ -117,6 +117,33 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(parsed["title"], "title\twith-tab")
         self.assertTrue(parsed["current"])
 
+    def test_parse_pane_line_accepts_tmux_octal_escaped_separator(self) -> None:
+        parts = [
+            "session",
+            "3",
+            "@4",
+            "window",
+            "%5",
+            "0",
+            "1",
+            "bash",
+            "/tmp/path",
+            "title",
+            "123",
+            "0",
+            "80",
+            "24",
+            "/dev/ttys001",
+        ]
+        with mock.patch.object(tmux_control, "descendant_processes", return_value=(0, [], 0)):
+            parsed = tmux_control.parse_pane_line("\\037".join(parts), current_pane_id="%5")
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed["session_name"], "session")
+        self.assertEqual(parsed["pane_id"], "%5")
+        self.assertTrue(parsed["current"])
+
     def test_capture_max_chars_after_strip(self) -> None:
         args = argparse.Namespace(pane="%1", lines=10, strip_ansi=True, max_chars=4)
         with mock.patch.object(tmux_control, "capture_text", return_value="abcdef"):
