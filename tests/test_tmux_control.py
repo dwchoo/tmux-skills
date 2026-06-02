@@ -17,6 +17,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import tmux_control
+import tmux_queue
 import tmux_state
 
 
@@ -697,6 +698,44 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 1)
         self.assertIn("watch requires nonblank --status-file when provided", stderr.getvalue())
         start_worker.assert_not_called()
+
+    def test_watch_low_token_requires_status_file(self) -> None:
+        argv = ["tmux_control.py", "watch", "--job-id", "watch", "--pane", "%1", "--low-token"]
+        with mock.patch.object(tmux_control.sys, "argv", argv):
+            with mock.patch.object(tmux_control.sys, "stderr", io.StringIO()) as stderr:
+                with mock.patch.object(tmux_control, "start_managed_worker") as start_worker:
+                    with self.assertRaises(SystemExit) as raised:
+                        tmux_control.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("watch --low-token requires --status-file", stderr.getvalue())
+        start_worker.assert_not_called()
+
+    def test_low_token_watch_does_not_capture_pane_when_status_file_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                job_id="low-token-watch",
+                pane="%1",
+                workspace=tmp,
+                state_dir=None,
+                name=None,
+                interval=1.0,
+                capture_lines=80,
+                status_lines=10,
+                status_max_chars=1200,
+                status_file="missing.status",
+                timeout_seconds=0,
+                low_token=True,
+            )
+            with mock.patch.object(tmux_queue.tmux_control, "capture_text", side_effect=AssertionError("capture should not run")):
+                exit_code = tmux_queue.run_watch(args)
+            paths = tmux_state.state_paths(tmp)
+            status = tmux_state.read_json(tmux_state.status_path(paths, "low-token-watch"))[0]
+
+        self.assertEqual(exit_code, 1)
+        assert status is not None
+        self.assertIn("status file not found", status["last_output"])
+        self.assertTrue(status["low_token"])
 
     def test_queue_after_status_requires_require_row_in_main(self) -> None:
         argv = [
@@ -1578,7 +1617,13 @@ class TmuxControlTests(unittest.TestCase):
                 allow_duplicate=False,
                 owner=None,
             )
-            result = tmux_control.queue_after_idle(args)
+            with mock.patch.object(tmux_control.tmux_state, "pid_is_running", return_value=True):
+                with mock.patch.object(
+                    tmux_control.tmux_state,
+                    "process_command_line",
+                    return_value="python3 /repo/scripts/tmux_queue.py queue-after-idle --job-id active-job --pane %1",
+                ):
+                    result = tmux_control.queue_after_idle(args)
 
             paths = tmux_state.state_paths(tmp)
             record, record_error = tmux_state.read_json(tmux_state.job_path(paths, "missing-command"))
@@ -1806,7 +1851,7 @@ class TmuxControlTests(unittest.TestCase):
                 "job_id": "active-job",
                 "kind": "queue-after-idle",
                 "status": "waiting_pane_idle",
-                "pid": 0,
+                "pid": 12345,
                 "pane_id": "%1",
                 "dedupe_key": "existing-key",
                 "heartbeat_at": tmux_state.utc_now(),
@@ -1830,7 +1875,13 @@ class TmuxControlTests(unittest.TestCase):
                 allow_duplicate=False,
                 owner=None,
             )
-            result = tmux_control.queue_after_idle(args)
+            with mock.patch.object(tmux_control.tmux_state, "pid_is_running", return_value=True):
+                with mock.patch.object(
+                    tmux_control.tmux_state,
+                    "process_command_line",
+                    return_value="python3 /repo/scripts/tmux_queue.py queue-after-idle --job-id active-job --pane %1",
+                ):
+                    result = tmux_control.queue_after_idle(args)
 
             record, record_error = tmux_state.read_json(tmux_state.job_path(paths, "active-job"))
             status, status_error = tmux_state.read_json(tmux_state.status_path(paths, "active-job"))
@@ -2090,7 +2141,7 @@ class TmuxControlTests(unittest.TestCase):
                     "job_id": "first",
                     "kind": "queue-after-idle",
                     "status": "waiting_pane_idle",
-                    "pid": 0,
+                    "pid": 12345,
                     "pane_id": "%1",
                     "dedupe_key": dedupe_key,
                     "heartbeat_at": tmux_state.utc_now(),
@@ -2099,7 +2150,13 @@ class TmuxControlTests(unittest.TestCase):
                 },
             )
 
-            result = tmux_control.queue_after_idle(args)
+            with mock.patch.object(tmux_control.tmux_state, "pid_is_running", return_value=True):
+                with mock.patch.object(
+                    tmux_control.tmux_state,
+                    "process_command_line",
+                    return_value="python3 /repo/scripts/tmux_queue.py queue-after-idle --job-id first --pane %1",
+                ):
+                    result = tmux_control.queue_after_idle(args)
 
         self.assertFalse(result["started"])
         self.assertTrue(result["duplicate"])
@@ -2110,11 +2167,14 @@ class TmuxControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             counter = {"pid": 20000}
             counter_lock = threading.Lock()
+            pid_to_job: dict[int, str] = {}
 
-            def fake_popen(*_args: object, **_kwargs: object) -> object:
+            def fake_popen(argv: list[str], *_args: object, **_kwargs: object) -> object:
                 with counter_lock:
                     counter["pid"] += 1
                     pid = counter["pid"]
+                    job_id = argv[argv.index("--job-id") + 1]
+                    pid_to_job[pid] = job_id
 
                 class Proc:
                     pass
@@ -2141,9 +2201,15 @@ class TmuxControlTests(unittest.TestCase):
                 )
                 return tmux_control.queue_after_idle(args)
 
+            def command_line(pid: int | None) -> str:
+                job_id = pid_to_job.get(int(pid or 0), "first")
+                return f"python3 /repo/scripts/tmux_queue.py queue-after-idle --job-id {job_id} --pane %1"
+
             with mock.patch.object(tmux_control.subprocess, "Popen", side_effect=fake_popen):
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                    results = list(pool.map(start, ["first", "second"]))
+                with mock.patch.object(tmux_control.tmux_state, "pid_is_running", return_value=True):
+                    with mock.patch.object(tmux_control.tmux_state, "process_command_line", side_effect=command_line):
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                            results = list(pool.map(start, ["first", "second"]))
 
         self.assertEqual(sum(1 for result in results if result.get("started")), 1)
         self.assertEqual(sum(1 for result in results if result.get("duplicate")), 1)
@@ -2189,7 +2255,7 @@ class TmuxControlTests(unittest.TestCase):
                     "job_id": "first",
                     "kind": "queue-after-idle",
                     "status": "waiting_pane_idle",
-                    "pid": 0,
+                    "pid": 12345,
                     "pane_id": "%1",
                     "dedupe_key": dedupe_key,
                     "heartbeat_at": tmux_state.utc_now(),
@@ -2198,13 +2264,99 @@ class TmuxControlTests(unittest.TestCase):
                 },
             )
             with mock.patch.object(tmux_control.subprocess, "Popen", return_value=Proc()):
-                result = tmux_control.queue_after_idle(args)
+                with mock.patch.object(tmux_control.tmux_state, "pid_is_running", return_value=True):
+                    with mock.patch.object(
+                        tmux_control.tmux_state,
+                        "process_command_line",
+                        return_value="python3 /repo/scripts/tmux_queue.py queue-after-idle --job-id first --pane %1",
+                    ):
+                        result = tmux_control.queue_after_idle(args)
 
             record = tmux_state.read_json(tmux_state.job_path(paths, "second"))[0]
 
         self.assertTrue(result["started"])
         self.assertTrue(record["duplicate_allowed"])
         self.assertEqual(record["duplicate_of"], "first")
+
+    def test_queue_reclaims_dead_same_dedupe_record_before_start(self) -> None:
+        class Proc:
+            pid = 12346
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            args = argparse.Namespace(
+                job_id="second",
+                pane="%1",
+                command_text="echo ok",
+                workspace=tmp,
+                state_dir=None,
+                name=None,
+                poll_seconds=1.0,
+                timeout_seconds=None,
+                strict_preflight=False,
+                bash_if_not_executable=False,
+                replace=False,
+                allow_duplicate=False,
+                owner=None,
+            )
+            dedupe_key = tmux_control.managed_dedupe_key(
+                tmux_control.managed_dedupe_payload(paths, args, kind="queue-after-idle", command_text=args.command_text)
+            )
+            tmux_state.atomic_write_json(
+                tmux_state.job_path(paths, "first"),
+                {
+                    "job_id": "first",
+                    "kind": "queue-after-idle",
+                    "status": "waiting_pane_idle",
+                    "pid": 12345,
+                    "pane_id": "%1",
+                    "dedupe_key": dedupe_key,
+                    "heartbeat_at": tmux_state.utc_now(),
+                    "updated_at": tmux_state.utc_now(),
+                    "check_interval_seconds": 1,
+                },
+            )
+            with mock.patch.object(tmux_control.subprocess, "Popen", return_value=Proc()):
+                with mock.patch.object(tmux_control.tmux_state, "pid_is_running", return_value=False):
+                    result = tmux_control.queue_after_idle(args)
+
+            first = tmux_state.read_json(tmux_state.job_path(paths, "first"))[0]
+
+        self.assertTrue(result["started"])
+        self.assertEqual(result["reclaimed"][0]["job_id"], "first")
+        self.assertEqual(first["status"], "stale")
+        self.assertEqual(first["replaced_by"], "second")
+
+    def test_job_list_compact_omits_verbose_fields_and_truncates_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            tmux_state.atomic_write_json(
+                tmux_state.job_path(paths, "watch"),
+                {
+                    "job_id": "watch",
+                    "kind": "watch",
+                    "status": "starting",
+                    "pid": 0,
+                    "pane_id": "%1",
+                    "dedupe_key": "sha256:" + ("a" * 64),
+                    "dedupe_payload": {"status_file": "very large payload"},
+                    "argv": ["python", "tmux_queue.py", "watch"],
+                    "observed_status_tail": "large tail",
+                    "heartbeat_at": tmux_state.utc_now(),
+                    "updated_at": tmux_state.utc_now(),
+                    "check_interval_seconds": 1,
+                },
+            )
+            args = argparse.Namespace(workspace=tmp, state_dir=None, compact=True, no_observed_tail=True, max_chars=12)
+            result = tmux_control.job_list(args)
+
+        job = result["jobs"][0]
+        self.assertNotIn("argv", job)
+        self.assertNotIn("dedupe_payload", job)
+        self.assertNotIn("observed_status_tail", job)
+        self.assertEqual(job["dedupe_key"], "sha256:aa...")
 
     def test_replace_tolerates_existing_pid_disappearing_before_signal(self) -> None:
         class Proc:
@@ -2424,7 +2576,7 @@ class TmuxControlTests(unittest.TestCase):
                 {
                     "job_id": "watch",
                     "kind": " Watch ",
-                    "status": "running",
+                    "status": "starting",
                     "pid": 0,
                     "pane_id": "%1",
                     "heartbeat_at": tmux_state.utc_now(),
@@ -2520,6 +2672,58 @@ class TmuxControlTests(unittest.TestCase):
         self.assertTrue(result["found"])
         assert result["record"] is not None
         self.assertEqual(result["record"]["kind"], "watch")
+
+    def test_job_status_reports_dead_pid_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            tmux_state.atomic_write_json(
+                tmux_state.job_path(paths, "dead-watch"),
+                {
+                    "job_id": "dead-watch",
+                    "kind": "watch",
+                    "status": "running",
+                    "pid": 12345,
+                    "pane_id": "%1",
+                    "heartbeat_at": tmux_state.utc_now(),
+                    "updated_at": tmux_state.utc_now(),
+                    "check_interval_seconds": 180,
+                },
+            )
+            with mock.patch.object(tmux_control.tmux_state, "pid_is_running", return_value=False):
+                result = tmux_control.job_status(argparse.Namespace(job_id="dead-watch", workspace=tmp, state_dir=None))
+
+        assert result["record"] is not None
+        self.assertEqual(result["record"]["status"], "running")
+        self.assertEqual(result["record"]["effective_status"], "dead")
+        self.assertEqual(result["record"]["process_state"], "dead_pid")
+        self.assertTrue(result["record"]["stale"])
+
+    def test_job_status_reports_orphaned_foreign_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            tmux_state.atomic_write_json(
+                tmux_state.job_path(paths, "foreign-watch"),
+                {
+                    "job_id": "foreign-watch",
+                    "kind": "watch",
+                    "status": "running",
+                    "pid": 12345,
+                    "pane_id": "%1",
+                    "heartbeat_at": tmux_state.utc_now(),
+                    "updated_at": tmux_state.utc_now(),
+                    "check_interval_seconds": 180,
+                },
+            )
+            with mock.patch.object(tmux_control.tmux_state, "pid_is_running", return_value=True):
+                with mock.patch.object(tmux_control.tmux_state, "process_command_line", return_value="python3 other.py"):
+                    result = tmux_control.job_status(argparse.Namespace(job_id="foreign-watch", workspace=tmp, state_dir=None))
+
+        assert result["record"] is not None
+        self.assertEqual(result["record"]["effective_status"], "orphaned")
+        self.assertEqual(result["record"]["process_state"], "foreign_pid")
+        self.assertFalse(result["record"]["pid_matches"])
 
     def test_job_status_kind_filter_checks_status_when_record_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -680,7 +680,7 @@ class TmuxStateTests(unittest.TestCase):
                 {
                     "job_id": "fresh",
                     "kind": "queue-after-idle",
-                    "status": "waiting_pane_idle",
+                    "status": "starting",
                     "pid": 0,
                     "pane_id": "%1",
                     "stale_reason": "legacy stale reason",
@@ -759,7 +759,7 @@ class TmuxStateTests(unittest.TestCase):
                 {
                     "job_id": "watch",
                     "kind": " Watch ",
-                    "status": " Running ",
+                    "status": " Starting ",
                     "pane_id": "%1",
                     "heartbeat_at": tmux_state.utc_now(),
                     "updated_at": tmux_state.utc_now(),
@@ -769,7 +769,7 @@ class TmuxStateTests(unittest.TestCase):
             state = tmux_state.load_task_state(paths)
             classified = tmux_state.classify_task_state(state)
 
-        self.assertEqual(state["jobs"][0]["status"], "running")
+        self.assertEqual(state["jobs"][0]["status"], "starting")
         self.assertEqual(state["jobs"][0]["kind"], "watch")
         self.assertEqual(classified["running"][0]["job_id"], "watch")
 

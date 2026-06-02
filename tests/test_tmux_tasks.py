@@ -731,7 +731,7 @@ class TmuxTaskTests(unittest.TestCase):
                 {
                     "job_id": "watch",
                     "kind": "watch",
-                    "status": "running",
+                    "status": "starting",
                     "pid": 0,
                     "pane_id": "%2\nextra",
                     "heartbeat_at": tmux_state.utc_now(),
@@ -743,7 +743,7 @@ class TmuxTaskTests(unittest.TestCase):
             plain = self.cli(["task", "load"], tmp).stdout
             for_skill = self.cli(["task", "load", "--for-skill"], tmp).stdout
 
-        expected = "- watch running kind=watch pane=%2 extra"
+        expected = "- watch starting kind=watch pane=%2 extra"
         self.assertIn(expected, plain)
         self.assertIn(expected, for_skill)
         self.assertNotIn("\nextra", plain)

@@ -26,7 +26,7 @@ TASK_STATUSES = {"waiting", "ready", "in_progress", "done", "blocked", "cancelle
 TASK_OPEN_STATUSES = {"waiting", "ready", "in_progress", "blocked"}
 TASK_TRIGGERS = {"succeeded", "failed", "terminal"}
 TASK_TRANSIENT_FIELDS = {"effective_status", "matched_status", "stale", "task_path"}
-MANAGED_TRANSIENT_FIELDS = {"pid_running", "pid_matches", "stale"}
+MANAGED_TRANSIENT_FIELDS = {"pid_running", "pid_matches", "stale", "effective_status", "process_state"}
 MANAGED_WORKER_ACTIONS = {"queue-after-idle", "queue-after-status", "watch"}
 DEFAULT_STALE_SECONDS = 30 * 60
 TASK_DISPLAY_TEXT_LIMIT = 800
@@ -462,6 +462,37 @@ def managed_job_stale_reason(
     return None
 
 
+def managed_job_effective_status(
+    record: dict[str, Any],
+    *,
+    pid_running: bool | None = None,
+    pid_matches: bool | None = None,
+    now: datetime | None = None,
+) -> tuple[str, str, str | None]:
+    stored_status = token_text(record.get("status")) or "unknown"
+    if stored_status in MANAGED_TERMINAL_STATUSES:
+        return stored_status, "terminal", record.get("stale_reason") if stored_status == "stale" else None
+    if stored_status not in MANAGED_ACTIVE_STATUSES:
+        return stored_status, "unknown", None
+
+    pid = managed_job_pid(record)
+    if not pid:
+        age = age_seconds(record.get("heartbeat_at") or record.get("updated_at"), now=now)
+        if stored_status == "starting" and (age is None or age < 10):
+            return stored_status, "starting", None
+        return "dead", "missing_pid", "active managed job has no recorded pid"
+
+    if pid_running is False:
+        return "dead", "dead_pid", "recorded pid is not running"
+    if pid_running is True and pid_matches is False:
+        return "orphaned", "foreign_pid", "recorded pid is running but is not this tmux-skills worker"
+    return stored_status, "verified_worker", None
+
+
+def is_verified_active_managed_job(record: dict[str, Any]) -> bool:
+    return is_active_managed_job(record) and token_text(record.get("effective_status") or record.get("status")) in MANAGED_ACTIVE_STATUSES
+
+
 def sort_key(status: dict[str, Any]) -> str:
     return str(status.get("ended_at") or status.get("updated_at") or status.get("started_at") or "")
 
@@ -638,12 +669,20 @@ def managed_job_with_effective_state(record: dict[str, Any]) -> dict[str, Any]:
     pid = managed_job_pid(enriched)
     pid_running = pid_is_running(pid) if pid else False
     pid_matches = managed_worker_pid_matches(enriched) if pid_running else False
+    effective_status, process_state, process_reason = managed_job_effective_status(
+        enriched,
+        pid_running=pid_running,
+        pid_matches=pid_matches,
+    )
     stale_reason = managed_job_stale_reason(enriched, pid_running=pid_running, pid_matches=pid_matches)
     enriched["pid_running"] = pid_running
     enriched["pid_matches"] = pid_matches
-    enriched["stale"] = bool(stale_reason)
-    if stale_reason:
-        enriched["stale_reason"] = stale_reason
+    enriched["effective_status"] = effective_status
+    enriched["process_state"] = process_state
+    enriched["stale"] = bool(stale_reason or effective_status in {"dead", "orphaned", "stale"})
+    reason = stale_reason or process_reason
+    if reason:
+        enriched["stale_reason"] = reason
     else:
         enriched.pop("stale_reason", None)
     return enriched

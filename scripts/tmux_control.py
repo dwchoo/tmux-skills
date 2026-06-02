@@ -1193,13 +1193,79 @@ def load_job_records(paths: dict[str, Path], kind: str | None = None) -> list[di
     return records
 
 
+def managed_record_is_reclaimable(record: dict[str, Any]) -> bool:
+    return tmux_state.is_active_managed_job(record) and str(record.get("effective_status") or "") in {"dead", "orphaned"}
+
+
+def mark_managed_job_stale(
+    paths: dict[str, Path],
+    record: dict[str, Any],
+    *,
+    stale_reason: str,
+    replaced_by: str | None = None,
+) -> dict[str, Any] | None:
+    job_id = str(record.get("job_id") or record.get("id") or "")
+    if not job_id:
+        return None
+    now = tmux_state.utc_now()
+    record_path = tmux_state.job_path(paths, job_id)
+    stored, error = tmux_state.read_json(record_path)
+    if error or not stored:
+        return None
+    stored = tmux_state.normalize_managed_job(stored, record_path)
+    stored.update({"status": "stale", "updated_at": now, "heartbeat_at": now, "stale_reason": stale_reason})
+    if replaced_by:
+        stored["replaced_by"] = replaced_by
+    tmux_state.strip_managed_transient_fields(stored)
+    tmux_state.atomic_write_json(record_path, stored)
+
+    status_path = tmux_state.status_path(paths, job_id)
+    status, _status_error = tmux_state.read_json(status_path)
+    if status:
+        status = tmux_state.normalize_status(status, status_path)
+        status.update({"status": "stale", "exit_code": 1, "last_output": stale_reason, "stale_reason": stale_reason})
+    else:
+        status = tmux_state.build_status(
+            kind=str(stored.get("kind") or "job"),
+            item_id=job_id,
+            attempt=1,
+            name=stored.get("name"),
+            status="stale",
+            pane_id=stored.get("pane_id"),
+            command_preview_text=str(stored.get("command_path") or ""),
+            cwd=str(paths["workspace"]),
+            status_file=status_path,
+            log_file=tmux_state.log_path(paths, job_id),
+            exit_code=1,
+            last_output=stale_reason,
+        )
+    if replaced_by:
+        status["replaced_by"] = replaced_by
+    tmux_state.write_status(status_path, status)
+    return stored
+
+
+def reclaim_matching_inactive_jobs(paths: dict[str, Path], *, dedupe_key: str, replacement_job_id: str) -> list[dict[str, Any]]:
+    reclaimed: list[dict[str, Any]] = []
+    for record in load_job_records(paths):
+        if record.get("dedupe_key") != dedupe_key:
+            continue
+        if not managed_record_is_reclaimable(record):
+            continue
+        reason = str(record.get("stale_reason") or f"reclaimed {record.get('effective_status')} managed job")
+        marked = mark_managed_job_stale(paths, record, stale_reason=reason, replaced_by=replacement_job_id)
+        if marked:
+            reclaimed.append({"job_id": marked.get("job_id"), "stale_reason": reason})
+    return reclaimed
+
+
 def active_duplicate_record(paths: dict[str, Path], *, dedupe_key: str, item_id: str | None = None) -> dict[str, Any] | None:
     for record in load_job_records(paths):
         if record.get("dedupe_key") != dedupe_key:
             continue
         if item_id and record.get("job_id") == item_id:
             continue
-        if tmux_state.is_active_managed_job(record) and not record.get("stale"):
+        if tmux_state.is_verified_active_managed_job(record):
             return record
     return None
 
@@ -1214,6 +1280,117 @@ def duplicate_result(item_id: str, *, dedupe_key: str, existing: dict[str, Any],
         "existing": existing,
         "reason": reason,
     }
+
+
+COMPACT_JOB_FIELDS = {
+    "job_id",
+    "id",
+    "kind",
+    "status",
+    "effective_status",
+    "process_state",
+    "pid",
+    "pid_running",
+    "pid_matches",
+    "pane_id",
+    "dedupe_key",
+    "created_at",
+    "updated_at",
+    "heartbeat_at",
+    "stale_reason",
+    "error",
+    "job_path",
+    "status_path",
+    "log_path",
+    "replaced_by",
+    "pane_state",
+}
+
+COMPACT_STATUS_FIELDS = {
+    "id",
+    "job_id",
+    "kind",
+    "status",
+    "exit_code",
+    "pane_id",
+    "updated_at",
+    "ended_at",
+    "heartbeat_at",
+    "last_output",
+    "stale_reason",
+    "status_path",
+    "log_path",
+    "replaced_by",
+}
+
+
+def truncate_strings(value: Any, max_chars: int | None) -> Any:
+    if max_chars is None:
+        return value
+    if isinstance(value, str):
+        if max_chars <= 0:
+            return ""
+        return value if len(value) <= max_chars else value[: max_chars - 3] + "..." if max_chars > 3 else value[:max_chars]
+    if isinstance(value, list):
+        return [truncate_strings(item, max_chars) for item in value]
+    if isinstance(value, dict):
+        return {key: truncate_strings(item, max_chars) for key, item in value.items()}
+    return value
+
+
+def remove_observed_tail(value: Any) -> Any:
+    if isinstance(value, list):
+        return [remove_observed_tail(item) for item in value]
+    if isinstance(value, dict):
+        return {key: remove_observed_tail(item) for key, item in value.items() if key != "observed_status_tail"}
+    return value
+
+
+def compact_mapping(value: Any, fields: set[str]) -> Any:
+    if not isinstance(value, dict):
+        return value
+    return {key: value[key] for key in sorted(fields) if key in value}
+
+
+def compact_job_output(data: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    result: dict[str, Any] = dict(data)
+    if getattr(args, "compact", False):
+        if isinstance(result.get("jobs"), list):
+            result["jobs"] = [compact_mapping(job, COMPACT_JOB_FIELDS) for job in result["jobs"]]
+        if isinstance(result.get("stale_jobs"), list):
+            result["stale_jobs"] = [compact_mapping(job, COMPACT_JOB_FIELDS) for job in result["stale_jobs"]]
+        if isinstance(result.get("record"), dict):
+            result["record"] = compact_mapping(result["record"], COMPACT_JOB_FIELDS)
+        if isinstance(result.get("status"), dict):
+            result["status"] = compact_mapping(result["status"], COMPACT_STATUS_FIELDS)
+    if getattr(args, "no_observed_tail", False):
+        result = remove_observed_tail(result)
+    return truncate_strings(result, getattr(args, "max_chars", None))
+
+
+def pane_state_for(pane_id: Any) -> dict[str, Any]:
+    pane_text = str(pane_id or "")
+    if not pane_text:
+        return {"pane_id": None, "pane_exists": False}
+    info = current_info(pane_text)
+    if not info:
+        return {"pane_id": pane_text, "pane_exists": False}
+    return {
+        "pane_id": info.get("pane_id"),
+        "pane_exists": True,
+        "pane_dead": info.get("pane_dead"),
+        "current_command": info.get("current_command"),
+        "window_id": info.get("window_id"),
+        "window_name": info.get("window_name"),
+    }
+
+
+def attach_pane_state(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not record:
+        return record
+    updated = dict(record)
+    updated["pane_state"] = pane_state_for(updated.get("pane_id"))
+    return updated
 
 
 def write_managed_job_record(
@@ -1474,6 +1651,7 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
                                 "existing": existing,
                             }
 
+            reclaimed = reclaim_matching_inactive_jobs(paths, dedupe_key=dedupe_key, replacement_job_id=item_id)
             duplicate = active_duplicate_record(paths, dedupe_key=dedupe_key, item_id=item_id)
             duplicate_allowed = bool(getattr(args, "allow_duplicate", False))
             duplicate_of = duplicate.get("job_id") if duplicate else None
@@ -1557,6 +1735,8 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
                 )
                 if args.status_file:
                     argv.extend(["--status-file", args.status_file])
+                if getattr(args, "low_token", False):
+                    argv.append("--low-token")
             else:
                 argv.extend(["--poll-seconds", str(args.poll_seconds)])
                 if args.strict_preflight:
@@ -1571,6 +1751,8 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
                         argv.extend(["--fail-row", row])
                     if not args.require_idle_shell:
                         argv.append("--no-require-idle-shell")
+                    if getattr(args, "low_token", False):
+                        argv.append("--low-token")
             if args.timeout_seconds is not None:
                 argv.extend(["--timeout-seconds", str(args.timeout_seconds)])
 
@@ -1581,6 +1763,8 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
                 "owner": owner,
                 "check_interval_seconds": interval,
             }
+            if getattr(args, "low_token", False):
+                record_extra["low_token"] = True
             if duplicate_allowed and duplicate_of:
                 record_extra.update({"duplicate_allowed": True, "duplicate_of": duplicate_of})
             try:
@@ -1715,6 +1899,7 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
         "log_path": str(tmux_state.log_path(paths, item_id)),
         "workspace": str(paths["workspace"]),
         "state_dir": str(paths["root"]),
+        "reclaimed": reclaimed,
         "record": record,
     }
 
@@ -1722,7 +1907,8 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
 def job_list(args: argparse.Namespace, kind: str | None = None) -> dict[str, Any]:
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
-    return {"jobs": load_job_records(paths, kind), "workspace": str(paths["workspace"]), "state_dir": str(paths["root"])}
+    result = {"jobs": load_job_records(paths, kind), "workspace": str(paths["workspace"]), "state_dir": str(paths["root"])}
+    return compact_job_output(result, args)
 
 
 def job_kind_matches(actual: str | None, expected: str | None) -> bool:
@@ -1746,10 +1932,14 @@ def job_status(args: argparse.Namespace, kind: str | None = None) -> dict[str, A
     if status:
         status = tmux_state.normalize_status(status, status_path)
     if record and not job_kind_matches(str(record.get("kind") or ""), kind):
-        return {"job_id": item_id, "found": False, "reason": f"job is not a {kind} job", "record": record}
+        result = {"job_id": item_id, "found": False, "reason": f"job is not a {kind} job", "record": record}
+        return compact_job_output(result, args)
     if not record and status and not job_kind_matches(str(status.get("kind") or ""), kind):
-        return {"job_id": item_id, "found": False, "reason": f"status is not a {kind} job", "status": status}
-    return {
+        result = {"job_id": item_id, "found": False, "reason": f"status is not a {kind} job", "status": status}
+        return compact_job_output(result, args)
+    if getattr(args, "include_pane_state", False):
+        record = attach_pane_state(record)
+    result = {
         "job_id": item_id,
         "found": bool(record or status),
         "record": record,
@@ -1758,6 +1948,7 @@ def job_status(args: argparse.Namespace, kind: str | None = None) -> dict[str, A
         "status_error": status_error,
         "pid_running": bool((record or {}).get("pid_running")),
     }
+    return compact_job_output(result, args)
 
 
 def job_cancel(args: argparse.Namespace, kind: str | None = None) -> dict[str, Any]:
@@ -1775,28 +1966,37 @@ def job_cancel(args: argparse.Namespace, kind: str | None = None) -> dict[str, A
 
     record_status = tmux_state.token_text(record.get("status"))
     if record_status in tmux_state.TERMINAL_STATUSES:
-        return {"job_id": item_id, "cancelled": False, "reason": f"job already {record_status}", "record": record}
+        if getattr(args, "include_pane_state", False):
+            record = attach_pane_state(record)
+        result = {"job_id": item_id, "cancelled": False, "reason": f"job already {record_status}", "record": record}
+        return compact_job_output(result, args)
     pid = parse_int(str(record.get("pid") or ""))
     running = pid_is_running(pid)
     if running and pid:
         if not tmux_state.managed_worker_pid_matches(record):
-            return {
+            if getattr(args, "include_pane_state", False):
+                record = attach_pane_state(record)
+            result = {
                 "job_id": item_id,
                 "cancelled": False,
                 "reason": "recorded pid is running but no longer looks like this tmux-skills worker",
                 "record": record,
             }
+            return compact_job_output(result, args)
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             running = False
         except PermissionError as exc:
-            return {
+            if getattr(args, "include_pane_state", False):
+                record = attach_pane_state(record)
+            result = {
                 "job_id": item_id,
                 "cancelled": False,
                 "reason": f"could not signal recorded pid: {exc}",
                 "record": record,
             }
+            return compact_job_output(result, args)
 
     now = tmux_state.utc_now()
     record.update({"status": "cancelled", "updated_at": now, "heartbeat_at": now})
@@ -1832,16 +2032,23 @@ def job_cancel(args: argparse.Namespace, kind: str | None = None) -> dict[str, A
             last_output="cancelled by tmux_control.py",
         )
     status = tmux_state.write_status(status_file, status)
-    return {"job_id": item_id, "cancelled": True, "signal_sent": running, "record": record, "status": status}
+    if getattr(args, "include_pane_state", False):
+        record = attach_pane_state(record)
+    result = {"job_id": item_id, "cancelled": True, "signal_sent": running, "record": record, "status": status}
+    return compact_job_output(result, args)
 
 
-def job_gc(args: argparse.Namespace) -> dict[str, Any]:
+def job_gc(args: argparse.Namespace, kind: str | None = None) -> dict[str, Any]:
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
     if not args.stale:
         die("job gc requires --stale")
 
-    stale_records = [record for record in load_job_records(paths) if record.get("stale")]
+    stale_records = [
+        record
+        for record in load_job_records(paths, kind)
+        if tmux_state.is_active_managed_job(record) and record.get("stale")
+    ]
     result: dict[str, Any] = {
         "dry_run": bool(args.dry_run),
         "stale_jobs": stale_records,
@@ -1849,47 +2056,17 @@ def job_gc(args: argparse.Namespace) -> dict[str, Any]:
         "workspace": str(paths["workspace"]),
         "state_dir": str(paths["root"]),
     }
+    if getattr(args, "include_pane_state", False):
+        result["stale_jobs"] = [attach_pane_state(record) for record in result["stale_jobs"]]
     if args.dry_run:
-        return result
+        return compact_job_output(result, args)
 
-    now = tmux_state.utc_now()
     for record in stale_records:
-        job_id = str(record.get("job_id") or record.get("id") or "")
-        if not job_id:
-            continue
         stale_reason = str(record.get("stale_reason") or "stale managed job")
-        record_path = tmux_state.job_path(paths, job_id)
-        stored, error = tmux_state.read_json(record_path)
-        if error or not stored:
-            continue
-        stored = tmux_state.normalize_managed_job(stored, record_path)
-        stored.update({"status": "stale", "updated_at": now, "heartbeat_at": now, "stale_reason": stale_reason})
-        tmux_state.strip_managed_transient_fields(stored)
-        tmux_state.atomic_write_json(record_path, stored)
-
-        status_path = tmux_state.status_path(paths, job_id)
-        status, _status_error = tmux_state.read_json(status_path)
-        if status:
-            status = tmux_state.normalize_status(status, status_path)
-            status.update({"status": "stale", "exit_code": 1, "last_output": stale_reason, "stale_reason": stale_reason})
-        else:
-            status = tmux_state.build_status(
-                kind=str(stored.get("kind") or "job"),
-                item_id=job_id,
-                attempt=1,
-                name=stored.get("name"),
-                status="stale",
-                pane_id=stored.get("pane_id"),
-                command_preview_text=str(stored.get("command_path") or ""),
-                cwd=str(paths["workspace"]),
-                status_file=status_path,
-                log_file=tmux_state.log_path(paths, job_id),
-                exit_code=1,
-                last_output=stale_reason,
-            )
-        tmux_state.write_status(status_path, status)
-        result["marked"].append({"job_id": job_id, "stale_reason": stale_reason})
-    return result
+        marked = mark_managed_job_stale(paths, record, stale_reason=stale_reason)
+        if marked:
+            result["marked"].append({"job_id": marked.get("job_id"), "stale_reason": stale_reason})
+    return compact_job_output(result, args)
 
 
 def watch(args: argparse.Namespace) -> dict[str, Any]:
@@ -1899,10 +2076,14 @@ def watch(args: argparse.Namespace) -> dict[str, Any]:
         return job_status(args, "watch")
     if args.watch_action == "cancel":
         return job_cancel(args, "watch")
+    if args.watch_action == "gc":
+        return job_gc(args, "watch")
     if not args.job_id or not args.pane:
         die("watch start requires --job-id and --pane")
     validate_managed_identity(args)
     validate_optional_status_file(args, "watch")
+    if getattr(args, "low_token", False) and not tmux_state.one_line_text(getattr(args, "status_file", None)):
+        die("watch --low-token requires --status-file")
     return start_managed_worker(args, "watch", "watch")
 
 
@@ -2378,7 +2559,7 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser.add_argument("--state-dir")
 
     watch_parser = subparsers.add_parser("watch", help="Start or inspect a managed recurring pane watch")
-    watch_parser.add_argument("watch_action", nargs="?", choices=["start", "list", "status", "cancel"], default="start")
+    watch_parser.add_argument("watch_action", nargs="?", choices=["start", "list", "status", "cancel", "gc"], default="start")
     watch_parser.add_argument("--job-id")
     watch_parser.add_argument("--pane", help="Stable tmux pane ID, such as %%3")
     watch_parser.add_argument("--interval", type=positive_float, default=180.0)
@@ -2386,6 +2567,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--status-lines", type=positive_int, default=tmux_state.DEFAULT_STATUS_LINES)
     watch_parser.add_argument("--status-max-chars", type=positive_int, default=tmux_state.DEFAULT_STATUS_MAX_CHARS)
     watch_parser.add_argument("--status-file")
+    watch_parser.add_argument("--low-token", action="store_true", help="Poll only the status file during normal watch heartbeats")
     watch_parser.add_argument("--timeout-seconds", type=positive_float)
     watch_parser.add_argument("--name")
     watch_parser.add_argument("--workspace")
@@ -2393,6 +2575,12 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--replace", action="store_true", help="Replace a running managed worker with the same job id")
     watch_parser.add_argument("--allow-duplicate", action="store_true", help="Allow another active worker with the same dedupe key")
     watch_parser.add_argument("--owner", help="Owner metadata for this managed worker")
+    watch_parser.add_argument("--stale", action="store_true", help="For watch gc, mark stale watch records")
+    watch_parser.add_argument("--dry-run", action="store_true", help="For watch gc, only report stale watch records")
+    watch_parser.add_argument("--compact", action="store_true")
+    watch_parser.add_argument("--no-observed-tail", action="store_true")
+    watch_parser.add_argument("--max-chars", type=nonnegative_int)
+    watch_parser.add_argument("--include-pane-state", action="store_true")
 
     queue_idle_parser = subparsers.add_parser("queue-after-idle", help="Submit a command after a pane becomes an idle shell")
     queue_idle_parser.add_argument("--job-id", required=True)
@@ -2423,6 +2611,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_status_parser.add_argument("--fail-row", action="append", default=[])
     queue_status_parser.add_argument("--poll-seconds", "--interval", dest="poll_seconds", type=positive_float, default=2.0)
     queue_status_parser.add_argument("--timeout-seconds", type=positive_float)
+    queue_status_parser.add_argument("--low-token", action="store_true", help="Record low-token status summaries")
     queue_status_parser.add_argument("--then-require-idle-shell", dest="require_idle_shell", action="store_true")
     queue_status_parser.add_argument("--no-require-idle-shell", dest="require_idle_shell", action="store_false")
     queue_status_parser.set_defaults(require_idle_shell=True)
@@ -2440,19 +2629,34 @@ def build_parser() -> argparse.ArgumentParser:
     job_list_parser = job_subparsers.add_parser("list", help="List managed workers")
     job_list_parser.add_argument("--workspace")
     job_list_parser.add_argument("--state-dir")
+    job_list_parser.add_argument("--compact", action="store_true")
+    job_list_parser.add_argument("--no-observed-tail", action="store_true")
+    job_list_parser.add_argument("--max-chars", type=nonnegative_int)
     job_status_parser = job_subparsers.add_parser("status", help="Show one managed worker")
     job_status_parser.add_argument("--job-id", required=True)
     job_status_parser.add_argument("--workspace")
     job_status_parser.add_argument("--state-dir")
+    job_status_parser.add_argument("--compact", action="store_true")
+    job_status_parser.add_argument("--no-observed-tail", action="store_true")
+    job_status_parser.add_argument("--max-chars", type=nonnegative_int)
+    job_status_parser.add_argument("--include-pane-state", action="store_true")
     job_cancel_parser = job_subparsers.add_parser("cancel", help="Cancel one managed worker")
     job_cancel_parser.add_argument("--job-id", required=True)
     job_cancel_parser.add_argument("--workspace")
     job_cancel_parser.add_argument("--state-dir")
+    job_cancel_parser.add_argument("--compact", action="store_true")
+    job_cancel_parser.add_argument("--no-observed-tail", action="store_true")
+    job_cancel_parser.add_argument("--max-chars", type=nonnegative_int)
+    job_cancel_parser.add_argument("--include-pane-state", action="store_true")
     job_gc_parser = job_subparsers.add_parser("gc", help="Mark stale managed workers")
     job_gc_parser.add_argument("--stale", action="store_true", help="Mark stale active managed jobs")
     job_gc_parser.add_argument("--dry-run", action="store_true", help="Only report stale active managed jobs")
     job_gc_parser.add_argument("--workspace")
     job_gc_parser.add_argument("--state-dir")
+    job_gc_parser.add_argument("--compact", action="store_true")
+    job_gc_parser.add_argument("--no-observed-tail", action="store_true")
+    job_gc_parser.add_argument("--max-chars", type=nonnegative_int)
+    job_gc_parser.add_argument("--include-pane-state", action="store_true")
 
     task_parser = subparsers.add_parser("task", help="Manage tmux-skills follow-up tasks")
     task_subparsers = task_parser.add_subparsers(dest="task_action", required=True)

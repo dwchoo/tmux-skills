@@ -174,7 +174,7 @@ def write_worker_record(
         "updated_at": now,
         "heartbeat_at": now,
     }
-    for key in ("dedupe_key", "dedupe_payload", "owner", "duplicate_allowed", "duplicate_of", "argv"):
+    for key in ("dedupe_key", "dedupe_payload", "owner", "duplicate_allowed", "duplicate_of", "argv", "low_token"):
         if previous and key in previous:
             record[key] = previous[key]
     if previous and "check_interval_seconds" in previous:
@@ -684,7 +684,14 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
             extra={"error": str(exc)},
         )
     started = time.monotonic()
-    write_worker_record(paths, args, kind=kind, status="waiting_status", command_text=command_text, extra={"observed_status_file": str(observed_file)})
+    write_worker_record(
+        paths,
+        args,
+        kind=kind,
+        status="waiting_status",
+        command_text=command_text,
+        extra={"observed_status_file": str(observed_file), "low_token": bool(getattr(args, "low_token", False))},
+    )
 
     while True:
         try:
@@ -704,6 +711,7 @@ def run_queue_after_status(args: argparse.Namespace) -> int:
         matched_failed = specs_matching(rows, fail_rows)
         extra = {
             "observed_status_file": str(observed_file),
+            "low_token": bool(getattr(args, "low_token", False)),
             "required_rows": required,
             "matched_required_rows": matched_required,
             "fail_rows": fail_rows,
@@ -853,26 +861,6 @@ def run_watch(args: argparse.Namespace) -> int:
     )
 
     while True:
-        try:
-            output = tmux_control.capture_text(args.pane, args.capture_lines, strip=True)
-        except (Exception, SystemExit) as exc:
-            output = exception_text(exc)
-            terminal = "failed"
-            exit_code = 1
-            error_extra = {**status_tail_extra, "error": output}
-            write_worker_record(paths, args, kind=kind, status=terminal, extra=error_extra)
-            write_worker_status(
-                paths,
-                args,
-                kind=kind,
-                status=terminal,
-                started_at=started_at,
-                last_output=tmux_state.status_tail(output, lines=status_lines, max_chars=status_max_chars),
-                exit_code=exit_code,
-                extra=error_extra,
-            )
-            return exit_code
-
         observed_tail = ""
         if observed_file and observed_file.exists():
             try:
@@ -888,6 +876,31 @@ def run_watch(args: argparse.Namespace) -> int:
                     last_output=error,
                     extra={**status_tail_extra, "observed_status_file": str(observed_file), "error": error},
                 )
+        elif getattr(args, "low_token", False):
+            observed_tail = "status file not found; pane not captured"
+
+        if getattr(args, "low_token", False):
+            output = observed_tail
+        else:
+            try:
+                output = tmux_control.capture_text(args.pane, args.capture_lines, strip=True)
+            except (Exception, SystemExit) as exc:
+                output = exception_text(exc)
+                terminal = "failed"
+                exit_code = 1
+                error_extra = {**status_tail_extra, "error": output}
+                write_worker_record(paths, args, kind=kind, status=terminal, extra=error_extra)
+                write_worker_status(
+                    paths,
+                    args,
+                    kind=kind,
+                    status=terminal,
+                    started_at=started_at,
+                    last_output=tmux_state.status_tail(output, lines=status_lines, max_chars=status_max_chars),
+                    exit_code=exit_code,
+                    extra=error_extra,
+                )
+                return exit_code
         try:
             log_file.write_text(output, encoding="utf-8")
         except OSError as exc:
@@ -903,6 +916,7 @@ def run_watch(args: argparse.Namespace) -> int:
             )
         extra = {
             "capture_lines": args.capture_lines,
+            "low_token": bool(getattr(args, "low_token", False)),
             **status_tail_extra,
             "observed_status_file": str(observed_file) if observed_file else None,
             "observed_status_tail": observed_tail,
@@ -988,6 +1002,7 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--no-require-idle-shell", dest="require_idle_shell", action="store_false")
     status_parser.add_argument("--strict-preflight", action="store_true")
     status_parser.add_argument("--bash-if-not-executable", action="store_true")
+    status_parser.add_argument("--low-token", action="store_true")
 
     watch_parser = subparsers.add_parser("watch")
     add_common(watch_parser)
@@ -996,6 +1011,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--status-lines", type=positive_int, default=tmux_state.DEFAULT_STATUS_LINES)
     watch_parser.add_argument("--status-max-chars", type=positive_int, default=tmux_state.DEFAULT_STATUS_MAX_CHARS)
     watch_parser.add_argument("--status-file")
+    watch_parser.add_argument("--low-token", action="store_true")
     watch_parser.add_argument("--timeout-seconds", type=positive_float)
 
     return parser
@@ -1025,6 +1041,8 @@ def main() -> None:
         raise SystemExit(run_worker_safely(args, paths, job_id, run_queue_after_status))
     if args.action == "watch":
         try:
+            if getattr(args, "low_token", False) and not tmux_state.one_line_text(getattr(args, "status_file", None)):
+                raise ValueError("watch --low-token requires --status-file")
             optional_status_file(paths, args.status_file, "watch")
         except ValueError as exc:
             print(str(exc), file=sys.stderr)

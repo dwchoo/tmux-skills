@@ -27,7 +27,7 @@ The preferred flow is:
 | Queue after idle | Submit the next command only after a busy pane returns to an idle shell. | `queue-after-idle` | `managed-workers.md` |
 | Queue after status | Submit the next command after a status TSV reaches required rows and the target pane is idle. | `queue-after-status` | `managed-workers.md` |
 | Duplicate prevention | Prevent multiple Codex instances from creating the same active watcher or queue by default. | managed start commands, `--allow-duplicate`, `--replace` | `managed-workers.md` |
-| Stale recovery | Mark orphaned active worker records as stale without killing unrelated PIDs. | `job gc --stale` | `managed-workers.md` |
+| Stale recovery | Mark dead or orphaned active worker records as stale without killing unrelated PIDs. | `job gc --stale`, `watch gc --stale` | `managed-workers.md` |
 | Real-use validation | Prove behavior through public CLI subprocesses and real tmux sessions. | `scripts/e2e_real_use.py` | `real-use-e2e.md` |
 
 ## Workflow: Start Work in tmux
@@ -160,6 +160,22 @@ Expected behavior:
 - Timeout or cancellation is recorded for later inspection.
 - Use the status tail for low-reasoning triage, then inspect the full log only for errors, unclear output, or analysis-heavy results.
 
+For status-file-first monitoring, use low-token mode:
+
+```bash
+python scripts/tmux_control.py watch \
+  --job-id train-watch-low-token \
+  --pane %1 \
+  --status-file logs/train.status.tsv \
+  --low-token
+```
+
+Expected low-token behavior:
+
+- `--status-file` is required.
+- Normal heartbeats read the status file and do not capture the pane.
+- If the status file is missing, the watch remains running and records a compact reason instead of falling back to pane capture.
+
 ## Workflow: Prevent Duplicate Managed Work
 
 This is the default behavior when multiple Codex instances share a workspace.
@@ -177,17 +193,26 @@ See [`managed-workers.md`](managed-workers.md) for exact duplicate JSON fields, 
 Use this when a worker record looks active but the real worker is gone or no longer trustworthy.
 
 ```bash
-python scripts/tmux_control.py job gc --stale --dry-run
+python scripts/tmux_control.py job gc --stale --dry-run --compact
 python scripts/tmux_control.py job gc --stale
+python scripts/tmux_control.py watch gc --stale --dry-run --compact
 ```
 
 Expected behavior:
 
 - Logs and status files are kept as evidence.
 - A live PID that does not look like the managed worker is not killed.
+- Active records with dead or foreign PIDs are reported with read-time `effective_status` and can be marked stale by GC.
 - After stale GC, the same dedupe input can be recreated.
 
 See [`managed-workers.md`](managed-workers.md) for the stale threshold and exact GC contract.
+
+Use compact output when Codex should inspect worker state without rehydrating verbose payloads:
+
+```bash
+python scripts/tmux_control.py watch list --compact --no-observed-tail --max-chars 400
+python scripts/tmux_control.py job status --job-id train-watch --compact --include-pane-state
+```
 
 ## Workflow-to-Test Mapping
 

@@ -364,7 +364,7 @@ class CodexTmuxHookTests(unittest.TestCase):
                 {
                     "job_id": "watch",
                     "kind": "watch",
-                    "status": "running",
+                    "status": "starting",
                     "pane_id": "%1\nextra",
                     "heartbeat_at": tmux_state.utc_now(),
                     "updated_at": tmux_state.utc_now(),
@@ -374,7 +374,7 @@ class CodexTmuxHookTests(unittest.TestCase):
             output = self.run_hook(["context", "--event", "UserPromptSubmit", "--workspace", tmp], {})
 
         context = output["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("managed job watch: running kind=watch pane=%1 extra heartbeat=", context)
+        self.assertIn("managed job watch: starting kind=watch pane=%1 extra heartbeat=", context)
         self.assertNotIn("\nextra", context)
 
     def test_context_excludes_stale_managed_jobs(self) -> None:

@@ -58,10 +58,13 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 - `run` stores command files, logs, status JSON, and acknowledgements in `.codex/tmux-skills` by default.
 - Managed worker contracts are canonical in [docs/managed-workers.md](docs/managed-workers.md).
 - Real-use E2E coverage is canonical in [docs/real-use-e2e.md](docs/real-use-e2e.md).
-- `watch`, `queue-after-idle`, and `queue-after-status` store managed worker records in `.codex/tmux-skills/jobs`; inspect them with `watch list`, `watch status`, or `job status`.
+- `watch`, `queue-after-idle`, and `queue-after-status` store managed worker records in `.codex/tmux-skills/jobs`; inspect them with compact output first, for example `watch list --compact --no-observed-tail` or `job status --compact`.
 - Use `queue-after-idle` when the next command should run only after a busy pane returns to an idle shell.
 - Use `queue-after-status` when a status TSV must reach required row states before the next command is submitted.
 - Cancel managed background workers with `watch cancel --job-id ID` or `job cancel --job-id ID`.
+- Use `watch --low-token --status-file PATH` for long monitoring where status-file polling is enough; it avoids normal pane captures.
+- Use `job gc --stale` or `watch gc --stale` when `effective_status` shows dead, orphaned, or stale managed workers. GC marks records as stale and preserves evidence.
+- Use `--include-pane-state` when status, cancel, or GC output should report whether the target pane still exists. Do not close panes or windows unless the user explicitly asks.
 - `run --next-instruction`, `run --next-instruction-file`, and anchored `task add` store Codex instructions in `.codex/tmux-skills/tasks`; they do not execute while Codex is absent.
 - Codex hooks do not directly observe independent tmux jobs. Use `SessionStart`, `UserPromptSubmit`, and `Stop` command hooks to read status files.
 - `SessionStart` resume/compact context can expose ready follow-up tasks. A new startup should use explicit `task load --for-skill` instead of auto-running prior work.
@@ -87,14 +90,15 @@ python scripts/tmux_control.py spawn [--target SESSION:WINDOW] [--cwd PATH] [--v
 python scripts/tmux_control.py new-window --cwd PATH [--target SESSION] [--name NAME]
 python scripts/tmux_control.py send --pane PANE_ID --command TEXT [--require-idle-shell] [--strict-preflight] [--bash-if-not-executable] (--enter|--no-enter)
 python scripts/tmux_control.py run --pane PANE_ID (--command TEXT|--command-file PATH) [--job-id ID] [(--next-instruction TEXT|--next-instruction-file PATH)] [--next-on succeeded|failed|terminal]
-python scripts/tmux_control.py watch --job-id ID --pane PANE_ID [--interval N] [--capture-lines N] [--status-lines N] [--status-max-chars N] [--status-file PATH] [--timeout-seconds N] [--replace] [--allow-duplicate]
-python scripts/tmux_control.py watch list
-python scripts/tmux_control.py watch status|cancel --job-id ID
+python scripts/tmux_control.py watch --job-id ID --pane PANE_ID [--interval N] [--capture-lines N] [--status-lines N] [--status-max-chars N] [--status-file PATH] [--low-token] [--timeout-seconds N] [--replace] [--allow-duplicate]
+python scripts/tmux_control.py watch list [--compact] [--no-observed-tail] [--max-chars N]
+python scripts/tmux_control.py watch status|cancel --job-id ID [--compact] [--include-pane-state]
+python scripts/tmux_control.py watch gc --stale [--dry-run] [--compact] [--include-pane-state]
 python scripts/tmux_control.py queue-after-idle --job-id ID (--pane|--then-pane) PANE_ID ((--command|--then-command) TEXT|--command-file PATH) [--interval N|--poll-seconds N] [--timeout-seconds N] [--then-require-idle-shell] [--replace] [--allow-duplicate]
-python scripts/tmux_control.py queue-after-status --job-id ID --status-file PATH --require-row KEY:VALUE|key=value,... (--pane|--then-pane) PANE_ID ((--command|--then-command) TEXT|--command-file PATH) [--interval N|--poll-seconds N] [--timeout-seconds N] [--then-require-idle-shell|--no-require-idle-shell] [--replace] [--allow-duplicate]
-python scripts/tmux_control.py job list
-python scripts/tmux_control.py job status|cancel --job-id ID
-python scripts/tmux_control.py job gc --stale [--dry-run]
+python scripts/tmux_control.py queue-after-status --job-id ID --status-file PATH --require-row KEY:VALUE|key=value,... (--pane|--then-pane) PANE_ID ((--command|--then-command) TEXT|--command-file PATH) [--interval N|--poll-seconds N] [--timeout-seconds N] [--low-token] [--then-require-idle-shell|--no-require-idle-shell] [--replace] [--allow-duplicate]
+python scripts/tmux_control.py job list [--compact] [--no-observed-tail] [--max-chars N]
+python scripts/tmux_control.py job status|cancel --job-id ID [--compact] [--include-pane-state]
+python scripts/tmux_control.py job gc --stale [--dry-run] [--compact] [--include-pane-state]
 python scripts/e2e_real_use.py --scenario smoke
 python scripts/e2e_real_use.py --scenario all --json
 python scripts/tmux_control.py task load [--for-skill] [--json] [--max-items N]
