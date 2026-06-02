@@ -1150,6 +1150,300 @@ class TmuxTaskTests(unittest.TestCase):
             self.assertEqual(task["trigger_on"], "terminal")
             self.assertEqual(task["instruction"], "Inspect file result\nChoose the next run\n")
 
+    def autopilot_start_args(self, workspace: str, **overrides: object) -> argparse.Namespace:
+        values: dict[str, object] = {
+            "objective_id": "train",
+            "pane": "%1",
+            "command_text": "python train.py",
+            "command_file": None,
+            "goal": "Finish training",
+            "cwd": None,
+            "max_attempts": 3,
+            "require_idle_shell": False,
+            "workspace": workspace,
+            "state_dir": None,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def autopilot_simple_args(self, workspace: str, objective_id: str = "train", **overrides: object) -> argparse.Namespace:
+        values: dict[str, object] = {
+            "objective_id": objective_id,
+            "command_text": None,
+            "command_file": None,
+            "require_idle_shell": False,
+            "workspace": workspace,
+            "state_dir": None,
+            "autopilot_action": "status",
+            "reason": None,
+            "for_agent": False,
+            "json": False,
+            "max_chars": tmux_control.AUTOPILOT_TICK_MAX_CHARS,
+            "kind": "status",
+            "attempt": "current",
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_autopilot_start_snapshots_command_file_and_starts_first_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            command_file = Path(tmp) / "train.sh"
+            command_file.write_text("python train.py --epochs 1\n", encoding="utf-8")
+            args = self.autopilot_start_args(tmp, command_text=None, command_file=str(command_file))
+
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                result = tmux_control.autopilot_start(args)
+
+            command_file.write_text("python changed.py\n", encoding="utf-8")
+            paths = tmux_state.state_paths(tmp)
+            objective = tmux_state.read_json(tmux_state.objective_path(paths, "train"))[0]
+
+        self.assertTrue(result["started"])
+        assert objective is not None
+        self.assertEqual(objective["command_snapshot"], "python train.py --epochs 1\n")
+        self.assertEqual(objective["current_attempt"]["job_id"], "train-attempt-1")
+        self.assertEqual(objective["attempts"][0]["attempt"], 1)
+
+    def test_autopilot_tick_completes_succeeded_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp))
+            paths = tmux_state.state_paths(tmp)
+            self.write_status(paths, "train-attempt-1", "succeeded")
+
+            tick = tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick"))
+            objective = tmux_state.read_json(tmux_state.objective_path(paths, "train"))[0]
+
+        self.assertEqual(tick["action"], "completed")
+        assert objective is not None
+        self.assertEqual(objective["status"], "succeeded")
+        self.assertIsNotNone(objective["completed_at"])
+
+    def test_autopilot_tick_claims_repair_once_for_failed_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp))
+            paths = tmux_state.state_paths(tmp)
+            self.write_status(paths, "train-attempt-1", "failed")
+
+            first = tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick"))
+            second = tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick"))
+
+        self.assertEqual(first["action"], "repair")
+        self.assertEqual(first["status"], "repairing")
+        self.assertIn("bounded workspace repairs", first["agent_instruction"])
+        self.assertIn("--state-dir", " ".join(first["commands"]))
+        self.assertEqual(second["action"], "no_action")
+        self.assertEqual(second["reason"], "repair already claimed")
+        self.assertEqual(first["lease"]["attempt_job_id"], "train-attempt-1")
+
+    def test_autopilot_tick_includes_bounded_summary_and_evidence_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp))
+            paths = tmux_state.state_paths(tmp)
+            status = self.write_status(paths, "train-attempt-1", "failed")
+            status["last_output"] = "prefix-" + ("x" * 40)
+            tmux_state.write_status(tmux_state.status_path(paths, "train-attempt-1"), status)
+
+            tick = tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick", max_chars=12))
+
+        self.assertEqual(tick["action"], "repair")
+        for field in ("objective_id", "status", "action", "reason", "evidence_paths", "policy", "commands", "agent_instruction"):
+            self.assertIn(field, tick)
+        summary = tick["attempt_summary"]
+        self.assertEqual(summary["attempt_job_id"], "train-attempt-1")
+        self.assertEqual(summary["attempt_status"], "failed")
+        self.assertTrue(summary["terminal"])
+        self.assertEqual(summary["last_output_tail"], "x" * 12)
+        self.assertTrue(summary["truncated"])
+        self.assertEqual(summary["total_chars_known"], 47)
+        self.assertEqual(summary["source"], "status.last_output")
+        self.assertIn("evidence_commands", tick)
+        self.assertIn("--kind status", tick["evidence_commands"][0]["command"])
+        self.assertIn("--max-chars 8000", tick["evidence_commands"][0]["command"])
+
+    def test_autopilot_tick_no_action_does_not_offer_evidence_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp))
+            paths = tmux_state.state_paths(tmp)
+            self.write_status(paths, "train-attempt-1", "failed")
+            tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick"))
+
+            duplicate = tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick"))
+
+        self.assertEqual(duplicate["action"], "no_action")
+        self.assertNotIn("evidence_commands", duplicate)
+        self.assertIn("do not open evidence files", duplicate["agent_instruction"])
+        self.assertEqual(duplicate["attempt_summary"]["attempt_status"], "failed")
+        self.assertEqual(duplicate["attempt_summary"]["source"], "status.last_output")
+
+    def test_autopilot_rerun_uses_snapshot_and_increments_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sent: list[str] = []
+
+            def fake_send(args: argparse.Namespace) -> dict[str, object]:
+                sent.append(args.command_text)
+                return {"sent_to_pane": True}
+
+            with mock.patch.object(tmux_control, "send", side_effect=fake_send):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp, command_text="python train.py"))
+                paths = tmux_state.state_paths(tmp)
+                self.write_status(paths, "train-attempt-1", "failed")
+                tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick"))
+                result = tmux_control.autopilot_rerun(self.autopilot_simple_args(tmp, autopilot_action="rerun"))
+
+            objective = result["objective"]
+
+        self.assertEqual(result["action"], "rerun_started")
+        self.assertEqual(objective["status"], "active")
+        self.assertIsNone(objective["lease"])
+        self.assertEqual(objective["current_attempt"]["job_id"], "train-attempt-2")
+        self.assertEqual(len(objective["attempts"]), 2)
+        self.assertIn("train-attempt-2", sent[-1])
+
+    def test_autopilot_rerun_send_failure_stays_repairable_until_attempts_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            send_results = [
+                {"sent_to_pane": True},
+                {"sent_to_pane": False, "reason": "pane is busy"},
+                {"sent_to_pane": False, "reason": "pane is missing"},
+            ]
+
+            with mock.patch.object(tmux_control, "send", side_effect=send_results):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp, max_attempts=3))
+                paths = tmux_state.state_paths(tmp)
+                self.write_status(paths, "train-attempt-1", "failed")
+                tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick"))
+                failed_rerun = tmux_control.autopilot_rerun(self.autopilot_simple_args(tmp, autopilot_action="rerun"))
+                exhausted_rerun = tmux_control.autopilot_rerun(self.autopilot_simple_args(tmp, autopilot_action="rerun"))
+
+            objective = tmux_state.read_json(tmux_state.objective_path(paths, "train"))[0]
+
+        self.assertEqual(failed_rerun["action"], "rerun_failed")
+        self.assertEqual(failed_rerun["objective"]["status"], "repairing")
+        self.assertEqual(failed_rerun["objective"]["lease"]["attempt_job_id"], "train-attempt-2")
+        self.assertIn("pane is busy", failed_rerun["reason"])
+        self.assertIn("autopilot block", " ".join(failed_rerun["commands"]))
+        self.assertEqual(exhausted_rerun["action"], "blocked")
+        self.assertIn("maximum attempts reached", exhausted_rerun["reason"])
+        assert objective is not None
+        self.assertEqual(objective["status"], "blocked")
+        self.assertEqual(objective["current_attempt"]["job_id"], "train-attempt-3")
+        self.assertEqual(len(objective["attempts"]), 3)
+
+    def test_autopilot_evidence_status_and_log_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp))
+            paths = tmux_state.state_paths(tmp)
+            status = self.write_status(paths, "train-attempt-1", "failed")
+            status["last_output"] = "status-" + ("a" * 20)
+            tmux_state.write_status(tmux_state.status_path(paths, "train-attempt-1"), status)
+            tmux_state.log_path(paths, "train-attempt-1").write_text("log-" + ("b" * 20), encoding="utf-8")
+
+            status_evidence = tmux_control.autopilot_evidence(
+                self.autopilot_simple_args(tmp, autopilot_action="evidence", kind="status", max_chars=6)
+            )
+            log_evidence = tmux_control.autopilot_evidence(
+                self.autopilot_simple_args(tmp, autopilot_action="evidence", kind="log", max_chars=7)
+            )
+            zero_status = tmux_control.autopilot_evidence(
+                self.autopilot_simple_args(tmp, autopilot_action="evidence", kind="status", max_chars=0)
+            )
+
+        self.assertEqual(status_evidence["kind"], "status")
+        self.assertTrue(status_evidence["readable"])
+        self.assertEqual(status_evidence["content"], "a" * 6)
+        self.assertTrue(status_evidence["truncated"])
+        self.assertEqual(status_evidence["total_chars_known"], 27)
+        self.assertEqual(status_evidence["status_core"]["status"], "failed")
+        self.assertEqual(log_evidence["kind"], "log")
+        self.assertEqual(log_evidence["content"], "b" * 7)
+        self.assertIsNone(log_evidence["status_core"])
+        self.assertEqual(zero_status["content"], "")
+        self.assertTrue(zero_status["content_omitted"])
+        self.assertEqual(zero_status["total_chars_known"], 27)
+        self.assertEqual(zero_status["status_core"]["status"], "failed")
+
+    def test_autopilot_evidence_reports_missing_and_malformed_artifacts_as_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp))
+            paths = tmux_state.state_paths(tmp)
+
+            missing_log = tmux_control.autopilot_evidence(
+                self.autopilot_simple_args(tmp, autopilot_action="evidence", kind="log", max_chars=0)
+            )
+            tmux_state.status_path(paths, "train-attempt-1").write_text("{not-json", encoding="utf-8")
+            malformed_status = tmux_control.autopilot_evidence(
+                self.autopilot_simple_args(tmp, autopilot_action="evidence", kind="status", max_chars=0)
+            )
+
+        self.assertFalse(missing_log["exists"])
+        self.assertFalse(missing_log["readable"])
+        self.assertEqual(missing_log["content"], "")
+        self.assertTrue(malformed_status["exists"])
+        self.assertFalse(malformed_status["readable"])
+        self.assertIn("Expecting property name", malformed_status["error"])
+
+    def test_autopilot_blocks_at_max_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp, max_attempts=1))
+            paths = tmux_state.state_paths(tmp)
+            self.write_status(paths, "train-attempt-1", "failed")
+
+            tick = tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick"))
+            objective = tmux_state.read_json(tmux_state.objective_path(paths, "train"))[0]
+
+        self.assertEqual(tick["action"], "blocked")
+        assert objective is not None
+        self.assertEqual(objective["status"], "blocked")
+        self.assertEqual(objective["blocked_reason"], "maximum attempts reached")
+
+    def test_autopilot_heartbeat_prompt_contains_policy_and_tick_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp))
+
+            prompt = tmux_control.autopilot_heartbeat_prompt(self.autopilot_simple_args(tmp, autopilot_action="heartbeat-prompt"))
+
+        self.assertIn("autopilot tick", prompt)
+        self.assertIn("--objective-id train", prompt)
+        self.assertIn("Bounded repair", prompt)
+        self.assertIn("heartbeat can be paused or removed", prompt)
+
+    def test_autopilot_cancelled_tick_reports_cancelled_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp))
+            tmux_control.autopilot_finish(self.autopilot_simple_args(tmp, autopilot_action="cancel"), "cancelled")
+
+            tick = tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick"))
+
+        self.assertEqual(tick["action"], "cancelled")
+        self.assertEqual(tick["status"], "cancelled")
+        self.assertEqual(tick["attempt_summary"]["attempt_job_id"], "train-attempt-1")
+
+    def test_autopilot_tick_reclaims_malformed_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_control, "send", return_value={"sent_to_pane": True}):
+                tmux_control.autopilot_start(self.autopilot_start_args(tmp))
+            paths = tmux_state.state_paths(tmp)
+            self.write_status(paths, "train-attempt-1", "failed")
+            objective = tmux_state.read_json(tmux_state.objective_path(paths, "train"))[0]
+            assert objective is not None
+            objective["status"] = "repairing"
+            objective["lease"] = {"expires_at": "not-a-date", "attempt_job_id": "train-attempt-1"}
+            tmux_state.atomic_write_json(tmux_state.objective_path(paths, "train"), objective)
+
+            tick = tmux_control.autopilot_tick(self.autopilot_simple_args(tmp, autopilot_action="tick"))
+
+        self.assertEqual(tick["action"], "repair")
+        self.assertNotEqual(tick["lease"]["expires_at"], "not-a-date")
+
 
 if __name__ == "__main__":
     unittest.main()

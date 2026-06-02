@@ -30,7 +30,7 @@ Options:
 Current code facts from `scripts/e2e_real_use.py`:
 
 - `smoke` has 7 scenarios.
-- `all` has 24 scenarios.
+- `all` has 25 scenarios.
 - `all` is `smoke` plus the full-only scenarios.
 
 Smoke scenarios:
@@ -62,6 +62,7 @@ Full-only scenarios:
 - `pane-dies-mid-wait`
 - `task-followup-flow`
 - `stop-hook-blocks-terminal`
+- `autopilot-repair-rerun`
 
 ## Scenario Matrix
 
@@ -93,6 +94,7 @@ Each harness run uses a temporary workspace, a temporary `TMUX_TMPDIR`, and an i
 | `pane-dies-mid-wait` | Queue wait handles a pane disappearing. | Put the target pane in `sleep` and choose an output file. | Start `queue-after-idle`, wait for `waiting_pane_idle`, then kill the target pane. | Job reaches a terminal failure state instead of hanging, no send result is recorded, output file is absent, and the harness recreates the isolated pane for later scenarios. |
 | `task-followup-flow` | Run-created follow-up tasks become ready and claimable. | Start with an idle pane. | Run a quick successful job with `--next-instruction` and `--next-on succeeded`, then poll task APIs. | The task becomes `ready`, hook context exposes the ready task and instruction, `task claim` succeeds, and `task next --json` no longer returns that task as ready. |
 | `stop-hook-blocks-terminal` | Stop hook blocks once for terminal events. | Drain previous terminal stop notifications, then run a quick job without follow-up task creation. | Call `codex_tmux_hook.py stop --workspace <workspace>` twice with stdin `{}`. | First call returns `decision: block` with a terminal-event reason; second identical call returns no block because the event was acknowledged. |
+| `autopilot-repair-rerun` | Heartbeat-style Autopilot repair loop. | Start with an idle pane and choose an objective id. | Start an Autopilot objective whose first attempt fails with long output, call bounded `tick`, expand bounded log evidence, call duplicate `tick`, rerun with a fixed command, then tick again. | First tick returns `repair` with bounded `attempt_summary` and evidence commands, log evidence returns failure output without a full dump, duplicate tick returns `no_action`, rerun starts attempt 2, attempt 2 succeeds, final tick completes the objective without extra evidence commands, and heartbeat prompt includes the wake contract. |
 
 ## Scenario Design Rules
 

@@ -17,12 +17,14 @@ from typing import Any
 
 STATE_VERSION = 1
 TASK_VERSION = 2
+OBJECTIVE_VERSION = 1
 MANAGED_ACTIVE_STATUSES = {"starting", "running", "waiting", "waiting_status", "waiting_pane_idle"}
 MANAGED_TERMINAL_STATUSES = {"submitted", "failed", "timeout", "cancelled", "stale"}
 TERMINAL_STATUSES = {"succeeded", "matched", "stopped"} | MANAGED_TERMINAL_STATUSES
 FAILED_TRIGGER_STATUSES = {"failed", "timeout", "stopped", "cancelled", "stale"}
 RUNNING_STATUSES = {"pending", "running", "starting", "waiting", "waiting_status", "waiting_pane_idle"}
 TASK_STATUSES = {"waiting", "ready", "in_progress", "done", "blocked", "cancelled"}
+OBJECTIVE_STATUSES = {"active", "repairing", "succeeded", "blocked", "cancelled"}
 TASK_OPEN_STATUSES = {"waiting", "ready", "in_progress", "blocked"}
 TASK_TRIGGERS = {"succeeded", "failed", "terminal"}
 TASK_TRANSIENT_FIELDS = {"effective_status", "matched_status", "stale", "task_path"}
@@ -65,11 +67,12 @@ def state_paths(workspace: str | None = None, state_dir: str | None = None) -> d
         "acks": root / "acks",
         "tasks": root / "tasks",
         "jobs": root / "jobs",
+        "objectives": root / "objectives",
     }
 
 
 def ensure_state_dirs(paths: dict[str, Path]) -> None:
-    for key in ("commands", "logs", "status", "acks", "tasks", "jobs"):
+    for key in ("commands", "logs", "status", "acks", "tasks", "jobs", "objectives"):
         paths[key].mkdir(parents=True, exist_ok=True)
 
 
@@ -101,6 +104,10 @@ def task_path(paths: dict[str, Path], task_id: str) -> Path:
 
 def job_path(paths: dict[str, Path], job_id: str) -> Path:
     return paths["jobs"] / f"{safe_id(job_id)}.json"
+
+
+def objective_path(paths: dict[str, Path], objective_id: str) -> Path:
+    return paths["objectives"] / f"{safe_id(objective_id)}.json"
 
 
 def job_registry_lock_path(paths: dict[str, Path]) -> Path:
@@ -524,6 +531,107 @@ def newest_unacked_terminal(paths: dict[str, Path]) -> tuple[dict[str, Any] | No
     candidates = [status for status in statuses if is_terminal(status) and not is_acked(paths, status)]
     candidates.sort(key=sort_key, reverse=True)
     return (candidates[0] if candidates else None), errors
+
+
+def build_objective(
+    *,
+    objective_id: str,
+    goal: str,
+    pane_id: str,
+    cwd: str,
+    command_snapshot: str,
+    max_attempts: int,
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    now = utc_now()
+    item_id = safe_id(objective_id)
+    return {
+        "version": OBJECTIVE_VERSION,
+        "objective_id": item_id,
+        "status": "active",
+        "goal": goal,
+        "pane_id": pane_id,
+        "cwd": cwd,
+        "command_snapshot": command_snapshot,
+        "attempts": [],
+        "current_attempt": None,
+        "max_attempts": max_attempts,
+        "policy": policy,
+        "lease": None,
+        "created_at": now,
+        "updated_at": now,
+        "completed_at": None,
+        "blocked_reason": None,
+    }
+
+
+def normalize_objective(objective: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
+    item_id = safe_id(str(path.stem if path else objective.get("objective_id") or objective.get("id") or "objective"))
+    normalized = dict(objective)
+    try:
+        version = int(normalized.get("version") or OBJECTIVE_VERSION)
+    except (TypeError, ValueError):
+        version = OBJECTIVE_VERSION
+    normalized["version"] = version
+    normalized["objective_id"] = item_id
+    normalized["id"] = item_id
+    normalized["status"] = token_text(normalized.get("status")) or "active"
+    if normalized["status"] not in OBJECTIVE_STATUSES:
+        normalized["status"] = "active"
+    normalized.setdefault("goal", "")
+    normalized.setdefault("pane_id", None)
+    normalized.setdefault("cwd", None)
+    normalized.setdefault("command_snapshot", "")
+    attempts = normalized.get("attempts")
+    normalized["attempts"] = attempts if isinstance(attempts, list) else []
+    normalized.setdefault("current_attempt", None)
+    try:
+        max_attempts = int(normalized.get("max_attempts") or 1)
+    except (TypeError, ValueError):
+        max_attempts = 1
+    normalized["max_attempts"] = max(1, max_attempts)
+    policy = normalized.get("policy")
+    normalized["policy"] = policy if isinstance(policy, dict) else {}
+    lease = normalized.get("lease")
+    normalized["lease"] = lease if isinstance(lease, dict) else None
+    normalized.setdefault("created_at", normalized.get("updated_at") or utc_now())
+    normalized.setdefault("updated_at", normalized.get("created_at"))
+    normalized.setdefault("completed_at", None)
+    normalized.setdefault("blocked_reason", None)
+    if path:
+        normalized["objective_path"] = str(path)
+    else:
+        normalized.setdefault("objective_path", None)
+    return normalized
+
+
+def load_objectives(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    objective_dir = root / "objectives"
+    objectives: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for path in sorted(objective_dir.glob("*.json")):
+        data, error = read_json(path)
+        if error:
+            errors.append({"path": str(path), "error": error})
+            continue
+        if data:
+            try:
+                objectives.append(normalize_objective(data, path))
+            except Exception as exc:
+                errors.append({"path": str(path), "error": str(exc)})
+                continue
+    return objectives, errors
+
+
+def write_objective(paths: dict[str, Path], objective: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_objective(objective)
+    normalized["updated_at"] = utc_now()
+    path = objective_path(paths, normalized["objective_id"])
+    stored = dict(normalized)
+    stored.pop("objective_path", None)
+    atomic_write_json(path, stored)
+    normalized["objective_path"] = str(path)
+    return normalized
 
 
 def build_task(

@@ -56,6 +56,7 @@ FULL_ONLY_SCENARIOS = [
     "pane-dies-mid-wait",
     "task-followup-flow",
     "stop-hook-blocks-terminal",
+    "autopilot-repair-rerun",
 ]
 
 ALL_SCENARIOS = SMOKE_SCENARIOS + FULL_ONLY_SCENARIOS
@@ -1441,6 +1442,145 @@ class Harness:
             raise ScenarioFailure(self.current_scenario, "stop-second-ack", "second stop hook call blocked after ack", second)
         return {"job_id": job_id, "first_decision": first_data.get("decision"), "second": second_data}
 
+    def scenario_autopilot_repair_rerun(self) -> dict[str, Any]:
+        self.current_scenario = "autopilot-repair-rerun"
+        objective_id = "autopilot-e2e"
+        first_job = f"{objective_id}-attempt-1"
+        second_job = f"{objective_id}-attempt-2"
+        output = self.workspace / "autopilot.out"
+        self.jobs.extend([first_job, second_job])
+
+        started = self.control(
+            [
+                "autopilot",
+                "start",
+                "--objective-id",
+                objective_id,
+                "--pane",
+                str(self.pane),
+                "--command",
+                "python3 -c 'print(\"first-fail-\" + \"x\" * 5000); raise SystemExit(7)'",
+                "--goal",
+                "Finish autopilot E2E after a bounded repair",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="autopilot-start",
+        )
+        start_data = started.json_data if isinstance(started.json_data, dict) else {}
+        if start_data.get("started") is not True:
+            raise ScenarioFailure(self.current_scenario, "autopilot-started", "autopilot start did not start first attempt", started)
+        self.wait_status(first_job, "failed", timeout=10.0)
+
+        tick = self.control(
+            [
+                "autopilot",
+                "tick",
+                "--objective-id",
+                objective_id,
+                "--for-agent",
+                "--json",
+                "--max-chars",
+                "1200",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="autopilot-tick-repair",
+        )
+        tick_data = tick.json_data if isinstance(tick.json_data, dict) else {}
+        if tick_data.get("action") != "repair" or tick_data.get("status") != "repairing":
+            raise ScenarioFailure(self.current_scenario, "autopilot-repair-action", "tick did not claim repair", tick)
+        if first_job not in str(tick_data.get("evidence_paths") or ""):
+            raise ScenarioFailure(self.current_scenario, "autopilot-evidence", "tick did not expose failed attempt evidence", tick)
+        summary = tick_data.get("attempt_summary") if isinstance(tick_data.get("attempt_summary"), dict) else {}
+        if len(str(summary.get("last_output_tail") or "")) > 1200 or not summary.get("truncated"):
+            raise ScenarioFailure(self.current_scenario, "autopilot-summary-bound", "tick summary was not bounded and marked truncated", tick)
+        evidence_commands = tick_data.get("evidence_commands") if isinstance(tick_data.get("evidence_commands"), list) else []
+        if not any("--kind log" in str(item.get("command") if isinstance(item, dict) else item) for item in evidence_commands):
+            raise ScenarioFailure(self.current_scenario, "autopilot-evidence-command", "tick did not expose bounded log evidence command", tick)
+
+        log_evidence = self.control(
+            [
+                "autopilot",
+                "evidence",
+                "--objective-id",
+                objective_id,
+                "--kind",
+                "log",
+                "--max-chars",
+                "8000",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="autopilot-log-evidence",
+        )
+        log_evidence_data = log_evidence.json_data if isinstance(log_evidence.json_data, dict) else {}
+        if "first-fail-" not in str(log_evidence_data.get("content") or ""):
+            raise ScenarioFailure(self.current_scenario, "autopilot-log-evidence-content", "bounded log evidence did not include failure output", log_evidence)
+
+        duplicate_tick = self.control(
+            [
+                "autopilot",
+                "tick",
+                "--objective-id",
+                objective_id,
+                "--for-agent",
+                "--json",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="autopilot-tick-duplicate",
+        )
+        duplicate_data = duplicate_tick.json_data if isinstance(duplicate_tick.json_data, dict) else {}
+        if duplicate_data.get("action") != "no_action" or duplicate_data.get("reason") != "repair already claimed":
+            raise ScenarioFailure(self.current_scenario, "autopilot-duplicate-claim", "duplicate tick did not respect repair lease", duplicate_tick)
+
+        rerun = self.control(
+            [
+                "autopilot",
+                "rerun",
+                "--objective-id",
+                objective_id,
+                "--command",
+                "printf autopilot-ok > autopilot.out",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="autopilot-rerun",
+        )
+        rerun_data = rerun.json_data if isinstance(rerun.json_data, dict) else {}
+        if rerun_data.get("action") != "rerun_started":
+            raise ScenarioFailure(self.current_scenario, "autopilot-rerun-started", "rerun did not start second attempt", rerun)
+        self.wait_status(second_job, "succeeded", timeout=10.0)
+        self.wait_file(output, "autopilot-ok", timeout=5.0)
+
+        final_tick = self.control(
+            [
+                "autopilot",
+                "tick",
+                "--objective-id",
+                objective_id,
+                "--for-agent",
+                "--json",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="autopilot-final-tick",
+        )
+        final_data = final_tick.json_data if isinstance(final_tick.json_data, dict) else {}
+        if final_data.get("action") != "completed" or final_data.get("status") != "succeeded":
+            raise ScenarioFailure(self.current_scenario, "autopilot-completed", "final tick did not complete objective", final_tick)
+        if "evidence_commands" in final_data:
+            raise ScenarioFailure(self.current_scenario, "autopilot-terminal-evidence", "completed tick should not request extra evidence", final_tick)
+
+        prompt = self.control(
+            ["autopilot", "heartbeat-prompt", "--objective-id", objective_id, "--workspace", str(self.workspace)],
+            step="autopilot-heartbeat-prompt",
+        )
+        if "autopilot tick" not in prompt.stdout or "--max-chars 1200" not in prompt.stdout or "heartbeat can be paused or removed" not in prompt.stdout:
+            raise ScenarioFailure(self.current_scenario, "autopilot-prompt", "heartbeat prompt did not include wake contract", prompt)
+        return {"objective_id": objective_id, "first_job": first_job, "second_job": second_job, "final_action": final_data.get("action")}
+
 
 SCENARIO_METHODS = {
     "idle-continuation": Harness.scenario_idle_continuation,
@@ -1467,6 +1607,7 @@ SCENARIO_METHODS = {
     "pane-dies-mid-wait": Harness.scenario_pane_dies_mid_wait,
     "task-followup-flow": Harness.scenario_task_followup_flow,
     "stop-hook-blocks-terminal": Harness.scenario_stop_hook_blocks_terminal,
+    "autopilot-repair-rerun": Harness.scenario_autopilot_repair_rerun,
 }
 
 

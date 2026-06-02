@@ -19,7 +19,8 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 8. For long-running commands, use `python scripts/tmux_control.py run --pane <pane_id> --command '<command>'` so completion/failure is recorded under `.codex/tmux-skills`.
 9. For delayed checks or follow-up submissions, use managed `watch`, `queue-after-idle`, or `queue-after-status` instead of raw shell `sleep` watchers.
 10. Add resume-only follow-up instructions with `run --next-instruction TEXT`, `run --next-instruction-file PATH`, or anchored `task add --after-job JOB_ID|--after-event EVENT_ID`.
-11. Summarize the important output and continue with code edits or further tmux commands only when the result supports it.
+11. Use `autopilot start` only when a Codex Desktop heartbeat will wake this thread to continue bounded repair work later.
+12. Summarize the important output and continue with code edits or further tmux commands only when the result supports it.
 
 ## Target Selection
 - Prefer the current tmux window only when `$TMUX` is set.
@@ -69,6 +70,9 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 - Codex hooks do not directly observe independent tmux jobs. Use `SessionStart`, `UserPromptSubmit`, and `Stop` command hooks to read status files.
 - `SessionStart` resume/compact context can expose ready follow-up tasks. A new startup should use explicit `task load --for-skill` instead of auto-running prior work.
 - `Stop` can continue a current turn for an unacknowledged terminal event or ready task; hooks do not wake a dormant thread by themselves.
+- `autopilot` objectives do not wake Codex by themselves. Pair them with a current-thread Codex Desktop heartbeat using `autopilot heartbeat-prompt`.
+- Autopilot uses adaptive context: start with `tick --for-agent --max-chars 1200`, then use bounded `autopilot evidence` only when the summary is insufficient.
+- Autopilot bounded repair allows workspace diagnostics, code/config edits, focused tests, and rerun. Block before destructive cleanup, force git operations, push/deploy, dependency installation, secrets/auth changes, or expanding to higher-cost/longer training.
 - Use `references/HOOKS.md` for copyable hook snippets and `references/WORKFLOWS.md` for examples.
 
 ## Safety Rules
@@ -99,6 +103,12 @@ python scripts/tmux_control.py queue-after-status --job-id ID --status-file PATH
 python scripts/tmux_control.py job list [--compact] [--no-observed-tail] [--max-chars N]
 python scripts/tmux_control.py job status|cancel --job-id ID [--compact] [--include-pane-state]
 python scripts/tmux_control.py job gc --stale [--dry-run] [--compact] [--include-pane-state]
+python scripts/tmux_control.py autopilot start --objective-id ID --pane PANE_ID (--command TEXT|--command-file PATH) --goal TEXT [--cwd PATH] [--max-attempts N]
+python scripts/tmux_control.py autopilot tick --objective-id ID [--for-agent] [--json] [--max-chars N]
+python scripts/tmux_control.py autopilot evidence --objective-id ID --kind status|log [--attempt current|N] [--max-chars N]
+python scripts/tmux_control.py autopilot rerun --objective-id ID [(--command TEXT|--command-file PATH)]
+python scripts/tmux_control.py autopilot status|heartbeat-prompt|complete|cancel --objective-id ID
+python scripts/tmux_control.py autopilot block --objective-id ID --reason TEXT
 python scripts/e2e_real_use.py --scenario smoke
 python scripts/e2e_real_use.py --scenario all --json
 python scripts/tmux_control.py task load [--for-skill] [--json] [--max-items N]

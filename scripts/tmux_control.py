@@ -19,6 +19,7 @@ import sys
 import time
 import uuid
 from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1002,6 +1003,26 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
 
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_STALE_SECONDS = 30.0
+AUTOPILOT_LEASE_SECONDS = 30 * 60
+AUTOPILOT_TICK_MAX_CHARS = tmux_state.DEFAULT_STATUS_MAX_CHARS
+AUTOPILOT_EVIDENCE_MAX_CHARS = 8000
+AUTOPILOT_POLICY = {
+    "name": "bounded-repair",
+    "allowed": [
+        "inspect tmux status, logs, and workspace files",
+        "edit workspace code or configuration",
+        "run focused tests or diagnostics",
+        "rerun the objective command",
+    ],
+    "blocked_without_user_approval": [
+        "destructive cleanup",
+        "force git operations",
+        "push or deploy",
+        "dependency installation",
+        "secrets or authentication changes",
+        "expanding to higher-cost or longer training",
+    ],
+}
 
 
 def owner_identity(args: argparse.Namespace | None = None) -> str:
@@ -1167,6 +1188,13 @@ def registry_lock(paths: dict[str, Path], *, timeout_seconds: float = LOCK_TIMEO
 def task_lock(paths: dict[str, Path], task_id: str) -> Any:
     lock_dir = paths["tasks"] / f".{tmux_state.safe_id(task_id)}.lock"
     with directory_lock(lock_dir, description=f"task lock {tmux_state.safe_id(task_id)}"):
+        yield
+
+
+@contextlib.contextmanager
+def objective_lock(paths: dict[str, Path], objective_id: str) -> Any:
+    lock_dir = paths["objectives"] / f".{tmux_state.safe_id(objective_id)}.lock"
+    with directory_lock(lock_dir, description=f"objective lock {tmux_state.safe_id(objective_id)}"):
         yield
 
 
@@ -1543,6 +1571,18 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
             existing, _error = tmux_state.read_json(record_path)
             existing = annotate_job_record(tmux_state.normalize_managed_job(existing, record_path)) if existing else None
             existing_active = bool(existing and tmux_state.is_active_managed_job(existing) and not existing.get("stale"))
+            if (
+                existing
+                and getattr(args, "replace", False)
+                and tmux_state.is_active_managed_job(existing)
+                and str(existing.get("process_state") or "") == "foreign_pid"
+            ):
+                return {
+                    "job_id": item_id,
+                    "started": False,
+                    "reason": "existing pid is running but no longer looks like this tmux-skills worker",
+                    "existing": existing,
+                }
 
             try:
                 command_text, source_command_path = command_text_for_worker(args)
@@ -2113,6 +2153,657 @@ def read_text_arg(text: str | None, path: str | None) -> str | None:
     return text
 
 
+def require_objective_id(objective_id: str) -> str:
+    if not tmux_state.one_line_text(objective_id):
+        die("autopilot requires nonblank --objective-id")
+    item_id = tmux_state.safe_id(objective_id)
+    if item_id != objective_id:
+        die("autopilot --objective-id must contain only letters, numbers, '.', '_', or '-'")
+    return item_id
+
+
+def objective_attempt_job_id(objective_id: str, attempt_index: int) -> str:
+    return f"{objective_id}-attempt-{attempt_index}"
+
+
+def objective_attempt_record(paths: dict[str, Path], job_id: str, attempt_index: int) -> dict[str, Any]:
+    return {
+        "attempt": attempt_index,
+        "job_id": job_id,
+        "status_path": str(tmux_state.status_path(paths, job_id)),
+        "log_path": str(tmux_state.log_path(paths, job_id)),
+        "started_at": tmux_state.utc_now(),
+    }
+
+
+def read_command_snapshot(command_text: str | None, command_file: str | None) -> str:
+    snapshot = read_text_arg(command_text, command_file)
+    if snapshot is None or not tmux_state.one_line_text(snapshot):
+        raise ValueError("autopilot command is blank")
+    return snapshot
+
+
+def load_objective(paths: dict[str, Path], objective_id: str) -> dict[str, Any]:
+    item_id = require_objective_id(objective_id)
+    path = tmux_state.objective_path(paths, item_id)
+    objective, error = tmux_state.read_json(path)
+    if error or not objective:
+        die(f"could not load objective {item_id}: {error or 'not found'}")
+    return tmux_state.normalize_objective(objective, path)
+
+
+def current_attempt(objective: dict[str, Any]) -> dict[str, Any] | None:
+    current = objective.get("current_attempt")
+    if isinstance(current, dict):
+        return current
+    attempts = objective.get("attempts")
+    if isinstance(attempts, list) and attempts:
+        last = attempts[-1]
+        return last if isinstance(last, dict) else None
+    return None
+
+
+def attempt_status(paths: dict[str, Path], attempt: dict[str, Any] | None) -> tuple[dict[str, Any] | None, str | None]:
+    if not attempt:
+        return None, None
+    job_id = str(attempt.get("job_id") or "")
+    if not job_id:
+        return None, "attempt has no job_id"
+    status_path = tmux_state.status_path(paths, job_id)
+    status, error = tmux_state.read_json(status_path)
+    if error:
+        return None, error
+    if status:
+        return tmux_state.normalize_status(status, status_path), None
+    return None, None
+
+
+def objective_evidence(paths: dict[str, Path], objective: dict[str, Any], status: dict[str, Any] | None = None) -> list[str]:
+    evidence: list[str] = []
+    attempt = current_attempt(objective)
+    for value in (
+        (attempt or {}).get("status_path"),
+        (attempt or {}).get("log_path"),
+        (status or {}).get("status_path"),
+        (status or {}).get("log_path"),
+        objective.get("objective_path"),
+    ):
+        if value and value not in evidence:
+            evidence.append(str(value))
+    return evidence
+
+
+def bounded_tail_payload(text: Any, max_chars: int) -> dict[str, Any]:
+    value = "" if text is None else str(text)
+    if max_chars <= 0:
+        return {
+            "content": "",
+            "content_omitted": bool(value),
+            "truncated": bool(value),
+            "total_chars_known": len(value),
+            "max_chars": max_chars,
+        }
+    if len(value) <= max_chars:
+        return {
+            "content": value,
+            "content_omitted": False,
+            "truncated": False,
+            "total_chars_known": len(value),
+            "max_chars": max_chars,
+        }
+    return {
+        "content": value[-max_chars:],
+        "content_omitted": False,
+        "truncated": True,
+        "total_chars_known": len(value),
+        "max_chars": max_chars,
+    }
+
+
+def evidence_commands(paths: dict[str, Path], objective_id: Any, *, max_chars: int = AUTOPILOT_EVIDENCE_MAX_CHARS) -> list[dict[str, str]]:
+    item_id = str(objective_id)
+    state_args = f"--workspace {shlex.quote(str(paths['workspace']))} --state-dir {shlex.quote(str(paths['root']))}"
+    return [
+        {
+            "kind": "status",
+            "command": (
+                f"python scripts/tmux_control.py autopilot evidence --objective-id {shlex.quote(item_id)} "
+                f"--kind status --max-chars {max_chars} {state_args}"
+            ),
+        },
+        {
+            "kind": "log",
+            "command": (
+                f"python scripts/tmux_control.py autopilot evidence --objective-id {shlex.quote(item_id)} "
+                f"--kind log --max-chars {max_chars} {state_args}"
+            ),
+        },
+    ]
+
+
+def status_core(status: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not status:
+        return None
+    fields = ("status", "exit_code", "pane_id", "cwd", "command_preview", "status_path", "log_path")
+    return {field: status.get(field) for field in fields if field in status}
+
+
+def attempt_summary(
+    paths: dict[str, Path],
+    objective: dict[str, Any],
+    status: dict[str, Any] | None,
+    *,
+    max_chars: int,
+) -> dict[str, Any]:
+    attempt = current_attempt(objective)
+    payload = bounded_tail_payload((status or {}).get("last_output") if status else "", max_chars)
+    attempt_status = (status or {}).get("status")
+    return {
+        "objective_status": objective.get("status"),
+        "attempt_index": (attempt or {}).get("attempt"),
+        "attempt_job_id": (attempt or {}).get("job_id"),
+        "attempt_status": attempt_status,
+        "terminal": bool(status and tmux_state.is_terminal(status)),
+        "exit_code": (status or {}).get("exit_code"),
+        "command_preview": (status or {}).get("command_preview") or tmux_state.command_preview(str(objective.get("command_snapshot") or "")),
+        "status_path": (attempt or {}).get("status_path") or (status or {}).get("status_path"),
+        "log_path": (attempt or {}).get("log_path") or (status or {}).get("log_path"),
+        "last_output_tail": payload["content"],
+        "content_omitted": payload["content_omitted"],
+        "truncated": payload["truncated"],
+        "total_chars_known": payload["total_chars_known"] if status else None,
+        "max_chars": payload["max_chars"],
+        "source": "status.last_output" if status else "none",
+        "workspace": str(paths["workspace"]),
+        "state_dir": str(paths["root"]),
+    }
+
+
+def objective_attempt_by_selector(objective: dict[str, Any], selector: str) -> dict[str, Any]:
+    if selector == "current":
+        attempt = current_attempt(objective)
+        if attempt:
+            return attempt
+        die("autopilot evidence objective has no current attempt")
+    try:
+        attempt_index = int(selector)
+    except (TypeError, ValueError):
+        die("autopilot evidence --attempt must be 'current' or a positive attempt number")
+    if attempt_index < 1:
+        die("autopilot evidence --attempt must be positive")
+    for attempt in objective.get("attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        try:
+            stored_attempt = int(attempt.get("attempt") or 0)
+        except (TypeError, ValueError):
+            continue
+        if stored_attempt == attempt_index:
+            return attempt
+    die(f"autopilot evidence attempt not found: {attempt_index}")
+    raise AssertionError("unreachable")
+
+
+def evidence_file_payload(path: Path, *, max_chars: int, missing_label: str) -> dict[str, Any]:
+    exists = path.exists()
+    if not exists:
+        return {
+            "path": str(path),
+            "exists": False,
+            "readable": False,
+            "error": f"missing {missing_label}",
+            "content": "",
+            "content_omitted": False,
+            "truncated": False,
+            "total_chars_known": None,
+            "max_chars": max_chars,
+        }
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {
+            "path": str(path),
+            "exists": True,
+            "readable": False,
+            "error": str(exc),
+            "content": "",
+            "content_omitted": False,
+            "truncated": False,
+            "total_chars_known": None,
+            "max_chars": max_chars,
+        }
+    payload = bounded_tail_payload(text, max_chars)
+    return {
+        "path": str(path),
+        "exists": True,
+        "readable": True,
+        "error": None,
+        **payload,
+    }
+
+
+def lease_expired(lease: dict[str, Any] | None) -> bool:
+    if not lease:
+        return True
+    expires_at = lease.get("expires_at")
+    age = tmux_state.age_seconds(expires_at)
+    return age is None or age >= 0
+
+
+def build_repair_lease(attempt: dict[str, Any]) -> dict[str, Any]:
+    now = tmux_state.utc_now()
+    expires = datetime.now(timezone.utc) + timedelta(seconds=AUTOPILOT_LEASE_SECONDS)
+    return {
+        "owner": owner_identity(),
+        "claimed_at": now,
+        "expires_at": expires.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "attempt_job_id": attempt.get("job_id"),
+    }
+
+
+def autopilot_tick_output(
+    paths: dict[str, Path],
+    objective: dict[str, Any],
+    *,
+    action: str,
+    reason: str,
+    status: dict[str, Any] | None = None,
+    status_error: str | None = None,
+    max_chars: int = AUTOPILOT_TICK_MAX_CHARS,
+) -> dict[str, Any]:
+    attempt = current_attempt(objective)
+    state_args = f"--workspace {shlex.quote(str(paths['workspace']))} --state-dir {shlex.quote(str(paths['root']))}"
+    commands = [
+        f"python scripts/tmux_control.py autopilot status --objective-id {shlex.quote(str(objective.get('objective_id')))} {state_args}",
+    ]
+    if action in {"repair", "rerun_failed"}:
+        commands.append(
+            f"python scripts/tmux_control.py autopilot rerun --objective-id {shlex.quote(str(objective.get('objective_id')))} {state_args}"
+        )
+        commands.append(
+            f"python scripts/tmux_control.py autopilot block --objective-id {shlex.quote(str(objective.get('objective_id')))} --reason TEXT {state_args}"
+        )
+    result = {
+        "objective_id": objective.get("objective_id"),
+        "status": objective.get("status"),
+        "action": action,
+        "reason": reason,
+        "attempt_job_id": (attempt or {}).get("job_id"),
+        "attempt_status": (status or {}).get("status"),
+        "attempt_index": (attempt or {}).get("attempt"),
+        "max_attempts": objective.get("max_attempts"),
+        "evidence_paths": objective_evidence(paths, objective, status),
+        "policy": objective.get("policy") or AUTOPILOT_POLICY,
+        "lease": objective.get("lease"),
+        "commands": commands,
+        "status_error": status_error,
+        "workspace": str(paths["workspace"]),
+        "state_dir": str(paths["root"]),
+        "attempt_summary": attempt_summary(paths, objective, status, max_chars=max_chars),
+    }
+    if action in {"repair", "rerun_failed", "blocked"}:
+        result["evidence_commands"] = evidence_commands(paths, objective.get("objective_id"))
+    if action in {"repair", "rerun_failed"}:
+        result["agent_instruction"] = (
+            "Use attempt_summary first. If the failure cause is unclear, run the status evidence command, "
+            "then the log evidence command with bounded --max-chars. Make only bounded workspace repairs, "
+            "run focused verification, then use the rerun command. Block instead of acting if the repair requires a blocked policy action."
+        )
+    elif action == "no_action":
+        result["agent_instruction"] = "Report the current state briefly, do not open evidence files, and do not modify files."
+    elif action == "blocked":
+        result["agent_instruction"] = (
+            "Report the blocked objective state. Use evidence_commands only if attempt_summary is insufficient to explain the block; "
+            "remind the user the heartbeat can be paused or removed."
+        )
+    elif action in {"completed", "cancelled"}:
+        result["agent_instruction"] = "Report the terminal objective state and remind the user the heartbeat can be paused or removed."
+    return result
+
+
+def start_objective_attempt(
+    args: argparse.Namespace,
+    paths: dict[str, Path],
+    objective: dict[str, Any],
+    *,
+    attempt_index: int,
+    command_snapshot: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    job_id = objective_attempt_job_id(str(objective["objective_id"]), attempt_index)
+    run_args = argparse.Namespace(
+        pane=objective["pane_id"],
+        command_text=command_snapshot,
+        command_file=None,
+        job_id=job_id,
+        name=f"autopilot:{objective['objective_id']}",
+        cwd=objective.get("cwd") or str(paths["workspace"]),
+        workspace=str(paths["workspace"]),
+        state_dir=str(paths["root"]),
+        require_idle_shell=getattr(args, "require_idle_shell", False),
+        next_instruction=None,
+        next_instruction_file=None,
+        next_on="terminal",
+    )
+    result = run_job(run_args)
+    attempt = objective_attempt_record(paths, job_id, attempt_index)
+    attempt["sent"] = bool(result.get("sent"))
+    if result.get("reason"):
+        attempt["reason"] = result.get("reason")
+    attempts = list(objective.get("attempts") or [])
+    attempts.append(attempt)
+    objective["attempts"] = attempts
+    objective["current_attempt"] = attempt
+    objective["status"] = "active"
+    objective["lease"] = None
+    objective["completed_at"] = None
+    objective["blocked_reason"] = None
+    if command_snapshot != objective.get("command_snapshot"):
+        objective["command_snapshot"] = command_snapshot
+    return tmux_state.write_objective(paths, objective), result
+
+
+def autopilot_start(args: argparse.Namespace) -> dict[str, Any]:
+    item_id = require_objective_id(args.objective_id)
+    if not tmux_state.one_line_text(args.goal):
+        die("autopilot start requires nonblank --goal")
+    if not tmux_state.one_line_text(args.pane):
+        die("autopilot start requires nonblank --pane")
+    if args.max_attempts < 1:
+        die("autopilot --max-attempts must be positive")
+    paths = tmux_state.state_paths(args.workspace, args.state_dir)
+    tmux_state.ensure_state_dirs(paths)
+    try:
+        command_snapshot = read_command_snapshot(args.command_text, args.command_file)
+    except Exception as exc:
+        die(str(exc))
+    cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else str(paths["workspace"])
+    with objective_lock(paths, item_id):
+        path = tmux_state.objective_path(paths, item_id)
+        if path.exists():
+            die(f"objective already exists: {item_id}")
+        objective = tmux_state.build_objective(
+            objective_id=item_id,
+            goal=args.goal,
+            pane_id=args.pane,
+            cwd=cwd,
+            command_snapshot=command_snapshot,
+            max_attempts=args.max_attempts,
+            policy=AUTOPILOT_POLICY,
+        )
+        objective = tmux_state.write_objective(paths, objective)
+        objective, run_result = start_objective_attempt(args, paths, objective, attempt_index=1, command_snapshot=command_snapshot)
+    return {
+        "objective_id": item_id,
+        "started": bool(run_result.get("sent")),
+        "objective": objective,
+        "run": run_result,
+        "heartbeat_prompt_command": (
+            f"python scripts/tmux_control.py autopilot heartbeat-prompt --objective-id {shlex.quote(item_id)} "
+            f"--workspace {shlex.quote(str(paths['workspace']))} --state-dir {shlex.quote(str(paths['root']))}"
+        ),
+    }
+
+
+def autopilot_tick(args: argparse.Namespace) -> dict[str, Any]:
+    paths = tmux_state.state_paths(args.workspace, args.state_dir)
+    tmux_state.ensure_state_dirs(paths)
+    item_id = require_objective_id(args.objective_id)
+    max_chars = int(getattr(args, "max_chars", AUTOPILOT_TICK_MAX_CHARS))
+    with objective_lock(paths, item_id):
+        objective = load_objective(paths, item_id)
+        if objective["status"] in {"succeeded", "blocked", "cancelled"}:
+            if objective["status"] == "succeeded":
+                action = "completed"
+            elif objective["status"] == "cancelled":
+                action = "cancelled"
+            else:
+                action = "blocked"
+            status, status_error = attempt_status(paths, current_attempt(objective))
+            return autopilot_tick_output(
+                paths,
+                objective,
+                action=action,
+                reason=f"objective is {objective['status']}",
+                status=status,
+                status_error=status_error,
+                max_chars=max_chars,
+            )
+        if objective["status"] == "repairing" and not lease_expired(objective.get("lease")):
+            status, status_error = attempt_status(paths, current_attempt(objective))
+            return autopilot_tick_output(
+                paths,
+                objective,
+                action="no_action",
+                reason="repair already claimed",
+                status=status,
+                status_error=status_error,
+                max_chars=max_chars,
+            )
+        attempt = current_attempt(objective)
+        status, status_error = attempt_status(paths, attempt)
+        attempt_state = tmux_state.token_text((status or {}).get("status"))
+        if status_error:
+            return autopilot_tick_output(paths, objective, action="no_action", reason=f"could not read attempt status: {status_error}", status_error=status_error, max_chars=max_chars)
+        if not attempt or not attempt_state:
+            return autopilot_tick_output(paths, objective, action="no_action", reason="attempt status is not available yet", status=status, max_chars=max_chars)
+        if attempt_state in tmux_state.RUNNING_STATUSES:
+            return autopilot_tick_output(paths, objective, action="no_action", reason=f"attempt is {attempt_state}", status=status, max_chars=max_chars)
+        if attempt_state == "succeeded":
+            objective["status"] = "succeeded"
+            objective["completed_at"] = tmux_state.utc_now()
+            objective["lease"] = None
+            objective = tmux_state.write_objective(paths, objective)
+            return autopilot_tick_output(paths, objective, action="completed", reason="attempt succeeded", status=status, max_chars=max_chars)
+        if attempt_state in {"failed", "stopped", "timeout", "cancelled", "stale"}:
+            if len(objective.get("attempts") or []) >= int(objective.get("max_attempts") or 1):
+                objective["status"] = "blocked"
+                objective["blocked_reason"] = "maximum attempts reached"
+                objective["lease"] = None
+                objective = tmux_state.write_objective(paths, objective)
+                return autopilot_tick_output(paths, objective, action="blocked", reason="maximum attempts reached", status=status, max_chars=max_chars)
+            objective["status"] = "repairing"
+            objective["lease"] = build_repair_lease(attempt)
+            objective = tmux_state.write_objective(paths, objective)
+            return autopilot_tick_output(paths, objective, action="repair", reason=f"attempt ended with {attempt_state}", status=status, max_chars=max_chars)
+        return autopilot_tick_output(paths, objective, action="no_action", reason=f"attempt status is {attempt_state}", status=status, max_chars=max_chars)
+
+
+def autopilot_rerun(args: argparse.Namespace) -> dict[str, Any]:
+    paths = tmux_state.state_paths(args.workspace, args.state_dir)
+    tmux_state.ensure_state_dirs(paths)
+    item_id = require_objective_id(args.objective_id)
+    with objective_lock(paths, item_id):
+        objective = load_objective(paths, item_id)
+        if objective["status"] != "repairing":
+            die(f"objective is not repairing: {objective['status']}")
+        attempts = list(objective.get("attempts") or [])
+        if len(attempts) >= int(objective.get("max_attempts") or 1):
+            objective["status"] = "blocked"
+            objective["blocked_reason"] = "maximum attempts reached"
+            objective["lease"] = None
+            objective = tmux_state.write_objective(paths, objective)
+            return autopilot_tick_output(paths, objective, action="blocked", reason="maximum attempts reached")
+        try:
+            command_snapshot = read_command_snapshot(args.command_text, args.command_file) if (args.command_text is not None or args.command_file is not None) else str(objective.get("command_snapshot") or "")
+        except Exception as exc:
+            die(str(exc))
+        if not tmux_state.one_line_text(command_snapshot):
+            die("autopilot rerun has no command snapshot")
+        objective, run_result = start_objective_attempt(
+            args,
+            paths,
+            objective,
+            attempt_index=len(attempts) + 1,
+            command_snapshot=command_snapshot,
+        )
+        if not run_result.get("sent"):
+            attempts_after = list(objective.get("attempts") or [])
+            attempt = current_attempt(objective)
+            reason = f"rerun command was not sent to pane: {run_result.get('reason') or 'unknown reason'}"
+            status, _status_error = attempt_status(paths, attempt)
+            if len(attempts_after) >= int(objective.get("max_attempts") or 1):
+                objective["status"] = "blocked"
+                objective["blocked_reason"] = f"{reason}; maximum attempts reached"
+                objective["lease"] = None
+                objective = tmux_state.write_objective(paths, objective)
+                result = autopilot_tick_output(paths, objective, action="blocked", reason=objective["blocked_reason"], status=status)
+                result["objective"] = objective
+                result["run"] = run_result
+                return result
+            objective["status"] = "repairing"
+            objective["lease"] = build_repair_lease(attempt or {})
+            objective = tmux_state.write_objective(paths, objective)
+            result = autopilot_tick_output(paths, objective, action="rerun_failed", reason=reason, status=status)
+            result["objective"] = objective
+            result["run"] = run_result
+            return result
+    return {
+        "objective_id": item_id,
+        "action": "rerun_started",
+        "objective": objective,
+        "run": run_result,
+    }
+
+
+def autopilot_status(args: argparse.Namespace) -> Any:
+    paths = tmux_state.state_paths(args.workspace, args.state_dir)
+    tmux_state.ensure_state_dirs(paths)
+    if args.autopilot_action == "list":
+        objectives, errors = tmux_state.load_objectives(paths["root"])
+        return {"objectives": objectives, "errors": errors, "workspace": str(paths["workspace"]), "state_dir": str(paths["root"])}
+    return load_objective(paths, args.objective_id)
+
+
+def autopilot_evidence(args: argparse.Namespace) -> dict[str, Any]:
+    paths = tmux_state.state_paths(args.workspace, args.state_dir)
+    tmux_state.ensure_state_dirs(paths)
+    item_id = require_objective_id(args.objective_id)
+    max_chars = int(getattr(args, "max_chars", AUTOPILOT_EVIDENCE_MAX_CHARS))
+    with objective_lock(paths, item_id):
+        objective = load_objective(paths, item_id)
+        attempt = objective_attempt_by_selector(objective, str(getattr(args, "attempt", "current") or "current"))
+        job_id = str(attempt.get("job_id") or "")
+        if not job_id:
+            die("autopilot evidence attempt has no job_id")
+        if args.kind == "status":
+            path = tmux_state.status_path(paths, job_id)
+            exists = path.exists()
+            data, error = tmux_state.read_json(path)
+            if error or not data:
+                return {
+                    "objective_id": item_id,
+                    "kind": "status",
+                    "attempt": attempt.get("attempt"),
+                    "attempt_job_id": job_id,
+                    "path": str(path),
+                    "exists": exists,
+                    "readable": False,
+                    "error": error or "missing status file",
+                    "max_chars": max_chars,
+                    "content": "",
+                    "content_omitted": False,
+                    "truncated": False,
+                    "total_chars_known": None,
+                    "status_core": None,
+                }
+            status = tmux_state.normalize_status(data, path)
+            payload = bounded_tail_payload(status.get("last_output"), max_chars)
+            return {
+                "objective_id": item_id,
+                "kind": "status",
+                "attempt": attempt.get("attempt"),
+                "attempt_job_id": job_id,
+                "path": str(path),
+                "exists": True,
+                "readable": True,
+                "error": None,
+                "max_chars": max_chars,
+                "content": payload["content"],
+                "content_omitted": payload["content_omitted"],
+                "truncated": payload["truncated"],
+                "total_chars_known": payload["total_chars_known"],
+                "status_core": status_core(status),
+            }
+        path = tmux_state.log_path(paths, job_id)
+        payload = evidence_file_payload(path, max_chars=max_chars, missing_label="log file")
+        return {
+            "objective_id": item_id,
+            "kind": "log",
+            "attempt": attempt.get("attempt"),
+            "attempt_job_id": job_id,
+            **payload,
+            "status_core": None,
+        }
+
+
+def autopilot_finish(args: argparse.Namespace, status: str) -> dict[str, Any]:
+    paths = tmux_state.state_paths(args.workspace, args.state_dir)
+    tmux_state.ensure_state_dirs(paths)
+    item_id = require_objective_id(args.objective_id)
+    with objective_lock(paths, item_id):
+        objective = load_objective(paths, item_id)
+        if objective["status"] in {"succeeded", "blocked", "cancelled"}:
+            return objective
+        objective["status"] = status
+        objective["lease"] = None
+        if status in {"succeeded", "cancelled"}:
+            objective["completed_at"] = tmux_state.utc_now()
+            objective["blocked_reason"] = None
+        elif status == "blocked":
+            if not tmux_state.one_line_text(getattr(args, "reason", None)):
+                die("autopilot block requires nonblank --reason")
+            objective["blocked_reason"] = args.reason
+            objective["completed_at"] = None
+        return tmux_state.write_objective(paths, objective)
+
+
+def autopilot_heartbeat_prompt(args: argparse.Namespace) -> str:
+    paths = tmux_state.state_paths(args.workspace, args.state_dir)
+    objective = load_objective(paths, args.objective_id)
+    tick_command = (
+        "python scripts/tmux_control.py autopilot tick "
+        f"--objective-id {shlex.quote(str(objective['objective_id']))} "
+        f"--workspace {shlex.quote(str(paths['workspace']))} "
+        f"--state-dir {shlex.quote(str(paths['root']))} "
+        f"--for-agent --json --max-chars {AUTOPILOT_TICK_MAX_CHARS}"
+    )
+    return "\n".join(
+        [
+            f"Continue tmux Autopilot objective `{objective['objective_id']}` in workspace `{paths['workspace']}`.",
+            f"Goal: {objective.get('goal')}",
+            f"First run exactly: `{tick_command}`",
+            "Use attempt_summary first. If action is no_action, do not open evidence files; report the current state briefly and do not modify files.",
+            "If action is repair or rerun_failed and attempt_summary is insufficient, run the status evidence command first, then the log evidence command with bounded --max-chars.",
+            "Do not guess a repair when evidence is insufficient; increase --max-chars only as needed, and treat a full log dump as the last resort.",
+            "If action is completed or cancelled, report the result without extra evidence and remind the user the heartbeat can be paused or removed.",
+            "If action is blocked, use evidence_commands only when attempt_summary is insufficient to explain the block, then remind the user the heartbeat can be paused or removed.",
+            "Bounded repair allows workspace diagnostics, code/config edits, focused tests, and rerun. Block before destructive cleanup, force git operations, push/deploy, dependency installation, secrets/auth changes, or expanding to higher-cost/longer training.",
+        ]
+    )
+
+
+def autopilot(args: argparse.Namespace) -> Any:
+    if args.autopilot_action == "start":
+        return autopilot_start(args)
+    if args.autopilot_action == "tick":
+        return autopilot_tick(args)
+    if args.autopilot_action == "rerun":
+        return autopilot_rerun(args)
+    if args.autopilot_action == "evidence":
+        return autopilot_evidence(args)
+    if args.autopilot_action in {"status", "list"}:
+        return autopilot_status(args)
+    if args.autopilot_action == "complete":
+        return autopilot_finish(args, "succeeded")
+    if args.autopilot_action == "block":
+        return autopilot_finish(args, "blocked")
+    if args.autopilot_action == "cancel":
+        return autopilot_finish(args, "cancelled")
+    if args.autopilot_action == "heartbeat-prompt":
+        return autopilot_heartbeat_prompt(args)
+    die(f"unknown autopilot command: {args.autopilot_action}")
+
+
 def task_add(args: argparse.Namespace) -> dict[str, Any]:
     if args.task_id is not None and not tmux_state.one_line_text(args.task_id):
         die("task add requires nonblank --task-id when provided")
@@ -2658,6 +3349,68 @@ def build_parser() -> argparse.ArgumentParser:
     job_gc_parser.add_argument("--max-chars", type=nonnegative_int)
     job_gc_parser.add_argument("--include-pane-state", action="store_true")
 
+    autopilot_parser = subparsers.add_parser("autopilot", help="Manage heartbeat-driven tmux objectives")
+    autopilot_subparsers = autopilot_parser.add_subparsers(dest="autopilot_action", required=True)
+
+    autopilot_start_parser = autopilot_subparsers.add_parser("start", help="Start an Autopilot objective")
+    autopilot_start_parser.add_argument("--objective-id", required=True)
+    autopilot_start_parser.add_argument("--pane", required=True, help="Stable tmux pane ID, such as %%3")
+    autopilot_start_command = autopilot_start_parser.add_mutually_exclusive_group(required=True)
+    autopilot_start_command.add_argument("--command", dest="command_text")
+    autopilot_start_command.add_argument("--command-file")
+    autopilot_start_parser.add_argument("--goal", required=True)
+    autopilot_start_parser.add_argument("--cwd")
+    autopilot_start_parser.add_argument("--max-attempts", type=positive_int, default=3)
+    autopilot_start_parser.add_argument("--require-idle-shell", action="store_true")
+    autopilot_start_parser.add_argument("--workspace")
+    autopilot_start_parser.add_argument("--state-dir")
+
+    autopilot_tick_parser = autopilot_subparsers.add_parser("tick", help="Inspect an Autopilot objective and claim repair if needed")
+    autopilot_tick_parser.add_argument("--objective-id", required=True)
+    autopilot_tick_parser.add_argument("--for-agent", action="store_true")
+    autopilot_tick_parser.add_argument("--json", action="store_true")
+    autopilot_tick_parser.add_argument("--max-chars", type=nonnegative_int, default=AUTOPILOT_TICK_MAX_CHARS)
+    autopilot_tick_parser.add_argument("--workspace")
+    autopilot_tick_parser.add_argument("--state-dir")
+
+    autopilot_evidence_parser = autopilot_subparsers.add_parser("evidence", help="Read bounded Autopilot evidence for the current or numbered attempt")
+    autopilot_evidence_parser.add_argument("--objective-id", required=True)
+    autopilot_evidence_parser.add_argument("--kind", choices=["status", "log"], required=True)
+    autopilot_evidence_parser.add_argument("--attempt", default="current")
+    autopilot_evidence_parser.add_argument("--max-chars", type=nonnegative_int, default=AUTOPILOT_EVIDENCE_MAX_CHARS)
+    autopilot_evidence_parser.add_argument("--workspace")
+    autopilot_evidence_parser.add_argument("--state-dir")
+
+    autopilot_rerun_parser = autopilot_subparsers.add_parser("rerun", help="Start another attempt after a bounded repair")
+    autopilot_rerun_parser.add_argument("--objective-id", required=True)
+    autopilot_rerun_command = autopilot_rerun_parser.add_mutually_exclusive_group()
+    autopilot_rerun_command.add_argument("--command", dest="command_text")
+    autopilot_rerun_command.add_argument("--command-file")
+    autopilot_rerun_parser.add_argument("--require-idle-shell", action="store_true")
+    autopilot_rerun_parser.add_argument("--workspace")
+    autopilot_rerun_parser.add_argument("--state-dir")
+
+    autopilot_status_parser = autopilot_subparsers.add_parser("status", help="Show one Autopilot objective")
+    autopilot_status_parser.add_argument("--objective-id", required=True)
+    autopilot_status_parser.add_argument("--workspace")
+    autopilot_status_parser.add_argument("--state-dir")
+
+    autopilot_list_parser = autopilot_subparsers.add_parser("list", help="List Autopilot objectives")
+    autopilot_list_parser.add_argument("--workspace")
+    autopilot_list_parser.add_argument("--state-dir")
+
+    for action in ("complete", "cancel", "heartbeat-prompt"):
+        objective_parser = autopilot_subparsers.add_parser(action, help=f"Autopilot {action}")
+        objective_parser.add_argument("--objective-id", required=True)
+        objective_parser.add_argument("--workspace")
+        objective_parser.add_argument("--state-dir")
+
+    autopilot_block_parser = autopilot_subparsers.add_parser("block", help="Block an Autopilot objective")
+    autopilot_block_parser.add_argument("--objective-id", required=True)
+    autopilot_block_parser.add_argument("--reason", required=True)
+    autopilot_block_parser.add_argument("--workspace")
+    autopilot_block_parser.add_argument("--state-dir")
+
     task_parser = subparsers.add_parser("task", help="Manage tmux-skills follow-up tasks")
     task_subparsers = task_parser.add_subparsers(dest="task_action", required=True)
 
@@ -2774,6 +3527,13 @@ def main() -> None:
             print_json(job_gc(args))
         else:
             parser.error(f"unknown job command: {args.job_action}")
+    elif args.action == "autopilot":
+        result = autopilot(args)
+        print_result(result)
+        if args.autopilot_action == "start" and isinstance(result, dict) and not result.get("started"):
+            raise SystemExit(2)
+        if args.autopilot_action == "rerun" and isinstance(result, dict) and result.get("action") in {"blocked", "rerun_failed"}:
+            raise SystemExit(2)
     elif args.action == "task":
         if args.task_action == "add":
             print_json(task_add(args))

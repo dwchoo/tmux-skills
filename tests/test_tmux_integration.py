@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -36,7 +37,14 @@ class TmuxIntegrationTests(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
         subprocess.run(["tmux", "kill-server"], env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.tmp.cleanup()
+        for attempt in range(5):
+            try:
+                self.tmp.cleanup()
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.1)
 
     def tmux(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

@@ -1947,6 +1947,49 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(result["job_id"], "job-with-space")
         kill.assert_called_once_with(12345, signal.SIGTERM)
 
+    def test_replace_rejects_foreign_live_pid_before_stale_reclaim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            tmux_state.atomic_write_json(
+                tmux_state.job_path(paths, "foreign"),
+                {
+                    "job_id": "foreign",
+                    "kind": "queue-after-idle",
+                    "status": "waiting_pane_idle",
+                    "pid": 12345,
+                    "pane_id": "%1",
+                    "heartbeat_at": tmux_state.utc_now(),
+                    "updated_at": tmux_state.utc_now(),
+                    "check_interval_seconds": 1,
+                },
+            )
+            args = argparse.Namespace(
+                job_id="foreign",
+                pane="%1",
+                command_text="echo replacement",
+                command_file=None,
+                workspace=tmp,
+                state_dir=None,
+                name=None,
+                poll_seconds=1.0,
+                timeout_seconds=None,
+                strict_preflight=False,
+                bash_if_not_executable=False,
+                replace=True,
+                allow_duplicate=False,
+                owner=None,
+            )
+
+            with mock.patch.object(tmux_control.tmux_state, "pid_is_running", return_value=True):
+                with mock.patch.object(tmux_control.tmux_state, "process_command_line", return_value="python other.py"):
+                    with mock.patch.object(tmux_control.subprocess, "Popen") as popen:
+                        result = tmux_control.queue_after_idle(args)
+
+        self.assertFalse(result["started"])
+        self.assertIn("no longer looks like this tmux-skills worker", result["reason"])
+        popen.assert_not_called()
+
     def test_queue_after_status_requires_required_row_before_starting_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args = argparse.Namespace(
