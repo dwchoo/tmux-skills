@@ -38,6 +38,7 @@ Queue commands accept report-friendly aliases:
 - `queue-after-status --no-require-idle-shell` to submit immediately once status rows match, without waiting for the pane to look idle
 
 Polling intervals and timeouts must be finite positive numbers; zero, negative, `NaN`, and infinity values are rejected before a worker starts.
+`watch --status-lines` and `watch --status-max-chars` must be finite positive integers. They control only status `last_output`, defaulting to the last 10 lines capped to 1200 characters. `--capture-lines` still controls the full pane capture written to the log.
 Queue command sources must be nonblank; empty `--command`, whitespace-only command files, and blank `--command-file` paths fail before a worker starts.
 `watch --status-file` and `queue-after-status --status-file` paths must be nonblank when provided. `queue-after-status` also requires nonblank `--require-row`/`--fail-row` values.
 Managed workers and `job status`/`job cancel` require nonblank `--job-id` values; worker starts also require nonblank `--pane` values. Blank identifiers are never normalized to a default job record.

@@ -30,6 +30,8 @@ MANAGED_TRANSIENT_FIELDS = {"pid_running", "pid_matches", "stale"}
 MANAGED_WORKER_ACTIONS = {"queue-after-idle", "queue-after-status", "watch"}
 DEFAULT_STALE_SECONDS = 30 * 60
 TASK_DISPLAY_TEXT_LIMIT = 800
+DEFAULT_STATUS_LINES = 10
+DEFAULT_STATUS_MAX_CHARS = 1200
 
 
 def utc_now() -> str:
@@ -162,6 +164,18 @@ def tail_text(text: str, limit: int = 4000) -> str:
     if len(text) <= limit:
         return text
     return text[-limit:]
+
+
+def status_tail(text: str, *, lines: int = DEFAULT_STATUS_LINES, max_chars: int = DEFAULT_STATUS_MAX_CHARS) -> str:
+    if lines <= 0:
+        raise ValueError("status tail lines must be positive")
+    if max_chars <= 0:
+        raise ValueError("status tail max chars must be positive")
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    tail = "\n".join(normalized.splitlines()[-lines:])
+    if len(tail) <= max_chars:
+        return tail
+    return tail[-max_chars:]
 
 
 def parse_time(value: Any) -> datetime | None:

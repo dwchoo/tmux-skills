@@ -50,6 +50,23 @@ class TmuxStateTests(unittest.TestCase):
             paths = tmux_state.state_paths(str(workspace), str(absolute))
             self.assertEqual(paths["root"], absolute.resolve())
 
+    def test_status_tail_takes_lines_before_character_cap(self) -> None:
+        text = "\n".join(f"line {index}" for index in range(15))
+        self.assertEqual(tmux_state.status_tail(text, lines=3, max_chars=100), "line 12\nline 13\nline 14")
+        self.assertEqual(tmux_state.status_tail(text, lines=3, max_chars=9), "3\nline 14")
+
+    def test_status_tail_handles_empty_boundaries_and_crlf(self) -> None:
+        self.assertEqual(tmux_state.status_tail("", lines=10, max_chars=1200), "")
+        self.assertEqual(tmux_state.status_tail("one\r\ntwo\rthree", lines=2, max_chars=1200), "two\nthree")
+        self.assertEqual(tmux_state.status_tail("x" * 1200, lines=10, max_chars=1200), "x" * 1200)
+        self.assertEqual(tmux_state.status_tail("x" * 1201, lines=10, max_chars=1200), "x" * 1200)
+
+    def test_status_tail_rejects_nonpositive_limits(self) -> None:
+        with self.assertRaises(ValueError):
+            tmux_state.status_tail("text", lines=0, max_chars=1200)
+        with self.assertRaises(ValueError):
+            tmux_state.status_tail("text", lines=10, max_chars=0)
+
     def test_atomic_status_write_and_load(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = tmux_state.state_paths(tmp)

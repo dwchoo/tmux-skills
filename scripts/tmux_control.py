@@ -927,6 +927,8 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
     tmux_state.ensure_state_dirs(paths)
     monitor_id = tmux_state.safe_id(f"monitor-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}")
     script_dir = Path(__file__).resolve().parent
+    status_lines = getattr(args, "status_lines", tmux_state.DEFAULT_STATUS_LINES)
+    status_max_chars = getattr(args, "status_max_chars", tmux_state.DEFAULT_STATUS_MAX_CHARS)
     argv = [
         sys.executable,
         str(script_dir / "tmux_monitor.py"),
@@ -938,6 +940,10 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
         str(args.poll_seconds),
         "--lines",
         str(args.lines),
+        "--status-lines",
+        str(status_lines),
+        "--status-max-chars",
+        str(status_max_chars),
         "--workspace",
         str(paths["workspace"]),
         "--state-dir",
@@ -970,6 +976,7 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
             exit_code=1,
             last_output=reason,
         )
+        failed.update({"status_lines": status_lines, "status_max_chars": status_max_chars})
         tmux_state.write_status(status_path, failed)
         return {
             "monitor_id": monitor_id,
@@ -1534,7 +1541,20 @@ def start_managed_worker(args: argparse.Namespace, worker_action: str, kind: str
             if command_path_value:
                 argv.extend(["--command-file", command_path_value])
             if worker_action == "watch":
-                argv.extend(["--interval", str(args.interval), "--capture-lines", str(args.capture_lines)])
+                status_lines = getattr(args, "status_lines", tmux_state.DEFAULT_STATUS_LINES)
+                status_max_chars = getattr(args, "status_max_chars", tmux_state.DEFAULT_STATUS_MAX_CHARS)
+                argv.extend(
+                    [
+                        "--interval",
+                        str(args.interval),
+                        "--capture-lines",
+                        str(args.capture_lines),
+                        "--status-lines",
+                        str(status_lines),
+                        "--status-max-chars",
+                        str(status_max_chars),
+                    ]
+                )
                 if args.status_file:
                     argv.extend(["--status-file", args.status_file])
             else:
@@ -2352,6 +2372,8 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser.add_argument("--timeout-seconds", type=positive_float)
     monitor_parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
     monitor_parser.add_argument("--lines", type=positive_int, default=200)
+    monitor_parser.add_argument("--status-lines", type=positive_int, default=tmux_state.DEFAULT_STATUS_LINES)
+    monitor_parser.add_argument("--status-max-chars", type=positive_int, default=tmux_state.DEFAULT_STATUS_MAX_CHARS)
     monitor_parser.add_argument("--workspace")
     monitor_parser.add_argument("--state-dir")
 
@@ -2361,6 +2383,8 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--pane", help="Stable tmux pane ID, such as %%3")
     watch_parser.add_argument("--interval", type=positive_float, default=180.0)
     watch_parser.add_argument("--capture-lines", type=positive_int, default=80)
+    watch_parser.add_argument("--status-lines", type=positive_int, default=tmux_state.DEFAULT_STATUS_LINES)
+    watch_parser.add_argument("--status-max-chars", type=positive_int, default=tmux_state.DEFAULT_STATUS_MAX_CHARS)
     watch_parser.add_argument("--status-file")
     watch_parser.add_argument("--timeout-seconds", type=positive_float)
     watch_parser.add_argument("--name")

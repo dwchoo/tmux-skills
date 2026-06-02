@@ -43,11 +43,12 @@ python scripts/tmux_control.py monitor --pane %1 --match-regex "ERROR|Traceback"
 ```
 
 The monitor is single-trigger. It exits after a match, timeout, idle-shell event, or stop signal, then writes status JSON.
+Status `last_output` is a low-token tail by default: the last 10 lines capped to 1200 characters. The full stripped capture remains in the monitor log, and matching still uses the full `--lines` capture.
 Monitor pane targets must be nonblank; internal wrapper ids are also rejected before status files are written.
 
 ## Large output review
 
-Use main-agent capture for short output. For large output, capture with `--max-chars`, delegate the text to a subagent, and require this structure:
+Use main-agent capture for short output. For large or monitored output, inspect the capped status tail first with the latest available lightweight/mini model, or with the main model at low reasoning. Escalate to medium reasoning and full `log_path` or explicit `capture` only when the first pass reports `error`, `unclear`, or `needs_analysis`. For `progressing` or `complete`, keep reasoning low and return a concise conclusion. Require this structure:
 
 ```text
 Can judge:

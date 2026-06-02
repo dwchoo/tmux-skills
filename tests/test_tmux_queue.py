@@ -277,6 +277,8 @@ class TmuxQueueTests(unittest.TestCase):
         invalid_commands = [
             ["watch", "--job-id", "watch", "--pane", "%1", "--capture-lines", "0"],
             ["watch", "--job-id", "watch", "--pane", "%1", "--capture-lines", "-1"],
+            ["watch", "--job-id", "watch", "--pane", "%1", "--status-lines", "0"],
+            ["watch", "--job-id", "watch", "--pane", "%1", "--status-max-chars", "0"],
         ]
         for command in invalid_commands:
             with self.subTest(command=command):
@@ -867,6 +869,7 @@ class TmuxQueueTests(unittest.TestCase):
         send.assert_not_called()
 
     def test_watch_records_timeout_after_capture(self) -> None:
+        output = "\n".join(f"line {index}" for index in range(15))
         with tempfile.TemporaryDirectory() as tmp:
             args = argparse.Namespace(
                 job_id="watch",
@@ -874,22 +877,32 @@ class TmuxQueueTests(unittest.TestCase):
                 pane="%1",
                 interval=0.001,
                 capture_lines=10,
+                status_lines=2,
+                status_max_chars=1200,
                 status_file=None,
                 timeout_seconds=0.0,
                 workspace=tmp,
                 state_dir=None,
             )
-            with mock.patch.object(tmux_queue.tmux_control, "capture_text", return_value="latest output"):
+            with mock.patch.object(tmux_queue.tmux_control, "capture_text", return_value=output):
                 code = tmux_queue.run_watch(args)
 
             paths = tmux_state.state_paths(tmp)
             status, error = tmux_state.read_json(tmux_state.status_path(paths, "watch"))
+            record, record_error = tmux_state.read_json(tmux_state.job_path(paths, "watch"))
             log_text = tmux_state.log_path(paths, "watch").read_text(encoding="utf-8")
 
         self.assertIsNone(error)
+        self.assertIsNone(record_error)
         self.assertEqual(code, 1)
         self.assertEqual(status["status"], "timeout")
-        self.assertEqual(log_text, "latest output")
+        self.assertEqual(status["last_output"], "line 13\nline 14")
+        self.assertEqual(status["status_lines"], 2)
+        self.assertEqual(status["status_max_chars"], 1200)
+        assert record is not None
+        self.assertEqual(record["status_lines"], 2)
+        self.assertEqual(record["status_max_chars"], 1200)
+        self.assertEqual(log_text, output)
 
     def test_watch_records_failed_status_for_blank_observed_status_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

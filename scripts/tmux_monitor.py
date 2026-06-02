@@ -80,6 +80,8 @@ def run_monitor(args: argparse.Namespace) -> int:
     status_file = tmux_state.status_path(paths, args.monitor_id)
     log_file = tmux_state.log_path(paths, args.monitor_id)
     started = time.monotonic()
+    status_lines = getattr(args, "status_lines", tmux_state.DEFAULT_STATUS_LINES)
+    status_max_chars = getattr(args, "status_max_chars", tmux_state.DEFAULT_STATUS_MAX_CHARS)
 
     running = tmux_state.build_status(
         kind="monitor",
@@ -93,6 +95,7 @@ def run_monitor(args: argparse.Namespace) -> int:
         status_file=status_file,
         log_file=log_file,
     )
+    running.update({"status_lines": status_lines, "status_max_chars": status_max_chars})
     tmux_state.write_status(status_file, running)
 
     previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -131,7 +134,13 @@ def run_monitor(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGTERM, previous_sigterm)
 
     finished = dict(running)
-    finished.update({"status": terminal, "last_output": tmux_state.tail_text(stripped), "exit_code": 0 if terminal == "matched" else 1})
+    finished.update(
+        {
+            "status": terminal,
+            "last_output": tmux_state.status_tail(stripped, lines=status_lines, max_chars=status_max_chars),
+            "exit_code": 0 if terminal == "matched" else 1,
+        }
+    )
     tmux_state.write_status(status_file, finished)
     return 0 if terminal == "matched" else 1
 
@@ -146,6 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=positive_float)
     parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
     parser.add_argument("--lines", type=positive_int, default=200)
+    parser.add_argument("--status-lines", type=positive_int, default=tmux_state.DEFAULT_STATUS_LINES)
+    parser.add_argument("--status-max-chars", type=positive_int, default=tmux_state.DEFAULT_STATUS_MAX_CHARS)
     parser.add_argument("--workspace")
     parser.add_argument("--state-dir")
     return parser

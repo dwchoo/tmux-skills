@@ -47,8 +47,10 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 
 ## Reading Output
 - Read small or simple pane output directly with `capture`.
-- For large output, ask a subagent to inspect the captured text with inherited model settings and `reasoning_effort=low`; use `medium` only when the content is likely ambiguous.
-- Do not use fast/spark models for log interpretation.
+- For large or monitored output, first inspect only the status tail written by `watch` or `monitor`; by default this is the last 10 lines capped to 1200 characters.
+- Use the latest available lightweight/mini model for this first pass, or the main model with `reasoning_effort=low` when model selection is not available.
+- If the first pass indicates `error`, `unclear`, or `needs_analysis`, inspect the full `log_path` or an explicit `capture` with `reasoning_effort=medium`.
+- If the first pass indicates `progressing` or `complete`, keep `reasoning_effort=low` and report only the concise conclusion and next action to the main conversation.
 - Require this subagent format: `Can judge`, `Key conclusion`, `Important verbatim excerpts`, `Errors or risks`, `Recommended next action`, `Uncertainty`.
 - If the subagent cannot judge confidently, capture the relevant pane output in the main agent and inspect it directly.
 
@@ -85,7 +87,7 @@ python scripts/tmux_control.py spawn [--target SESSION:WINDOW] [--cwd PATH] [--v
 python scripts/tmux_control.py new-window --cwd PATH [--target SESSION] [--name NAME]
 python scripts/tmux_control.py send --pane PANE_ID --command TEXT [--require-idle-shell] [--strict-preflight] [--bash-if-not-executable] (--enter|--no-enter)
 python scripts/tmux_control.py run --pane PANE_ID (--command TEXT|--command-file PATH) [--job-id ID] [(--next-instruction TEXT|--next-instruction-file PATH)] [--next-on succeeded|failed|terminal]
-python scripts/tmux_control.py watch --job-id ID --pane PANE_ID [--interval N] [--capture-lines N] [--status-file PATH] [--timeout-seconds N] [--replace] [--allow-duplicate]
+python scripts/tmux_control.py watch --job-id ID --pane PANE_ID [--interval N] [--capture-lines N] [--status-lines N] [--status-max-chars N] [--status-file PATH] [--timeout-seconds N] [--replace] [--allow-duplicate]
 python scripts/tmux_control.py watch list
 python scripts/tmux_control.py watch status|cancel --job-id ID
 python scripts/tmux_control.py queue-after-idle --job-id ID (--pane|--then-pane) PANE_ID ((--command|--then-command) TEXT|--command-file PATH) [--interval N|--poll-seconds N] [--timeout-seconds N] [--then-require-idle-shell] [--replace] [--allow-duplicate]
@@ -99,7 +101,7 @@ python scripts/tmux_control.py task load [--for-skill] [--json] [--max-items N]
 python scripts/tmux_control.py task next [--json]
 python scripts/tmux_control.py task claim --task-id TASK_ID
 python scripts/tmux_control.py task add [--task-id TASK_ID] (--after-job JOB_ID|--after-event EVENT_ID) --trigger-on succeeded|failed|terminal --instruction TEXT
-python scripts/tmux_control.py monitor --pane PANE_ID [--match-regex REGEX] [--idle-shell] [--timeout-seconds N]
+python scripts/tmux_control.py monitor --pane PANE_ID [--match-regex REGEX] [--idle-shell] [--timeout-seconds N] [--status-lines N] [--status-max-chars N]
 python scripts/tmux_control.py capture --pane PANE_ID [--lines N] [--strip-ansi] [--max-chars N]
 ```
 

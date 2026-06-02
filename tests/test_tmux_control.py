@@ -920,7 +920,11 @@ class TmuxControlTests(unittest.TestCase):
             ["capture", "--pane", "%1", "--lines", "0"],
             ["capture", "--pane", "%1", "--lines", "-1"],
             ["monitor", "--pane", "%1", "--timeout-seconds", "1", "--lines", "0"],
+            ["monitor", "--pane", "%1", "--timeout-seconds", "1", "--status-lines", "0"],
+            ["monitor", "--pane", "%1", "--timeout-seconds", "1", "--status-max-chars", "0"],
             ["watch", "--job-id", "watch", "--pane", "%1", "--capture-lines", "0"],
+            ["watch", "--job-id", "watch", "--pane", "%1", "--status-lines", "0"],
+            ["watch", "--job-id", "watch", "--pane", "%1", "--status-max-chars", "0"],
         ]
         for command in invalid_commands:
             with self.subTest(command=command):
@@ -965,6 +969,8 @@ class TmuxControlTests(unittest.TestCase):
                 pane="%1",
                 poll_seconds=1.0,
                 lines=50,
+                status_lines=3,
+                status_max_chars=500,
                 match_regex=None,
                 idle_shell=False,
                 timeout_seconds=1.0,
@@ -978,6 +984,11 @@ class TmuxControlTests(unittest.TestCase):
 
         self.assertEqual(result["pid"], 12345)
         self.assertEqual(popen.call_count, 1)
+        argv = popen.call_args.args[0]
+        self.assertIn("--status-lines", argv)
+        self.assertIn("3", argv)
+        self.assertIn("--status-max-chars", argv)
+        self.assertIn("500", argv)
         env = popen.call_args.kwargs.get("env")
         self.assertIsNotNone(env)
         assert env is not None
@@ -1194,6 +1205,45 @@ class TmuxControlTests(unittest.TestCase):
         self.assertIn("dedupe_key", record)
         self.assertEqual(command, "echo ok\n")
         self.assertIn("tmux_queue.py", " ".join(popen.call_args.args[0]))
+
+    def test_watch_forwards_status_tail_options_to_worker(self) -> None:
+        class Proc:
+            pid = 12345
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                watch_action="start",
+                job_id="watch",
+                pane="%1",
+                interval=1.0,
+                capture_lines=80,
+                status_lines=3,
+                status_max_chars=500,
+                status_file=None,
+                timeout_seconds=None,
+                workspace=tmp,
+                state_dir=None,
+                name=None,
+                replace=False,
+                allow_duplicate=False,
+                owner=None,
+            )
+            with mock.patch.object(tmux_control.subprocess, "Popen", return_value=Proc()) as popen:
+                result = tmux_control.watch(args)
+
+            paths = tmux_state.state_paths(tmp)
+            record, error = tmux_state.read_json(tmux_state.job_path(paths, "watch"))
+
+        self.assertIsNone(error)
+        self.assertTrue(result["started"])
+        argv = popen.call_args.args[0]
+        self.assertIn("--status-lines", argv)
+        self.assertIn("3", argv)
+        self.assertIn("--status-max-chars", argv)
+        self.assertIn("500", argv)
+        assert record is not None
+        self.assertNotIn("status_lines", record["dedupe_payload"])
+        self.assertNotIn("status_max_chars", record["dedupe_payload"])
 
     def test_write_managed_job_record_normalizes_kind_and_status_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

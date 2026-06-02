@@ -45,6 +45,26 @@ class TmuxMonitorTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(status["status"], "matched")
 
+    def test_regex_uses_full_capture_but_status_tail_is_shortened(self) -> None:
+        output = "\n".join(["ERROR first", *[f"line {index}" for index in range(1, 15)]])
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tmux_monitor, "capture_pane", return_value=output):
+                code = tmux_monitor.run_monitor(
+                    self.args(tmp, match_regex="ERROR", timeout_seconds=5, status_lines=2, status_max_chars=1200)
+                )
+
+            paths = tmux_state.state_paths(tmp)
+            status, error = tmux_state.read_json(tmux_state.status_path(paths, "mon"))
+            log_text = tmux_state.log_path(paths, "mon").read_text(encoding="utf-8")
+
+        self.assertIsNone(error)
+        self.assertEqual(code, 0)
+        self.assertEqual(status["status"], "matched")
+        self.assertEqual(status["last_output"], "line 13\nline 14")
+        self.assertEqual(status["status_lines"], 2)
+        self.assertEqual(status["status_max_chars"], 1200)
+        self.assertIn("ERROR first", log_text)
+
     def test_timeout_records_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(tmux_monitor, "capture_pane", return_value="still running"):
@@ -151,6 +171,8 @@ class TmuxMonitorTests(unittest.TestCase):
         invalid_commands = [
             ["--monitor-id", "mon", "--pane", "%1", "--timeout-seconds", "1", "--lines", "0"],
             ["--monitor-id", "mon", "--pane", "%1", "--timeout-seconds", "1", "--lines", "-1"],
+            ["--monitor-id", "mon", "--pane", "%1", "--timeout-seconds", "1", "--status-lines", "0"],
+            ["--monitor-id", "mon", "--pane", "%1", "--timeout-seconds", "1", "--status-max-chars", "0"],
         ]
         for command in invalid_commands:
             with self.subTest(command=command):

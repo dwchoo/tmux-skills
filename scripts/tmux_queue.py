@@ -825,6 +825,9 @@ def run_watch(args: argparse.Namespace) -> int:
     started_at = tmux_state.utc_now()
     started = time.monotonic()
     kind = "watch"
+    status_lines = getattr(args, "status_lines", tmux_state.DEFAULT_STATUS_LINES)
+    status_max_chars = getattr(args, "status_max_chars", tmux_state.DEFAULT_STATUS_MAX_CHARS)
+    status_tail_extra = {"status_lines": status_lines, "status_max_chars": status_max_chars}
     try:
         observed_file = optional_status_file(paths, args.status_file, "watch")
     except ValueError as exc:
@@ -835,7 +838,7 @@ def run_watch(args: argparse.Namespace) -> int:
             kind=kind,
             command_text=None,
             last_output=str(exc),
-            extra={"error": str(exc)},
+            extra={**status_tail_extra, "error": str(exc)},
         )
     log_file = tmux_state.log_path(paths, args.job_id)
     write_worker_record(
@@ -843,7 +846,10 @@ def run_watch(args: argparse.Namespace) -> int:
         args,
         kind=kind,
         status="running",
-        extra={"observed_status_file": str(observed_file) if observed_file else None},
+        extra={
+            "observed_status_file": str(observed_file) if observed_file else None,
+            **status_tail_extra,
+        },
     )
 
     while True:
@@ -853,16 +859,17 @@ def run_watch(args: argparse.Namespace) -> int:
             output = exception_text(exc)
             terminal = "failed"
             exit_code = 1
-            write_worker_record(paths, args, kind=kind, status=terminal, extra={"error": output})
+            error_extra = {**status_tail_extra, "error": output}
+            write_worker_record(paths, args, kind=kind, status=terminal, extra=error_extra)
             write_worker_status(
                 paths,
                 args,
                 kind=kind,
                 status=terminal,
                 started_at=started_at,
-                last_output=output,
+                last_output=tmux_state.status_tail(output, lines=status_lines, max_chars=status_max_chars),
                 exit_code=exit_code,
-                extra={"error": output},
+                extra=error_extra,
             )
             return exit_code
 
@@ -879,7 +886,7 @@ def run_watch(args: argparse.Namespace) -> int:
                     kind=kind,
                     command_text=None,
                     last_output=error,
-                    extra={"observed_status_file": str(observed_file), "error": error},
+                    extra={**status_tail_extra, "observed_status_file": str(observed_file), "error": error},
                 )
         try:
             log_file.write_text(output, encoding="utf-8")
@@ -892,13 +899,15 @@ def run_watch(args: argparse.Namespace) -> int:
                 kind=kind,
                 command_text=None,
                 last_output=error,
-                extra={"error": error},
+                extra={**status_tail_extra, "error": error},
             )
         extra = {
             "capture_lines": args.capture_lines,
+            **status_tail_extra,
             "observed_status_file": str(observed_file) if observed_file else None,
             "observed_status_tail": observed_tail,
         }
+        status_output = tmux_state.status_tail(output, lines=status_lines, max_chars=status_max_chars)
         write_worker_record(paths, args, kind=kind, status="running", extra=extra)
         write_worker_status(
             paths,
@@ -906,7 +915,7 @@ def run_watch(args: argparse.Namespace) -> int:
             kind=kind,
             status="running",
             started_at=started_at,
-            last_output=output,
+            last_output=status_output,
             extra=extra,
         )
 
@@ -918,7 +927,7 @@ def run_watch(args: argparse.Namespace) -> int:
                 kind=kind,
                 status="timeout",
                 started_at=started_at,
-                last_output=output,
+                last_output=status_output,
                 exit_code=1,
                 extra=extra,
             )
@@ -984,6 +993,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(watch_parser)
     watch_parser.add_argument("--interval", type=positive_float, default=180.0)
     watch_parser.add_argument("--capture-lines", type=positive_int, default=80)
+    watch_parser.add_argument("--status-lines", type=positive_int, default=tmux_state.DEFAULT_STATUS_LINES)
+    watch_parser.add_argument("--status-max-chars", type=positive_int, default=tmux_state.DEFAULT_STATUS_MAX_CHARS)
     watch_parser.add_argument("--status-file")
     watch_parser.add_argument("--timeout-seconds", type=positive_float)
 

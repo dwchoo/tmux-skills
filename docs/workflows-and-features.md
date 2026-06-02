@@ -155,8 +155,10 @@ python scripts/tmux_control.py watch \
 Expected behavior:
 
 - The active watch appears in hook context as a managed job.
-- The worker writes a log/status record on each heartbeat.
+- The worker writes a full stripped pane capture to the log on each heartbeat.
+- The status `last_output` is a low-token tail by default: the last 10 lines capped to 1200 characters.
 - Timeout or cancellation is recorded for later inspection.
+- Use the status tail for low-reasoning triage, then inspect the full log only for errors, unclear output, or analysis-heavy results.
 
 ## Workflow: Prevent Duplicate Managed Work
 
