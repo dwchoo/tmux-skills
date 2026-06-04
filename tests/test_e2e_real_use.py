@@ -125,6 +125,7 @@ class E2ERealUseTests(unittest.TestCase):
             [
                 "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover",
                 "PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile scripts/*.py",
+                "bash scripts/run_managed_job.sh \"$(mktemp -d)/job\" bash -c 'printf \"ok\\n\"'",
                 "PYTHONDONTWRITEBYTECODE=1 python3 scripts/e2e_real_use.py --scenario smoke --json",
                 "PYTHONDONTWRITEBYTECODE=1 python3 scripts/e2e_real_use.py --scenario all --json",
                 "git diff --check",
@@ -149,6 +150,10 @@ class E2ERealUseTests(unittest.TestCase):
                     self.assertEqual(argv[3:], ["discover"])
                 elif argv[:3] == ["python3", "-m", "py_compile"]:
                     self.assertEqual(argv[3:], ["scripts/*.py"])
+                elif argv[:2] == ["bash", "scripts/run_managed_job.sh"]:
+                    self.assertGreaterEqual(len(argv), 4)
+                    self.assertEqual(argv[2], "$(mktemp -d)/job")
+                    self.assertTrue(argv[3:])
                 else:
                     self.assertEqual(argv, ["git", "diff", "--check"])
 

@@ -18,6 +18,7 @@ Codex skill for controlled tmux usage. It provides concise skill instructions, P
 - `scripts/tmux_queue.py`: managed watch and queue-after worker.
 - `scripts/tmux_monitor.py`: single-trigger pane monitor.
 - `scripts/codex_tmux_hook.py`: command hook status reader.
+- `scripts/run_managed_job.sh`: raw tmux fallback wrapper for helper-unavailable managed jobs.
 - `.codex/tmux-skills/tasks/`: runtime follow-up task records created by anchored `task add` and `run --next-instruction`.
 - `.codex/tmux-skills/jobs/`: managed background worker records created by `watch` and queue commands.
 
@@ -35,6 +36,7 @@ Codex skill for controlled tmux usage. It provides concise skill instructions, P
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile scripts/*.py
+bash scripts/run_managed_job.sh "$(mktemp -d)/job" bash -c 'printf "ok\n"'
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/e2e_real_use.py --scenario smoke --json
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/e2e_real_use.py --scenario all --json
 git diff --check
@@ -43,3 +45,13 @@ python3 scripts/tmux_control.py list
 ```
 
 When outside tmux, `spawn` and `new-window` create or reuse a detached `codex-<workspace>` session and report an `attach_command`.
+
+## Raw tmux fallback
+
+Prefer `python scripts/tmux_control.py run` for long-running commands. If the helper is unavailable and you must launch a manual raw tmux fallback, run the installed wrapper from the skill directory so status, logs, PID, and exit code are still preserved:
+
+```bash
+tmux new-session -d -s <job_id> "cd ~/.codex/skills/tmux-control && bash scripts/run_managed_job.sh <workspace>/logs/jobs/<job_id> <command> <args...>"
+```
+
+The wrapper executes the command as argv without shell re-parsing, writes combined stdout/stderr to `stdout.log`, and does not create `stderr.log`.

@@ -57,6 +57,8 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 
 ## Long-Running Jobs and Hooks
 - `run` stores command files, logs, status JSON, and acknowledgements in `.codex/tmux-skills` by default.
+- Prefer `python scripts/tmux_control.py run` for long-running commands. If the helper is unavailable and a manual raw tmux fallback is required, launch the installed wrapper from the skill directory: `tmux new-session -d -s <job_id> "cd ~/.codex/skills/tmux-control && bash scripts/run_managed_job.sh <workspace>/logs/jobs/<job_id> <command> <args...>"`.
+- The fallback wrapper preserves `command.sh`, combined `stdout.log`, `status.json`, `exitcode`, `started_at`, `finished_at`, and direct child `pid`; it executes argv without shell re-parsing and does not create `stderr.log`.
 - Managed worker contracts are canonical in [docs/managed-workers.md](docs/managed-workers.md).
 - Real-use E2E coverage is canonical in [docs/real-use-e2e.md](docs/real-use-e2e.md).
 - `watch`, `queue-after-idle`, and `queue-after-status` store managed worker records in `.codex/tmux-skills/jobs`; inspect them with compact output first, for example `watch list --compact --no-observed-tail` or `job status --compact`.
