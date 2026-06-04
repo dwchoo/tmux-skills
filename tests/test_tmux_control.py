@@ -1077,7 +1077,26 @@ class TmuxControlTests(unittest.TestCase):
         env = popen.call_args.kwargs.get("env")
         self.assertIsNotNone(env)
         assert env is not None
-        self.assertIn("TMUX_TMPDIR", env)
+        self.assertNotIn("TMUX_TMPDIR", env)
+
+    def test_tmux_env_does_not_create_hidden_tmpdir_by_default(self) -> None:
+        with mock.patch.dict(tmux_control.os.environ, {}, clear=True):
+            env = tmux_control.tmux_env()
+
+        self.assertNotIn("TMUX_TMPDIR", env)
+        self.assertNotIn("TMUX_SKILLS_SOCKET", env)
+
+    def test_tmux_env_redirects_internal_codex_socket_to_default_socket(self) -> None:
+        hidden = "/var/folders/tmp/codex-tmux-control/tmux-501/default"
+        default_socket = "/tmp/tmux-501/default"
+        with mock.patch.dict(tmux_control.os.environ, {"TMUX": f"{hidden},123,0"}, clear=True):
+            with mock.patch.object(tmux_control.os, "getuid", return_value=501):
+                with mock.patch.object(tmux_control, "socket_exists", return_value=True):
+                    env = tmux_control.tmux_env()
+                    prefix = tmux_control.tmux_command_prefix()
+
+        self.assertEqual(env["TMUX_SKILLS_SOCKET"], default_socket)
+        self.assertEqual(prefix, ["tmux", "-S", default_socket])
 
     def test_monitor_rejects_blank_pane_before_worker_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

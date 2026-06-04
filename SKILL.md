@@ -9,10 +9,10 @@ description: Use when Codex needs to operate tmux sessions, windows, or panes; r
 Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over pane positions, keep user-owned tmux state intact, and use status files plus Codex command hooks for long-running jobs.
 
 ## Quick Start
-1. Run `python scripts/tmux_control.py current` to identify Codex's current tmux session, window, and pane.
-2. Run `python scripts/tmux_control.py list` when multiple sessions, windows, or panes may exist.
-3. If Codex is inside tmux, use the current session/window by default.
-4. If Codex is outside tmux, use `python scripts/tmux_control.py spawn` or `new-window` to create or reuse a detached session named `codex-<workspace-basename>`.
+1. Run `python scripts/tmux_control.py current` to identify the tmux socket, session, window, and pane that commands will use.
+2. Run `python scripts/tmux_control.py list` when multiple sessions, windows, panes, or tmux sockets may exist.
+3. If Codex is already running inside tmux, use that current tmux session/window by default.
+4. If Codex is running outside tmux, create or reuse a normal default-socket tmux session so the user can see it with `tmux ls` and attach with `tmux attach -t SESSION`. Do not default to a hidden `TMUX_TMPDIR`.
 5. Resolve human pane references before acting, for example `python scripts/tmux_control.py resolve --current-window --pane-index 3`.
 6. Send commands with `python scripts/tmux_control.py send --pane <pane_id> --command '<command>' --enter --require-idle-shell` unless the pane is explicitly intended to receive input while busy.
 7. Capture results with `python scripts/tmux_control.py capture --pane <pane_id> --lines 200`; add `--strip-ansi` for tqdm/color/control-heavy output.
@@ -24,19 +24,21 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 13. Summarize the important output and continue with code edits or further tmux commands only when the result supports it.
 
 ## Target Selection
-- Prefer the current tmux window only when `$TMUX` is set.
+- Prefer the current tmux session/window when `$TMUX` is set. Every process that the user should observe, including long-running scripts, managed watches, queues, Autopilot attempts, and bridge daemons, should run in that session by default.
+- If Codex is outside tmux, use tmux's normal default socket. A created session must be visible to `tmux ls` unless the user explicitly chooses another socket through `TMUX_TMPDIR`.
 - Use `current` before choosing targets when more than one session, window, or pane exists.
 - Use `current --target <target>` to inspect a specific pane/window/session from outside tmux.
 - Use `resolve` to turn a pane index, ordinal, or explicit target into a stable `pane_id` before sending commands.
 - Treat `--pane-index` as tmux's usually 0-based `pane_index`; use `--ordinal` for human 1-based pane numbering.
-- Outside tmux, create or reuse a codex-managed detached session for the current workspace.
+- Outside tmux, create or reuse a codex-managed session on the default tmux socket. Report `tmux attach -t SESSION` so the user can enter it.
 - Use explicit user-provided targets when present.
 - Always report the selected `pane_id` after creating or choosing a pane.
-- When creating or reusing a detached session, also report the returned `attach_command`.
+- When creating or reusing a session from outside tmux, also report the returned `attach_command`.
 - If outside-tmux session creation fails because the sandbox cannot create a tmux socket, rerun the same helper command with the required filesystem/process escalation.
 
 ## Command Execution
-- Use `spawn` for new long-running work unless the user explicitly chooses an existing pane.
+- Use a current-session existing pane for new long-running work whenever possible.
+- Use `spawn` or `new-window` in the current session when a new pane/window is needed for foreground visibility.
 - Use `send --no-enter` only when the user wants the command staged for review.
 - Use `send --enter` when the user has asked Codex to run the command.
 - Prefer `send --require-idle-shell` for user-selected panes; it refuses to send when the target is not an idle shell prompt or has child processes.

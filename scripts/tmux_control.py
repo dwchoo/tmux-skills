@@ -83,24 +83,53 @@ def split_tmux_fields(line: str) -> list[str]:
     return line.replace(TMUX_ESCAPED_FIELD_SEP, FIELD_SEP).split(FIELD_SEP)
 
 
-def default_tmux_tmpdir() -> Path:
-    base = Path(os.environ.get("TMPDIR") or "/tmp").expanduser()
-    return base / "codex-tmux-control"
 
+def tmux_socket_from_env(value: str | None = None) -> str | None:
+    raw = value if value is not None else os.environ.get("TMUX")
+    if not raw:
+        return None
+    socket_path = raw.split(",", 1)[0].strip()
+    return socket_path or None
+
+
+def default_tmux_socket() -> str:
+    return str(Path("/tmp") / f"tmux-{os.getuid()}" / "default")
+
+
+def socket_exists(path: str | None) -> bool:
+    return bool(path and Path(path).exists())
+
+
+def selected_tmux_socket() -> str | None:
+    explicit = os.environ.get("TMUX_SKILLS_SOCKET")
+    if explicit:
+        return explicit
+
+    current = tmux_socket_from_env()
+    default_socket = default_tmux_socket()
+    if current and "codex-tmux-control" in current and socket_exists(default_socket):
+        return default_socket
+    return None
+
+
+def tmux_command_prefix() -> list[str]:
+    socket_path = selected_tmux_socket()
+    if socket_path:
+        return ["tmux", "-S", socket_path]
+    return ["tmux"]
 
 def tmux_env() -> dict[str, str]:
     env = os.environ.copy()
-    if not inside_tmux() and not env.get("TMUX_TMPDIR"):
-        tmpdir = default_tmux_tmpdir()
-        tmpdir.mkdir(parents=True, exist_ok=True)
-        env["TMUX_TMPDIR"] = str(tmpdir)
+    socket_path = selected_tmux_socket()
+    if socket_path:
+        env["TMUX_SKILLS_SOCKET"] = socket_path
     return env
 
 
 def tmux_tmpdir_value() -> str | None:
-    if inside_tmux():
+    if selected_tmux_socket():
         return None
-    return os.environ.get("TMUX_TMPDIR") or str(default_tmux_tmpdir())
+    return os.environ.get("TMUX_TMPDIR")
 
 
 def die(message: str, code: int = 1) -> None:
@@ -111,7 +140,7 @@ def die(message: str, code: int = 1) -> None:
 def run_tmux(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
-            ["tmux", *args],
+            [*tmux_command_prefix(), *args],
             check=False,
             env=tmux_env(),
             text=True,
@@ -384,6 +413,7 @@ def list_panes() -> dict[str, Any]:
         )
     return {
         "inside_tmux": inside_tmux(),
+        "tmux_socket": selected_tmux_socket() or tmux_socket_from_env(),
         "tmux_tmpdir": tmux_tmpdir_value(),
         "current": current,
         "sessions": session_values,
@@ -3500,6 +3530,7 @@ def main() -> None:
         print_json(
             {
                 "inside_tmux": inside_tmux(),
+                "tmux_socket": selected_tmux_socket() or tmux_socket_from_env(),
                 "tmux_tmpdir": tmux_tmpdir_value(),
                 "current": current_info(args.target),
             }

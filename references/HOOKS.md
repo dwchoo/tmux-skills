@@ -40,6 +40,7 @@ timeout = 5
 
 ## Notes
 
+- `SessionStart` and `UserPromptSubmit` context output must include `hookSpecificOutput.hookEventName` with the matching hook name. Codex rejects the hook output as invalid JSON when that discriminator is missing.
 - `PostToolUse` observes Codex tool calls, not independent long-running tmux jobs.
 - Hooks read status files written by `tmux_job.py` and `tmux_monitor.py`, plus follow-up tasks under `.codex/tmux-skills/tasks`.
 - A fresh startup should not auto-run prior work. Use `python scripts/tmux_control.py task load --for-skill` to inspect old work explicitly.

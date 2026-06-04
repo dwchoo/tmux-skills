@@ -90,6 +90,7 @@ def context(args: argparse.Namespace) -> dict[str, Any]:
         return {}
     return {
         "hookSpecificOutput": {
+            "hookEventName": args.event,
             "additionalContext": "tmux-skills status:\n" + "\n".join(f"- {line}" for line in lines)
         }
     }

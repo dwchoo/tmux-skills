@@ -141,6 +141,7 @@ class CodexTmuxHookTests(unittest.TestCase):
             self.write_terminal_status(tmp)
             output = self.run_hook(["context", "--event", "SessionStart", "--workspace", tmp])
         self.assertIn("hookSpecificOutput", output)
+        self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "SessionStart")
         self.assertIn("training: failed", output["hookSpecificOutput"]["additionalContext"])
 
     def test_context_compacts_multiline_status_tail(self) -> None:
@@ -373,6 +374,7 @@ class CodexTmuxHookTests(unittest.TestCase):
 
             output = self.run_hook(["context", "--event", "UserPromptSubmit", "--workspace", tmp], {})
 
+        self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
         context = output["hookSpecificOutput"]["additionalContext"]
         self.assertIn("managed job watch: starting kind=watch pane=%1 extra heartbeat=", context)
         self.assertNotIn("\nextra", context)
