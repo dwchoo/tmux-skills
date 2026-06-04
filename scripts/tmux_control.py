@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import tmux_state
+import tmux_bridge
 from tmux_text import prompt_like, strip_ansi
 
 
@@ -3349,6 +3350,35 @@ def build_parser() -> argparse.ArgumentParser:
     job_gc_parser.add_argument("--max-chars", type=nonnegative_int)
     job_gc_parser.add_argument("--include-pane-state", action="store_true")
 
+    bridge_parser = subparsers.add_parser("bridge", help="Register, start, inspect, or cancel Codex wake bridges")
+    bridge_subparsers = bridge_parser.add_subparsers(dest="bridge_action", required=True)
+    bridge_register_parser = bridge_subparsers.add_parser("register", help="Register a Codex thread wake bridge")
+    bridge_register_parser.add_argument("--thread-id", required=True)
+    bridge_register_parser.add_argument("--endpoint", required=True)
+    bridge_register_parser.add_argument("--bridge-id")
+    bridge_register_parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
+    bridge_register_parser.add_argument("--quiet-seconds", type=positive_float, default=10.0)
+    bridge_register_parser.add_argument("--replace", action="store_true")
+    bridge_register_parser.add_argument("--workspace")
+    bridge_register_parser.add_argument("--state-dir")
+    bridge_start_parser = bridge_subparsers.add_parser("start", help="Start a registered bridge daemon")
+    bridge_start_parser.add_argument("--bridge-id", required=True)
+    start_mode = bridge_start_parser.add_mutually_exclusive_group()
+    start_mode.add_argument("--foreground", action="store_true", help="Run daemon in the current process")
+    start_mode.add_argument("--background", action="store_true", help="Run daemon in the background")
+    bridge_start_parser.add_argument("--replace", action="store_true")
+    bridge_start_parser.add_argument("--workspace")
+    bridge_start_parser.add_argument("--state-dir")
+    bridge_status_parser = bridge_subparsers.add_parser("status", help="Show one bridge record")
+    bridge_status_parser.add_argument("--bridge-id", required=True)
+    bridge_status_parser.add_argument("--json", action="store_true")
+    bridge_status_parser.add_argument("--workspace")
+    bridge_status_parser.add_argument("--state-dir")
+    bridge_cancel_parser = bridge_subparsers.add_parser("cancel", help="Cancel one bridge daemon")
+    bridge_cancel_parser.add_argument("--bridge-id", required=True)
+    bridge_cancel_parser.add_argument("--workspace")
+    bridge_cancel_parser.add_argument("--state-dir")
+
     autopilot_parser = subparsers.add_parser("autopilot", help="Manage heartbeat-driven tmux objectives")
     autopilot_subparsers = autopilot_parser.add_subparsers(dest="autopilot_action", required=True)
 
@@ -3527,6 +3557,41 @@ def main() -> None:
             print_json(job_gc(args))
         else:
             parser.error(f"unknown job command: {args.job_action}")
+    elif args.action == "bridge":
+        workspace = args.workspace or os.getcwd()
+        if args.bridge_action == "register":
+            result = tmux_bridge.register_bridge(
+                thread_id=args.thread_id,
+                endpoint=args.endpoint,
+                workspace=workspace,
+                state_dir=args.state_dir,
+                bridge_id=args.bridge_id,
+                poll_seconds=args.poll_seconds,
+                quiet_seconds=args.quiet_seconds,
+                replace=args.replace,
+            )
+            print_json(result)
+            if not result.get("registered"):
+                raise SystemExit(2)
+        elif args.bridge_action == "start":
+            result = tmux_bridge.start_bridge(
+                bridge_id=args.bridge_id,
+                workspace=workspace,
+                state_dir=args.state_dir,
+                foreground=not args.background,
+                replace=args.replace,
+            )
+            print_json(result)
+            if not result.get("started", True) and not result.get("stopped"):
+                raise SystemExit(2)
+        elif args.bridge_action == "status":
+            result = tmux_bridge.bridge_status(bridge_id=args.bridge_id, workspace=workspace, state_dir=args.state_dir)
+            print_json(result)
+        elif args.bridge_action == "cancel":
+            result = tmux_bridge.cancel_bridge(bridge_id=args.bridge_id, workspace=workspace, state_dir=args.state_dir)
+            print_json(result)
+        else:
+            parser.error(f"unknown bridge command: {args.bridge_action}")
     elif args.action == "autopilot":
         result = autopilot(args)
         print_result(result)

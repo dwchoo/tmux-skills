@@ -1,0 +1,45 @@
+{
+  "canonical_success_signal": "turn_start_response",
+  "notifications": [],
+  "protocol_evidence": {
+    "command": "codex app-server generate-ts --experimental",
+    "initialize_params": {
+      "capabilities": {
+        "experimentalApi": false,
+        "optOutNotificationMethods": [],
+        "requestAttestation": false
+      },
+      "clientInfo": {
+        "name": "tmux-control-bridge",
+        "title": "tmux-control bridge",
+        "version": "0.1"
+      }
+    },
+    "observed_at": "2026-06-04T08:08:18+00:00",
+    "turn_start_text_input": {
+      "text": "<wake prompt>",
+      "text_elements": [],
+      "type": "text"
+    }
+  },
+  "requests": [
+    {
+      "id": "<request-id>",
+      "jsonrpc": "2.0",
+      "method": "initialize",
+      "params": {
+        "capabilities": {
+          "experimentalApi": false,
+          "optOutNotificationMethods": [],
+          "requestAttestation": false
+        },
+        "clientInfo": {
+          "name": "tmux-control-bridge",
+          "title": "tmux-control bridge",
+          "version": "0.1"
+        }
+      }
+    }
+  ],
+  "responses": []
+}

@@ -68,11 +68,12 @@ def state_paths(workspace: str | None = None, state_dir: str | None = None) -> d
         "tasks": root / "tasks",
         "jobs": root / "jobs",
         "objectives": root / "objectives",
+        "bridge": root / "bridge",
     }
 
 
 def ensure_state_dirs(paths: dict[str, Path]) -> None:
-    for key in ("commands", "logs", "status", "acks", "tasks", "jobs", "objectives"):
+    for key in ("commands", "logs", "status", "acks", "tasks", "jobs", "objectives", "bridge"):
         paths[key].mkdir(parents=True, exist_ok=True)
 
 

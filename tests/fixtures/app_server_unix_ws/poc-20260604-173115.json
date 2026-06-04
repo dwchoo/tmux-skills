@@ -1,0 +1,112 @@
+{
+  "canonical_success_signal": "turn_start_response",
+  "notifications": [
+    {
+      "method": "remoteControl/status/changed",
+      "params": {
+        "environmentId": null,
+        "installationId": "570f64eb-25d6-4b5d-94a2-7b6944354c0a",
+        "serverName": "DongWonui-MacBookPro.local",
+        "status": "disabled"
+      }
+    }
+  ],
+  "protocol_evidence": {
+    "command": "codex app-server generate-ts --experimental",
+    "initialize_params": {
+      "capabilities": {
+        "experimentalApi": false,
+        "optOutNotificationMethods": [],
+        "requestAttestation": false
+      },
+      "clientInfo": {
+        "name": "tmux-control-bridge",
+        "title": "tmux-control bridge",
+        "version": "0.1"
+      }
+    },
+    "observed_at": "2026-06-04T08:31:15+00:00",
+    "turn_start_text_input": {
+      "text": "<wake prompt>",
+      "text_elements": [],
+      "type": "text"
+    }
+  },
+  "requests": [
+    {
+      "id": "<request-id>",
+      "method": "initialize",
+      "params": {
+        "capabilities": {
+          "experimentalApi": false,
+          "optOutNotificationMethods": [],
+          "requestAttestation": false
+        },
+        "clientInfo": {
+          "name": "tmux-control-bridge",
+          "title": "tmux-control bridge",
+          "version": "0.1"
+        }
+      }
+    },
+    {
+      "method": "initialized",
+      "params": {}
+    },
+    {
+      "id": "<request-id>",
+      "method": "thread/resume",
+      "params": {
+        "threadId": "019e91c1-2c5e-7c92-a431-d173b8b3c5f5"
+      }
+    },
+    {
+      "id": "<request-id>",
+      "method": "turn/start",
+      "params": {
+        "cwd": "/Users/dwchoo/project/tmux-skills",
+        "input": [
+          {
+            "text": "tmux-control observed a terminal event.\n\nWorkspace: /Users/dwchoo/project/tmux-skills\nJob status: /Users/dwchoo/project/tmux-skills/.codex/tmux-skills/jobs/test/status.json\nJob log: /Users/dwchoo/project/tmux-skills/.codex/tmux-skills/jobs/test/output.log\nReady task: /Users/dwchoo/project/tmux-skills/.codex/tmux-skills/tasks/ready/test.json",
+            "text_elements": [],
+            "type": "text"
+          }
+        ],
+        "threadId": "019e91c1-2c5e-7c92-a431-d173b8b3c5f5"
+      }
+    }
+  ],
+  "responses": [
+    {
+      "id": 1,
+      "result": {
+        "codexHome": "/Users/dwchoo/.codex",
+        "platformFamily": "unix",
+        "platformOs": "macos",
+        "userAgent": "Codex Desktop/0.133.0 (Mac OS 26.5.1; arm64) tmux/3.6a (tmux-control-bridge; 0.1)"
+      }
+    },
+    {
+      "error": {
+        "code": -32600,
+        "message": "no rollout found for thread id 019e91c1-2c5e-7c92-a431-d173b8b3c5f5"
+      },
+      "id": 2
+    },
+    {
+      "id": 3,
+      "result": {
+        "turn": {
+          "completedAt": null,
+          "durationMs": null,
+          "error": null,
+          "id": "019e91c2-1170-7673-bcbf-7afe3d6abfe2",
+          "items": [],
+          "itemsView": "notLoaded",
+          "startedAt": null,
+          "status": "inProgress"
+        }
+      }
+    }
+  ]
+}

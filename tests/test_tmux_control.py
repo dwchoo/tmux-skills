@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import io
+import json
 import shlex
 import signal
 import threading
@@ -17,6 +18,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import tmux_control
+import tmux_bridge
 import tmux_queue
 import tmux_state
 
@@ -166,6 +168,50 @@ class TmuxControlTests(unittest.TestCase):
         with mock.patch.object(tmux_control.sys, "stderr", io.StringIO()):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["capture", "--pane", "%1", "--max-chars", "-1"])
+
+    def test_bridge_parser_exposes_contract_subcommands(self) -> None:
+        parser = tmux_control.build_parser()
+        args = parser.parse_args(
+            [
+                "bridge",
+                "register",
+                "--thread-id",
+                "thr_test",
+                "--endpoint",
+                "unix:///tmp/app.sock",
+                "--workspace",
+                "/tmp/workspace",
+            ]
+        )
+        self.assertEqual(args.action, "bridge")
+        self.assertEqual(args.bridge_action, "register")
+        self.assertEqual(args.poll_seconds, 2.0)
+        self.assertEqual(args.quiet_seconds, 10.0)
+
+        status_args = parser.parse_args(["bridge", "status", "--bridge-id", "bridge-thr-test", "--json"])
+        self.assertEqual(status_args.bridge_action, "status")
+        self.assertTrue(status_args.json)
+
+    def test_bridge_register_dispatches_to_tmux_bridge_without_delivery(self) -> None:
+        result = {"bridge_id": "bridge-thr-test", "registered": True}
+        argv = [
+            "tmux_control.py",
+            "bridge",
+            "register",
+            "--thread-id",
+            "thr_test",
+            "--endpoint",
+            "unix:///tmp/app.sock",
+            "--workspace",
+            "/tmp/workspace",
+        ]
+        with mock.patch.object(tmux_control.sys, "argv", argv):
+            with mock.patch.object(tmux_bridge, "register_bridge", return_value=result) as register:
+                with mock.patch.object(tmux_control.sys, "stdout", io.StringIO()) as stdout:
+                    tmux_control.main()
+
+        register.assert_called_once()
+        self.assertEqual(json.loads(stdout.getvalue())["bridge_id"], "bridge-thr-test")
 
     def test_idle_shell_check_returns_structured_failure_when_capture_fails(self) -> None:
         pane_info = {

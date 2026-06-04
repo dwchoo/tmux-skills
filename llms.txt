@@ -2,6 +2,8 @@
 
 > Codex skill for controlled tmux usage, managed watch/queue workers, hook-aware status records, and real-use tmux E2E validation.
 
+Bridge wakeup adds a path-only app-server notification flow for dormant main Codex threads. Treat the PoC same-thread wake fixture as the hard gate before relying on daemon lifecycle commands.
+
 Use this file as the LLM entry point. Start with the core files for orientation, then read the detailed docs only for the behavior you need to modify or verify.
 
 ## Core
@@ -14,7 +16,7 @@ Use this file as the LLM entry point. Start with the core files for orientation,
 - [Docs index](docs/README.md): LLM wiki map and maintenance rules for README, SKILL, docs, and references.
 - [LLM wiki style guide](docs/llm-wiki-style-guide.md): Rules for writing canonical, low-duplication, code-fact-checked wiki pages.
 - [Workflows and features](docs/workflows-and-features.md): Desired operating flow, feature map, and workflow-to-test mapping.
-- [Managed workers](docs/managed-workers.md): Canonical contract for `watch`, `queue-after-idle`, `queue-after-status`, dedupe, stale GC, and send preflight behavior.
+- [Managed workers](docs/managed-workers.md): Canonical contract for `watch`, `queue-after-idle`, `queue-after-status`, dedupe, stale GC, send preflight behavior, and the bridge boundary.
 - [Real-use E2E](docs/real-use-e2e.md): Canonical guide for `scripts/e2e_real_use.py`, smoke/all scenario groups, exit codes, diagnostics, and cleanup checks.
 
 ## References

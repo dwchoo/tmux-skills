@@ -131,6 +131,7 @@ class E2ERealUseTests(unittest.TestCase):
                 "git diff --check",
                 "python3 scripts/tmux_control.py --help",
                 "python3 scripts/tmux_control.py list",
+                "python3 scripts/tmux_control.py bridge --help",
             ],
         )
         for command in commands:
@@ -139,7 +140,7 @@ class E2ERealUseTests(unittest.TestCase):
                 if argv[:2] == ["python3", "scripts/e2e_real_use.py"]:
                     e2e_parser.parse_args(argv[2:])
                 elif argv[:2] == ["python3", "scripts/tmux_control.py"]:
-                    if argv[2:] == ["--help"]:
+                    if argv[2:] == ["--help"] or argv[-1:] == ["--help"]:
                         with self.assertRaises(SystemExit) as raised:
                             with mock.patch.object(tmux_control.sys, "stdout", io.StringIO()):
                                 control_parser.parse_args(argv[2:])

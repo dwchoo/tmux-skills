@@ -1,0 +1,18 @@
+{
+  "created_at": "2026-06-04T08:08:18+00:00",
+  "delivered": false,
+  "endpoint": "unix://",
+  "error": "timed out waiting for JSON-RPC response",
+  "failure_class": "retryable_failure",
+  "manual_confirmation_note_path": "/Users/dwchoo/project/tmux-skills/.codex/tmux-skills/bridge/poc-20260604-170808.manual.md",
+  "protocol_fixture_path": "/Users/dwchoo/project/tmux-skills/tests/fixtures/app_server_proxy/poc-20260604-170808.json",
+  "provisional_delivery": false,
+  "request_sequence": [
+    "initialize"
+  ],
+  "response_id": "",
+  "resume_thread_id": null,
+  "supplied_thread_id": "019e91a7-8e2c-70a3-944a-66c4af57655e",
+  "turn_id": null,
+  "turn_start_thread_id": null
+}

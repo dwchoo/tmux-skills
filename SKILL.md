@@ -20,7 +20,8 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 9. For delayed checks or follow-up submissions, use managed `watch`, `queue-after-idle`, or `queue-after-status` instead of raw shell `sleep` watchers.
 10. Add resume-only follow-up instructions with `run --next-instruction TEXT`, `run --next-instruction-file PATH`, or anchored `task add --after-job JOB_ID|--after-event EVENT_ID`.
 11. Use `autopilot start` only when a Codex Desktop heartbeat will wake this thread to continue bounded repair work later.
-12. Summarize the important output and continue with code edits or further tmux commands only when the result supports it.
+12. Use `bridge register|start|status|cancel` only after the PoC app-server same-thread wake gate has passed for the workspace/thread.
+13. Summarize the important output and continue with code edits or further tmux commands only when the result supports it.
 
 ## Target Selection
 - Prefer the current tmux window only when `$TMUX` is set.
@@ -73,6 +74,9 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 - `SessionStart` resume/compact context can expose ready follow-up tasks. A new startup should use explicit `task load --for-skill` instead of auto-running prior work.
 - `Stop` can continue a current turn for an unacknowledged terminal event or ready task; hooks do not wake a dormant thread by themselves.
 - `autopilot` objectives do not wake Codex by themselves. Pair them with a current-thread Codex Desktop heartbeat using `autopilot heartbeat-prompt`.
+- `bridge` observes terminal events and ready tasks under `.codex/tmux-skills` and wakes a user-specified main Codex thread through the same local `codex app-server`.
+- Bridge wake prompts are path-only. They include workspace/job/status/task/log paths, but never status/log summaries, task instruction bodies, traceback text, diagnosis, suggested commands, or retry instructions.
+- Bridge v1 uses stdlib WebSocket-over-Unix transport for explicit `unix://PATH` endpoints only. It does not call the OpenAI API directly, require `OPENAI_API_KEY`, discover threads, run standalone `codex`, run `codex app-server proxy`, run `codex exec resume`, call `turn/steer`, call `thread/shellCommand`, or send keys to tmux panes.
 - Autopilot uses adaptive context: start with `tick --for-agent --max-chars 1200`, then use bounded `autopilot evidence` only when the summary is insufficient.
 - Autopilot bounded repair allows workspace diagnostics, code/config edits, focused tests, and rerun. Block before destructive cleanup, force git operations, push/deploy, dependency installation, secrets/auth changes, or expanding to higher-cost/longer training.
 - Use `references/HOOKS.md` for copyable hook snippets and `references/WORKFLOWS.md` for examples.
@@ -117,6 +121,10 @@ python scripts/tmux_control.py task load [--for-skill] [--json] [--max-items N]
 python scripts/tmux_control.py task next [--json]
 python scripts/tmux_control.py task claim --task-id TASK_ID
 python scripts/tmux_control.py task add [--task-id TASK_ID] (--after-job JOB_ID|--after-event EVENT_ID) --trigger-on succeeded|failed|terminal --instruction TEXT
+python scripts/tmux_control.py bridge register --thread-id THREAD --endpoint unix://PATH [--bridge-id ID] [--poll-seconds N] [--quiet-seconds N] [--replace]
+python scripts/tmux_control.py bridge start --bridge-id ID [--foreground|--background] [--replace]
+python scripts/tmux_control.py bridge status --bridge-id ID [--json]
+python scripts/tmux_control.py bridge cancel --bridge-id ID
 python scripts/tmux_control.py monitor --pane PANE_ID [--match-regex REGEX] [--idle-shell] [--timeout-seconds N] [--status-lines N] [--status-max-chars N]
 python scripts/tmux_control.py capture --pane PANE_ID [--lines N] [--strip-ansi] [--max-chars N]
 ```

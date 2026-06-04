@@ -28,6 +28,7 @@ The preferred flow is:
 | Queue after idle | Submit the next command only after a busy pane returns to an idle shell. | `queue-after-idle` | `managed-workers.md` |
 | Queue after status | Submit the next command after a status TSV reaches required rows and the target pane is idle. | `queue-after-status` | `managed-workers.md` |
 | Autopilot objective | Track a goal across attempts so heartbeat-woken Codex can diagnose, repair, and rerun bounded tmux work. | `autopilot start`, `autopilot tick`, `autopilot rerun` | This document |
+| Bridge wakeup | `.codex/tmux-skills`의 terminal event와 ready task를 path-only prompt로 지정 Codex thread에 알린다. | `bridge register`, `bridge start`, `bridge status`, `bridge cancel` | This document |
 | Duplicate prevention | Prevent multiple Codex instances from creating the same active watcher or queue by default. | managed start commands, `--allow-duplicate`, `--replace` | `managed-workers.md` |
 | Stale recovery | Mark dead or orphaned active worker records as stale without killing unrelated PIDs. | `job gc --stale`, `watch gc --stale` | `managed-workers.md` |
 | Real-use validation | Prove behavior through public CLI subprocesses and real tmux sessions. | `scripts/e2e_real_use.py` | `real-use-e2e.md` |
@@ -143,6 +144,85 @@ Bounded repair policy:
 - A pane send failure is evidence for the next repair step; fix target pane selection or block explicitly instead of silently treating the objective as complete.
 - Context policy: use `attempt_summary` first, bounded `autopilot evidence` second, and only expand beyond the default when the available evidence is insufficient.
 - Completion, blocking, or cancellation does not delete the Codex Desktop heartbeat automatically; report that the heartbeat can be paused or removed.
+
+## Workflow: Bridge Wakeup for Dormant Codex
+
+`tmux-control bridge`는 `.codex/tmux-skills/status`의 terminal event와 `.codex/tmux-skills/tasks`의 ready task를 관찰하고, 같은 local `codex app-server`에 연결된 사용자가 지정한 main Codex thread에 wake prompt만 제출한다. bridge는 hook replacement가 아니다. Hooks는 active turn continuation 또는 resume/compact context를 돕고, bridge는 dormant CLI가 같은 app-server/thread에서 새 user turn을 받도록 깨우는 companion이다.
+
+PoC hard gate가 먼저다. `scripts/codex_app_server_client.py`와 `scripts/tmux_bridge.py poc`가 live `codex app-server --listen unix://PATH` plus `codex --remote unix://PATH` 환경에서 same-thread wake를 증명하고 protocol fixture를 저장하기 전에는 daemon/background/cancel wiring을 구현하거나 운영에 사용하지 않는다.
+
+Register and start:
+
+```bash
+python3 scripts/tmux_control.py bridge register \
+  --thread-id THREAD \
+  --endpoint unix://"$PWD/.codex/tmux-skills/bridge/sockets/codex-bridge.sock" \
+  --workspace "$PWD"
+
+python3 scripts/tmux_control.py bridge start \
+  --bridge-id bridge-THREAD \
+  --workspace "$PWD"
+```
+
+Status and cancel:
+
+```bash
+python3 scripts/tmux_control.py bridge status \
+  --bridge-id bridge-THREAD \
+  --workspace "$PWD" \
+  --json
+
+python3 scripts/tmux_control.py bridge cancel \
+  --bridge-id bridge-THREAD \
+  --workspace "$PWD"
+```
+
+PoC gate commands:
+
+```bash
+mkdir -p "$PWD/.codex/tmux-skills/bridge/sockets"
+codex app-server --listen unix://"$PWD/.codex/tmux-skills/bridge/sockets/codex-bridge.sock"
+codex --remote unix://"$PWD/.codex/tmux-skills/bridge/sockets/codex-bridge.sock" -C "$PWD"
+python3 scripts/tmux_bridge.py poc \
+  --thread-id THREAD \
+  --endpoint unix://PATH \
+  --workspace "$PWD" \
+  --prompt "tmux-control observed a terminal event."
+python3 scripts/tmux_bridge.py validate-poc \
+  --runtime-json .codex/tmux-skills/bridge/poc-YYYYMMDD-HHMMSS.json
+```
+
+State and artifacts:
+
+- Bridge records live under `.codex/tmux-skills/bridge/<bridge_id>.json`.
+- Bridge locks live under `.codex/tmux-skills/bridge/<bridge_id>.lock`.
+- PoC runtime evidence lives under `.codex/tmux-skills/bridge/poc-YYYYMMDD-HHMMSS.json`.
+- PoC protocol fixtures live under `tests/fixtures/app_server_unix_ws/poc-YYYYMMDD-HHMMSS.json`.
+- Manual same-thread confirmation notes live under `.codex/tmux-skills/bridge/poc-YYYYMMDD-HHMMSS.manual.md`.
+
+Wake prompt shape is fixed and path-only:
+
+```text
+tmux-control observed a terminal event.
+
+Workspace: <workspace>
+Job ID: <job_id or unknown>
+Status path: <status_path or none>
+Task path: <task_path or none>
+Log path: <log_path or none>
+
+Please use $tmux-control to inspect the status and logs, then continue the requested work.
+```
+
+Ready task prompts use `tmux-control observed a ready task.` as the first line. The prompt must not include status/log summaries, `last_output`, stdout/stderr tails, traceback text, task instruction bodies, diagnosis, suggested commands, retry commands, or model/delegation language.
+
+Safety rules:
+
+- Endpoint v1 accepts only explicit `unix://PATH`.
+- The bridge uses existing local Codex auth/session through local app-server Unix socket WebSocket transport; it does not call the OpenAI API directly and does not require `OPENAI_API_KEY`.
+- The bridge does not discover threads. The operator supplies the target main thread id.
+- The bridge does not send keys to tmux panes, run `codex app-server proxy`, run `codex exec resume`, use standalone `codex`, call `turn/steer`, call `thread/shellCommand`, or execute queued repair commands.
+- Delivery failure is recorded in bridge state. Retryable failures leave the event unobserved; permanent failures mark the bridge failed.
 
 ## Workflow: Queue a Command After a Busy Pane Becomes Idle
 

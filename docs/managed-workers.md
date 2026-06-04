@@ -13,6 +13,12 @@ Use managed workers when:
 - A command should run after a status TSV reaches required row states.
 - Multiple Codex instances may share the same workspace and should not create duplicate active workers by default.
 
+## Bridge Wakeup Boundary
+
+`tmux-control bridge` is not a managed queue worker. It observes `.codex/tmux-skills/status` terminal events and `.codex/tmux-skills/tasks` ready tasks, then submits a path-only notification prompt to a user-specified Codex thread through the same local `codex app-server`.
+
+The bridge does not submit queued commands, inspect panes, summarize logs, diagnose failures, retry commands, clean up tmux lifecycle state, or write managed worker records under `.codex/tmux-skills/jobs`. Its state is isolated under `.codex/tmux-skills/bridge`, and all bridge record read-modify-write updates are protected by the bridge record lock.
+
 ## Commands
 
 ```bash

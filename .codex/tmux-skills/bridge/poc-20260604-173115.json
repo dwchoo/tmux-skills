@@ -1,0 +1,21 @@
+{
+  "created_at": "2026-06-04T08:31:15+00:00",
+  "delivered": true,
+  "endpoint": "unix:///Users/dwchoo/project/tmux-skills/.codex/tmux-skills/bridge/sockets/live-poc.sock",
+  "manual_confirmation_note_path": "/Users/dwchoo/project/tmux-skills/.codex/tmux-skills/bridge/poc-20260604-173115.manual.md",
+  "protocol_fixture_path": "/Users/dwchoo/project/tmux-skills/tests/fixtures/app_server_unix_ws/poc-20260604-173115.json",
+  "provisional_delivery": true,
+  "request_sequence": [
+    "initialize",
+    "initialized",
+    "thread/resume",
+    "turn/start"
+  ],
+  "response_id": "3",
+  "resume_error": "JSON-RPC 2 error: {'code': -32600, 'message': 'no rollout found for thread id 019e91c1-2c5e-7c92-a431-d173b8b3c5f5'}",
+  "resume_thread_id": null,
+  "supplied_thread_id": "019e91c1-2c5e-7c92-a431-d173b8b3c5f5",
+  "turn_id": "019e91c2-1170-7673-bcbf-7afe3d6abfe2",
+  "turn_start_thread_id": "019e91c1-2c5e-7c92-a431-d173b8b3c5f5",
+  "validated_at": "2026-06-04T08:43:53+00:00"
+}
