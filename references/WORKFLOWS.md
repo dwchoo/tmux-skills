@@ -48,7 +48,7 @@ python scripts/tmux_control.py manager cancel --stop-worker
 python scripts/tmux_control.py manager cleanup --jobs
 ```
 
-`manager cancel` leaves panes/windows and evidence intact by default. `--stop-worker` is required before cancellation attempts to stop the active worker job. Use `manager cleanup --jobs` after demos or throwaway work to remove the cancelled manager record, dashboard, and manager-owned command/status/log files. Cleanup never closes panes or windows, and refuses a live manager unless `--force` is passed.
+`manager cancel` leaves panes/windows and evidence intact by default. `--stop-worker` is required before cancellation attempts to stop the active worker job. Cancellation is sticky: after `cancel_requested` or `cancelled` is recorded, delayed bridge acknowledgements, terminal notifications, or bridge-check updates must not revive the manager as `waiting_for_codex`, `idle`, or `running`. Use `manager cleanup --jobs` after demos or throwaway work to remove the cancelled manager record, dashboard, and manager-owned command/status/log files. Cleanup never closes panes or windows, and refuses a live manager unless `--force` is passed.
 
 ## Resume or load prior work
 

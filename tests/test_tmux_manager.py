@@ -572,6 +572,67 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(notification["ack_turn_id"], "turn-main")
             self.assertEqual(result["record"]["last_ack"]["event_id"], event_id)
 
+    def test_run_next_refuses_cancelled_manager_without_writing_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["status"] = "cancel_requested"
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.queue_manager_job(
+                manager_id="manager-one",
+                job_id="job-after-cancel",
+                command_text="echo should-not-run",
+                command_file=None,
+                workspace=str(workspace),
+            )
+
+            self.assertFalse(result["queued"])
+            self.assertIn("cancel", result["reason"])
+            self.assertFalse(
+                tmux_manager.manager_command_request_path(paths, "manager-one", "job-after-cancel").exists()
+            )
+
+    def test_bridge_check_delivery_update_does_not_overwrite_cancel_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            record["pending_job"] = None
+            tmux_manager.write_manager_record(paths, record)
+
+            def cancel_then_deliver(*args: object) -> dict[str, object]:
+                latest, _error = tmux_manager.read_manager_record(paths, "manager-one")
+                assert latest is not None
+                latest["status"] = "cancel_requested"
+                latest["cancel_requested_at"] = "cancel-now"
+                latest["pending_job"] = None
+                tmux_manager.write_manager_record(paths, latest)
+                return {"prompt_sha256": "preflight-sha", "event_id": "ignored"}
+
+            with mock.patch.object(tmux_manager.tmux_bridge, "deliver_bridge_candidate", side_effect=cancel_then_deliver):
+                result = tmux_manager.bridge_check_manager(
+                    manager_id="manager-one",
+                    workspace=str(workspace),
+                    ack_timeout_seconds=0,
+                )
+
+            self.assertFalse(result["verified"])
+            self.assertEqual(result["record"]["status"], "cancel_requested")
+            self.assertEqual(result["record"]["cancel_requested_at"], "cancel-now")
+
     def test_manager_cycle_trims_current_job_log_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             workspace = Path(tmp_name) / "workspace"
@@ -593,6 +654,25 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(log_path.read_bytes(), b"6789abcdef")
             self.assertEqual(updated["last_log_trim"]["job_id"], "job-one")
             self.assertEqual(updated["last_log_trim"]["size_after"], 10)
+
+    def test_manager_cycle_keeps_cancelled_record_cancelled_after_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            status = self.build_terminal_status(paths)
+            tmux_state.write_status(tmux_state.status_path(paths, "job-one"), status)
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            record["job_ids"] = ["job-one"]
+            record["status"] = "cancelled"
+
+            with mock.patch.object(tmux_manager, "pane_exists", return_value=True):
+                updated = tmux_manager.manager_cycle(record, paths=paths)
+
+            self.assertEqual(updated["status"], "cancelled")
+            self.assertIsNone(updated["last_terminal_event_id"])
 
     def test_cleanup_manager_removes_manager_and_job_evidence_only_in_state_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -692,6 +772,69 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertEqual(merged["status"], "cancel_requested")
         self.assertEqual(merged["heartbeat_at"], "old-heartbeat")
 
+    def test_write_manager_record_preserves_existing_cancel_over_stale_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            stale = self.build_record(paths)
+            stale["pending_job"] = None
+            stale["status"] = "running"
+            current = dict(stale)
+            current["status"] = "cancel_requested"
+            current["cancel_requested_at"] = "cancel-now"
+            current["pending_job"] = None
+            tmux_manager.write_manager_record(paths, current)
+
+            stale["status"] = "waiting_for_codex"
+            written = tmux_manager.write_manager_record(paths, stale)
+
+            self.assertEqual(written["status"], "cancel_requested")
+            self.assertEqual(written["cancel_requested_at"], "cancel-now")
+
+    def test_external_cancel_update_wins_over_ack_merge(self) -> None:
+        stale = {
+            "manager_id": "manager-one",
+            "status": "waiting_for_codex",
+            "pending_job": None,
+            "heartbeat_at": "old-heartbeat",
+            "last_notification": {
+                "event_id": "evt-one",
+                "status": "awaiting_ack",
+                "acknowledged_by_codex": False,
+            },
+            "notifications": [
+                {
+                    "event_id": "evt-one",
+                    "status": "awaiting_ack",
+                    "acknowledged_by_codex": False,
+                }
+            ],
+        }
+        latest = {
+            "manager_id": "manager-one",
+            "status": "cancel_requested",
+            "pending_job": None,
+            "heartbeat_at": "new-heartbeat",
+            "cancel_requested_at": "cancel-now",
+            "last_ack": {"event_id": "evt-one", "turn_id": "turn-main"},
+            "notifications": [
+                {
+                    "event_id": "evt-one",
+                    "status": "acknowledged",
+                    "acknowledged_by_codex": True,
+                    "ack_turn_id": "turn-main",
+                }
+            ],
+        }
+
+        merged = tmux_manager.merge_external_manager_update(stale, latest)
+
+        self.assertEqual(merged["status"], "cancel_requested")
+        self.assertEqual(merged["cancel_requested_at"], "cancel-now")
+        self.assertEqual(merged["last_ack"]["event_id"], "evt-one")
+        self.assertEqual(merged["last_notification"]["status"], "acknowledged")
+
     def test_external_pending_job_update_wins_over_stale_waiting_record(self) -> None:
         stale = {
             "manager_id": "manager-one",
@@ -729,6 +872,30 @@ class TmuxManagerTests(unittest.TestCase):
             interrupt.assert_not_called()
             self.assertEqual(result["record"]["status"], "cancel_requested")
             self.assertFalse(result["record"]["stop_worker_requested"])
+
+    def test_stop_worker_cancel_updates_existing_cancel_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            record["status"] = "cancelled"
+            record["stop_worker_requested"] = False
+            record["worker_stop_result"] = None
+            tmux_manager.write_manager_record(paths, record)
+
+            with mock.patch.object(
+                tmux_manager,
+                "send_worker_interrupt",
+                return_value={"sent": True, "returncode": 0, "stderr": ""},
+            ):
+                result = tmux_manager.cancel_manager("manager-one", workspace=str(workspace), stop_worker=True)
+
+            self.assertTrue(result["cancelled"])
+            self.assertTrue(result["record"]["stop_worker_requested"])
+            self.assertEqual(result["record"]["worker_stop_result"]["sent"], True)
 
     def test_render_dashboard_to_pane_uses_one_shot_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:

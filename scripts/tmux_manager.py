@@ -22,6 +22,7 @@ import tmux_state
 MANAGER_VERSION = 1
 DEFAULT_MANAGER_LOG_MAX_BYTES = 65536
 MANAGER_STATUSES = {"starting", "idle", "queued", "running", "waiting_for_codex", "cancel_requested", "cancelled", "failed"}
+MANAGER_CANCEL_STATUSES = {"cancel_requested", "cancelled"}
 MANAGER_TERMINAL_JOB_STATUSES = {"succeeded", "failed", "stopped", "timeout", "cancelled", "stale"}
 BRIDGE_VERIFICATION_STATUSES = {"unverified", "awaiting_ack", "verified", "expired", "mismatched_config", "submission_failed"}
 
@@ -183,6 +184,10 @@ def terminal_event_acknowledged(record: dict[str, Any]) -> tuple[bool, str | Non
 
 
 def manager_queue_gate(record: dict[str, Any]) -> tuple[bool, str | None]:
+    if manager_cancel_state(record):
+        if record.get("status") == "cancel_requested":
+            return False, "manager cancellation is requested"
+        return False, "manager is cancelled"
     verified, reason = bridge_receipt_verified(record)
     if not verified:
         return False, reason
@@ -190,6 +195,33 @@ def manager_queue_gate(record: dict[str, Any]) -> tuple[bool, str | None]:
     if not acknowledged:
         return False, reason
     return True, None
+
+
+def manager_cancel_state(record: dict[str, Any] | None) -> bool:
+    return bool(record) and str(record.get("status") or "") in MANAGER_CANCEL_STATUSES
+
+
+def merge_external_cancel_state(record: dict[str, Any], latest: dict[str, Any] | None) -> dict[str, Any]:
+    if not manager_cancel_state(latest):
+        return record
+    merged = dict(record)
+    if latest.get("cancel_requested_at") and not merged.get("cancel_requested_at"):
+        merged["cancel_requested_at"] = latest["cancel_requested_at"]
+    merged["stop_worker_requested"] = bool(record.get("stop_worker_requested") or latest.get("stop_worker_requested"))
+    if record.get("worker_stop_result") is None and latest.get("worker_stop_result") is not None:
+        merged["worker_stop_result"] = latest["worker_stop_result"]
+    merged["status"] = "cancelled" if record.get("status") == "cancelled" else latest.get("status")
+    if latest.get("pending_job") is None:
+        merged["pending_job"] = None
+    return merged
+
+
+def preserve_external_cancel_state(paths: dict[str, Path], record: dict[str, Any]) -> dict[str, Any]:
+    manager_id = str(record.get("manager_id") or "")
+    if not manager_id:
+        return record
+    latest, _latest_error = read_manager_record(paths, manager_id)
+    return merge_external_cancel_state(record, latest)
 
 
 def normalize_manager_record(record: dict[str, Any], paths: dict[str, Path] | None = None, path: Path | None = None) -> dict[str, Any]:
@@ -259,6 +291,8 @@ def read_manager_record(paths: dict[str, Path], manager_id: str) -> tuple[dict[s
 
 def write_manager_record(paths: dict[str, Path], record: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_manager_record(record, paths)
+    current, _error = tmux_state.read_json(manager_record_path(paths, normalized["manager_id"]))
+    normalized = merge_external_cancel_state(normalized, current)
     normalized["updated_at"] = tmux_state.utc_now()
     tmux_state.atomic_write_json(manager_record_path(paths, normalized["manager_id"]), normalized)
     return normalized
@@ -465,6 +499,8 @@ def bridge_check_manager(
     notify = record.get("notify") if isinstance(record.get("notify"), dict) else {"mode": "none"}
     if notify.get("mode") != "bridge":
         return bridge_check_result(record, ack_timeout_seconds=timeout, reason="manager bridge-check requires --notify bridge")
+    if manager_cancel_state(record):
+        return bridge_check_result(record, ack_timeout_seconds=timeout, reason="manager cancellation is requested")
 
     observed_at = tmux_state.utc_now()
     event_id = bridge_check_event_id(record, observed_at)
@@ -507,6 +543,10 @@ def bridge_check_manager(
             "prompt_sha256": prompt_hash,
         },
     )
+    record = preserve_external_cancel_state(paths, record)
+    if manager_cancel_state(record):
+        record = write_manager_record(paths, record)
+        return bridge_check_result(record, ack_timeout_seconds=timeout, reason="manager cancellation is requested")
     record = write_manager_record(paths, record)
 
     bridge_record = {
@@ -517,6 +557,7 @@ def bridge_check_manager(
     try:
         delivery = tmux_bridge.deliver_bridge_candidate(bridge_record, candidate, prompt)
     except Exception as exc:
+        record = preserve_external_cancel_state(paths, record)
         record["bridge_verification"] = dict(record["bridge_verification"]) | {
             "status": "submission_failed",
             "submitted_to_app_server": False,
@@ -538,6 +579,7 @@ def bridge_check_manager(
     latest, _latest_error = read_manager_record(paths, item_id)
     if latest is not None:
         record = merge_external_ack_fields(record, latest)
+    record = preserve_external_cancel_state(paths, record)
     acknowledged = bool((record.get("bridge_verification") or {}).get("acknowledged_by_codex"))
     record["bridge_verification"] = dict(record["bridge_verification"]) | {
         "status": "verified" if acknowledged else "awaiting_ack",
@@ -564,6 +606,8 @@ def bridge_check_manager(
         latest, _latest_error = read_manager_record(paths, item_id)
         if latest is not None:
             record = latest
+        if manager_cancel_state(record):
+            return bridge_check_result(record, ack_timeout_seconds=timeout, reason="manager cancellation is requested")
         verification = record.get("bridge_verification") if isinstance(record.get("bridge_verification"), dict) else {}
         if verification.get("event_id") == event_id and verification.get("status") == "verified" and verification.get("acknowledged_by_codex"):
             return bridge_check_result(record, ack_timeout_seconds=timeout, reason=None)
@@ -606,11 +650,20 @@ def queue_manager_job(
     if not tmux_state.one_line_text(text):
         return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "command is blank"}
 
+    record = preserve_external_cancel_state(paths, record)
+    if manager_cancel_state(record):
+        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager cancellation is requested"}
+
     request_path = write_command_request(paths, record["manager_id"], item_id, str(text))
     record = mark_last_terminal_event_handled(record, next_job_id=item_id)
     record["pending_job"] = build_pending_job(item_id, request_path, cwd)
     record["status"] = "queued"
     record["last_error"] = None
+    record = preserve_external_cancel_state(paths, record)
+    if manager_cancel_state(record):
+        request_path.unlink(missing_ok=True)
+        record = write_manager_record(paths, record)
+        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager cancellation is requested"}
     record = write_manager_record(paths, record)
     return {
         "manager_id": record["manager_id"],
@@ -683,6 +736,7 @@ def ack_manager_event(
             "turn_id": tmux_state.one_line_text(turn_id),
             "note": tmux_state.one_line_text(note),
         }
+        record = preserve_external_cancel_state(paths, record)
         record = write_manager_record(paths, record)
         return {
             "manager_id": item_id,
@@ -725,6 +779,7 @@ def ack_manager_event(
         "turn_id": tmux_state.one_line_text(turn_id),
         "note": tmux_state.one_line_text(note),
     }
+    record = preserve_external_cancel_state(paths, record)
     record = write_manager_record(paths, record)
     return {
         "manager_id": item_id,
@@ -1053,6 +1108,8 @@ def transition_terminal(
 
 def manager_cycle(record: dict[str, Any], *, paths: dict[str, Path]) -> dict[str, Any]:
     record["heartbeat_at"] = tmux_state.utc_now()
+    if record.get("status") == "cancelled":
+        return record
     if record.get("status") == "cancel_requested":
         record["status"] = "cancelled"
         return record
@@ -1118,10 +1175,12 @@ def merge_external_manager_update(record: dict[str, Any], latest: dict[str, Any]
     if not latest:
         return record
     record = merge_external_ack_fields(record, latest)
-    if latest.get("status") == "cancel_requested" and record.get("status") != "cancelled":
-        merged = dict(latest)
+    if manager_cancel_state(latest) and record.get("status") != "cancelled":
+        merged = merge_external_cancel_state(record, latest)
         merged["heartbeat_at"] = record.get("heartbeat_at")
         return merged
+    if manager_cancel_state(record):
+        return record
     if latest.get("pending_job") and not record.get("pending_job") and record.get("status") in {"waiting_for_codex", "idle"}:
         merged = dict(latest)
         merged["heartbeat_at"] = record.get("heartbeat_at")

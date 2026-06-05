@@ -168,7 +168,7 @@ python scripts/tmux_control.py manager cancel --stop-worker
 python scripts/tmux_control.py manager cleanup --jobs
 ```
 
-`manager run-next` starts the first or next job in the same worker pane and returns the Codex-owned manager to `running`. After any terminal event, Codex can submit another `manager run-next` command and the same manager resumes monitoring. `manager cancel` stops the manager loop only by default and leaves the worker job intact; `--stop-worker` is required to ask the active worker job to stop. The reusable manager pane remains available for the next manager start instead of being duplicated.
+`manager run-next` starts the first or next job in the same worker pane and returns the Codex-owned manager to `running`. After any terminal event, Codex can submit another `manager run-next` command and the same manager resumes monitoring. `manager cancel` stops the manager loop only by default and leaves the worker job intact; `--stop-worker` is required to ask the active worker job to stop. Cancellation is a sticky manager intent: once `cancel_requested` or `cancelled` is recorded, delayed bridge acknowledgements, terminal notifications, or bridge-check updates must not return that manager to `waiting_for_codex`, `idle`, or `running`. The reusable manager pane remains available for the next manager start instead of being duplicated.
 
 `manager cleanup` is a separate evidence cleanup step for demos or throwaway managers. By default it removes only the manager record and dashboard. With `--jobs`, it also removes manager-owned command, status, and log files for the manager's recorded jobs. Cleanup refuses to run while the manager process is still alive unless `--force` is used, and it never closes panes or windows.
 
