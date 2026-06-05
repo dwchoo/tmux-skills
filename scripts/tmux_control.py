@@ -25,6 +25,7 @@ from typing import Any
 
 import tmux_state
 import tmux_bridge
+import tmux_manager
 from tmux_text import prompt_like, strip_ansi
 
 
@@ -45,6 +46,8 @@ PANE_FIELDS = [
     "#{pane_dead}",
     "#{pane_width}",
     "#{pane_height}",
+    "#{pane_left}",
+    "#{pane_top}",
     "#{pane_tty}",
 ]
 CURRENT_FIELDS = [
@@ -62,6 +65,8 @@ CURRENT_FIELDS = [
     "#{pane_dead}",
     "#{pane_width}",
     "#{pane_height}",
+    "#{pane_left}",
+    "#{pane_top}",
     "#{pane_tty}",
 ]
 PANE_FORMAT = FIELD_SEP.join(PANE_FIELDS)
@@ -296,6 +301,8 @@ def parse_current_line(line: str) -> dict[str, Any] | None:
         pane_dead,
         pane_width,
         pane_height,
+        pane_left,
+        pane_top,
         pane_tty,
     ) = parts
     return enrich_pane_processes(
@@ -314,6 +321,8 @@ def parse_current_line(line: str) -> dict[str, Any] | None:
             "pane_dead": pane_dead == "1",
             "pane_width": parse_int(pane_width),
             "pane_height": parse_int(pane_height),
+            "pane_left": parse_int(pane_left),
+            "pane_top": parse_int(pane_top),
             "pane_tty": pane_tty,
         }
     )
@@ -338,6 +347,8 @@ def parse_pane_line(line: str, *, current_pane_id: str | None = None) -> dict[st
         pane_dead,
         pane_width,
         pane_height,
+        pane_left,
+        pane_top,
         pane_tty,
     ) = parts
     return enrich_pane_processes(
@@ -357,6 +368,8 @@ def parse_pane_line(line: str, *, current_pane_id: str | None = None) -> dict[st
             "pane_dead": pane_dead == "1",
             "pane_width": parse_int(pane_width),
             "pane_height": parse_int(pane_height),
+            "pane_left": parse_int(pane_left),
+            "pane_top": parse_int(pane_top),
             "pane_tty": pane_tty,
         }
     )
@@ -950,6 +963,421 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
     if not send_result.get("sent_to_pane", False):
         finalize_send_failure(send_result.get("reason"), result)
     return result
+
+
+def default_manager_id(paths: dict[str, Path], current: dict[str, Any] | None = None) -> str:
+    parts = ["manager", paths["workspace"].name or "workspace"]
+    if current:
+        parts.append(str(current.get("session_name") or "session"))
+        parts.append(str(current.get("window_id") or current.get("window_index") or "window"))
+    else:
+        parts.append("default")
+    return tmux_manager.manager_id_value("-".join(parts))
+
+
+def resolve_manager_id_arg(
+    value: str | None,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    current: dict[str, Any] | None = None,
+) -> str:
+    if tmux_state.one_line_text(value):
+        return tmux_manager.manager_id_value(value)
+    paths = tmux_manager.manager_paths(workspace, state_dir)
+    if current is None and inside_tmux():
+        current = current_info()
+    return default_manager_id(paths, current)
+
+
+def pane_number(pane: dict[str, Any], key: str) -> int:
+    value = pane.get(key)
+    return value if isinstance(value, int) else 0
+
+
+def panes_same_window(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return (
+        left.get("session_name") == right.get("session_name")
+        and left.get("window_id") == right.get("window_id")
+    )
+
+
+def horizontal_overlap(left: dict[str, Any], right: dict[str, Any]) -> int:
+    left_start = pane_number(left, "pane_left")
+    left_end = left_start + pane_number(left, "pane_width")
+    right_start = pane_number(right, "pane_left")
+    right_end = right_start + pane_number(right, "pane_width")
+    return max(0, min(left_end, right_end) - max(left_start, right_start))
+
+
+def pane_is_reusable_idle(pane_id: str | None) -> bool:
+    if not tmux_state.one_line_text(pane_id):
+        return False
+    info = current_info(str(pane_id))
+    if not info or info.get("pane_dead"):
+        return False
+    check = idle_shell_check(str(pane_id))
+    return bool(check.get("ok"))
+
+
+def find_idle_pane_below(
+    base: dict[str, Any],
+    panes: list[dict[str, Any]],
+    *,
+    exclude_ids: set[str],
+) -> dict[str, Any] | None:
+    base_bottom = pane_number(base, "pane_top") + pane_number(base, "pane_height")
+    base_left = pane_number(base, "pane_left")
+    candidates: list[tuple[int, int, int, dict[str, Any]]] = []
+    for pane in panes:
+        pane_id = str(pane.get("pane_id") or "")
+        if not pane_id or pane_id in exclude_ids or pane.get("pane_dead"):
+            continue
+        if not panes_same_window(base, pane):
+            continue
+        overlap = horizontal_overlap(base, pane)
+        if overlap <= 0:
+            continue
+        gap = pane_number(pane, "pane_top") - base_bottom
+        if gap < 0 or gap > 2:
+            continue
+        if not pane_is_reusable_idle(pane_id):
+            continue
+        candidates.append((gap, abs(pane_number(pane, "pane_left") - base_left), -overlap, pane))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[:3])
+    return candidates[0][3]
+
+
+def pane_is_below_base(pane: dict[str, Any], base: dict[str, Any]) -> bool:
+    if not panes_same_window(base, pane):
+        return False
+    base_bottom = pane_number(base, "pane_top") + pane_number(base, "pane_height")
+    gap = pane_number(pane, "pane_top") - base_bottom
+    return 0 <= gap <= 2 and horizontal_overlap(base, pane) > 0
+
+
+def pane_is_tall_side_worker(pane: dict[str, Any], base: dict[str, Any]) -> bool:
+    if not panes_same_window(base, pane):
+        return False
+    base_right = pane_number(base, "pane_left") + pane_number(base, "pane_width")
+    pane_left = pane_number(pane, "pane_left")
+    if pane_left < base_right - 2:
+        return False
+    if pane_number(pane, "pane_top") > pane_number(base, "pane_top") + 2:
+        return False
+    return pane_number(pane, "pane_height") >= pane_number(base, "pane_height")
+
+
+def find_idle_tall_worker_pane(
+    base: dict[str, Any],
+    panes: list[dict[str, Any]],
+    *,
+    exclude_ids: set[str],
+) -> dict[str, Any] | None:
+    base_right = pane_number(base, "pane_left") + pane_number(base, "pane_width")
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    for pane in panes:
+        pane_id = str(pane.get("pane_id") or "")
+        if not pane_id or pane_id in exclude_ids or pane.get("pane_dead"):
+            continue
+        if not pane_is_tall_side_worker(pane, base):
+            continue
+        if not pane_is_reusable_idle(pane_id):
+            continue
+        candidates.append((abs(pane_number(pane, "pane_left") - base_right), -pane_number(pane, "pane_height"), pane))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[:2])
+    return candidates[0][2]
+
+
+def reusable_record_pane(
+    record: dict[str, Any] | None,
+    key: str,
+    anchor: dict[str, Any],
+    *,
+    exclude_ids: set[str],
+    validator: Any | None = None,
+) -> dict[str, Any] | None:
+    if not record:
+        return None
+    pane_id = str(record.get(key) or "")
+    if not pane_id or pane_id in exclude_ids:
+        return None
+    pane = current_info(pane_id)
+    if not pane or pane.get("pane_dead") or not panes_same_window(anchor, pane):
+        return None
+    if validator and not validator(pane, anchor):
+        return None
+    if not pane_is_reusable_idle(pane_id):
+        return None
+    return pane
+
+
+def split_pane(cwd: Path, *, target: str, vertical: bool, percent: int, full_size: bool = False) -> tuple[str, str, str]:
+    tmux_args = [
+        "split-window",
+        "-v" if vertical else "-h",
+    ]
+    if full_size:
+        tmux_args.append("-f")
+    tmux_args.extend(
+        [
+            "-p",
+            str(percent),
+            "-P",
+            "-F",
+            SPAWN_FORMAT,
+            "-c",
+            str(cwd),
+            "-t",
+            target,
+        ]
+    )
+    result = run_tmux(
+        tmux_args
+    )
+    session_name, window_id, pane_id = split_tmux_fields(result.stdout.strip())
+    return session_name, window_id, pane_id
+
+
+def layout_from_existing_manager_record(record: dict[str, Any], cwd: Path) -> dict[str, Any]:
+    manager_pane_id = str(record.get("manager_pane_id") or "")
+    worker_pane_id = str(record.get("worker_pane_id") or "")
+    pane = None
+    if manager_pane_id:
+        pane = current_info(manager_pane_id)
+    if pane is None and worker_pane_id:
+        pane = current_info(worker_pane_id)
+    pane = pane or {}
+    session_name = str(pane.get("session_name") or "")
+    window_id = str(pane.get("window_id") or "")
+    window_index = str(pane.get("window_index") or "")
+    target = f"{session_name}:{window_index}" if session_name and window_index else ""
+    return {
+        "session_name": session_name,
+        "window_id": window_id,
+        "manager_window_id": window_id,
+        "worker_pane_id": worker_pane_id,
+        "manager_pane_id": manager_pane_id,
+        "manager_reused": True,
+        "worker_reused": True,
+        "target": target,
+        "cwd": str(cwd),
+        "attach_command": record.get("attach_command"),
+        "tmux_tmpdir": tmux_tmpdir_value(),
+    }
+
+
+def manager_layout(
+    cwd: Path,
+    *,
+    paths: dict[str, Path] | None = None,
+    manager_id: str | None = None,
+    existing_record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    attach_command = None
+    original_pane_id = None
+    if inside_tmux():
+        current = current_info()
+        original_pane_id = current.get("pane_id") if current else None
+        target = current_window_target()
+    else:
+        session, target = ensure_managed_target(cwd)
+        tmpdir = tmux_tmpdir_value()
+        attach_command = f"TMUX_TMPDIR={tmpdir} tmux attach -t {session}" if tmpdir else f"tmux attach -t {session}"
+        current = current_info(target)
+
+    if not current:
+        die("could not resolve current tmux pane for manager layout")
+    if existing_record is None and paths and manager_id:
+        existing_record, _error = tmux_manager.read_manager_record(paths, manager_id)
+
+    codex_pane_id = str(current.get("pane_id") or "")
+    panes = panes_for_target(target, current_pane_id=codex_pane_id)
+    session_name = str(current.get("session_name") or "")
+    window_id = str(current.get("window_id") or "")
+
+    worker_reused = False
+    worker_pane = reusable_record_pane(
+        existing_record,
+        "worker_pane_id",
+        current,
+        exclude_ids={codex_pane_id},
+        validator=pane_is_tall_side_worker,
+    )
+    if worker_pane is None:
+        worker_pane = find_idle_tall_worker_pane(current, panes, exclude_ids={codex_pane_id})
+    if worker_pane is None:
+        session_name, window_id, worker_pane_id = split_pane(
+            cwd,
+            target=codex_pane_id,
+            vertical=False,
+            percent=50,
+            full_size=True,
+        )
+    else:
+        worker_pane_id = str(worker_pane["pane_id"])
+        worker_reused = True
+
+    current = current_info(codex_pane_id) or current
+    panes = panes_for_target(target, current_pane_id=codex_pane_id)
+
+    manager_reused = False
+    manager_pane = reusable_record_pane(
+        existing_record,
+        "manager_pane_id",
+        current,
+        exclude_ids={codex_pane_id, worker_pane_id},
+        validator=pane_is_below_base,
+    )
+    if manager_pane is None:
+        manager_pane = find_idle_pane_below(current, panes, exclude_ids={codex_pane_id, worker_pane_id})
+    if manager_pane is None:
+        session_name, window_id, manager_pane_id = split_pane(cwd, target=codex_pane_id, vertical=True, percent=20)
+        manager_window_id = window_id
+    else:
+        manager_pane_id = str(manager_pane["pane_id"])
+        manager_window_id = str(manager_pane.get("window_id") or window_id)
+        manager_reused = True
+
+    if original_pane_id:
+        run_tmux(["select-pane", "-t", original_pane_id], check=False)
+    return {
+        "session_name": session_name,
+        "window_id": window_id,
+        "manager_window_id": manager_window_id,
+        "worker_pane_id": worker_pane_id,
+        "manager_pane_id": manager_pane_id,
+        "manager_reused": manager_reused,
+        "worker_reused": worker_reused,
+        "target": target,
+        "cwd": str(cwd),
+        "attach_command": attach_command,
+        "tmux_tmpdir": tmux_tmpdir_value(),
+    }
+
+
+def manager_start(args: argparse.Namespace) -> dict[str, Any]:
+    if not tmux_state.one_line_text(args.job_id):
+        return {"manager_id": args.manager_id, "started": False, "status": "failed", "reason": "manager start requires nonblank --job-id"}
+    job_id = tmux_state.safe_id(args.job_id)
+    try:
+        notify = tmux_manager.normalize_notify(args.notify, args.thread_id, args.endpoint)
+    except Exception as exc:
+        return {"manager_id": args.manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": str(exc)}
+
+    command_text, command_error = tmux_manager.command_text_from_source(args.command_text, args.command_file)
+    if command_error:
+        return {"manager_id": args.manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": command_error}
+    if not tmux_state.one_line_text(command_text):
+        return {"manager_id": args.manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": "command is blank"}
+
+    paths = tmux_manager.manager_paths(args.workspace, args.state_dir)
+    cwd = Path(args.cwd).expanduser().resolve() if args.cwd else paths["workspace"]
+    current = current_info() if inside_tmux() else None
+    try:
+        manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir, current)
+    except Exception as exc:
+        return {"manager_id": args.manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": str(exc)}
+    existing_record, record_error = tmux_manager.read_manager_record(paths, manager_id)
+    if record_error:
+        return {"manager_id": manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": record_error}
+    if existing_record and existing_record.get("pending_job"):
+        return {"manager_id": manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": "manager already has a pending job"}
+    if existing_record and existing_record.get("status") == "running":
+        return {"manager_id": manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": "manager is already running a job"}
+    existing_manager_alive = False
+    if existing_record and existing_record.get("status") in {"starting", "queued", "waiting_for_codex"}:
+        existing_manager_alive = pid_is_running(parse_int(str(existing_record.get("manager_pid") or "")))
+
+    if existing_manager_alive and existing_record:
+        layout = layout_from_existing_manager_record(existing_record, cwd)
+    else:
+        layout = manager_layout(cwd, paths=paths, manager_id=manager_id, existing_record=existing_record)
+    request_path = tmux_manager.write_command_request(paths, manager_id, job_id, str(command_text))
+    pending_job = tmux_manager.build_pending_job(job_id, request_path, str(cwd))
+    if existing_record:
+        record = dict(existing_record)
+        record.update(
+            {
+                "status": "queued",
+                "manager_pane_id": layout["manager_pane_id"],
+                "worker_pane_id": layout["worker_pane_id"],
+                "pending_job": pending_job,
+                "notify": notify,
+                "workspace": str(paths["workspace"]),
+                "state_dir": str(paths["root"]),
+                "attach_command": layout.get("attach_command"),
+                "poll_seconds": args.poll_seconds,
+                "manager_process_mode": "foreground",
+                "last_error": None,
+            }
+        )
+        if not existing_manager_alive:
+            record["manager_pid"] = os.getpid()
+            record["manager_process_started_at"] = tmux_state.utc_now()
+        record = tmux_manager.normalize_manager_record(record, paths)
+    else:
+        record = tmux_manager.build_manager_record(
+            manager_id=manager_id,
+            manager_pane_id=layout["manager_pane_id"],
+            worker_pane_id=layout["worker_pane_id"],
+            pending_job=pending_job,
+            notify=notify,
+            workspace=str(paths["workspace"]),
+            state_dir=str(paths["root"]),
+            attach_command=layout.get("attach_command"),
+            poll_seconds=args.poll_seconds,
+        )
+    record = tmux_manager.write_manager_record(paths, record)
+    dashboard_path = Path(str(record["dashboard_path"]))
+    tmux_manager.write_dashboard_file(dashboard_path, tmux_manager.dashboard_text(record))
+    return {
+        "manager_id": manager_id,
+        "job_id": job_id,
+        "started": True,
+        "status": record["status"],
+        "manager_path": record["manager_path"],
+        "dashboard_path": record["dashboard_path"],
+        "manager_process_mode": record.get("manager_process_mode") or "foreground",
+        "start_process_mode": "existing" if existing_manager_alive else "foreground",
+        "queued_on_existing_manager": existing_manager_alive,
+        "command_request_path": str(request_path),
+        "workspace": str(paths["workspace"]),
+        "state_dir": str(paths["root"]),
+        "record": record,
+        **layout,
+    }
+
+
+def manager(args: argparse.Namespace) -> dict[str, Any]:
+    if args.manager_action == "start":
+        return manager_start(args)
+    if args.manager_action == "status":
+        manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
+        return tmux_manager.manager_status(manager_id, args.workspace, args.state_dir)
+    if args.manager_action == "run-next":
+        manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
+        return tmux_manager.queue_manager_job(
+            manager_id=manager_id,
+            job_id=args.job_id,
+            command_text=args.command_text,
+            command_file=args.command_file,
+            workspace=args.workspace,
+            state_dir=args.state_dir,
+            cwd=args.cwd,
+        )
+    if args.manager_action == "cancel":
+        manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
+        return tmux_manager.cancel_manager(
+            manager_id,
+            workspace=args.workspace,
+            state_dir=args.state_dir,
+            stop_worker=args.stop_worker,
+        )
+    die(f"unknown manager command: {args.manager_action}")
 
 
 def monitor(args: argparse.Namespace) -> dict[str, Any]:
@@ -3180,7 +3608,14 @@ def resolve(args: argparse.Namespace) -> dict[str, Any]:
 
 def print_json(data: Any) -> None:
     try:
-        print(json.dumps(data, indent=2, sort_keys=True))
+        print(json.dumps(data, indent=2, sort_keys=True), flush=True)
+    except BrokenPipeError:
+        raise SystemExit(0)
+
+
+def print_json_line(data: Any) -> None:
+    try:
+        print(json.dumps(data, sort_keys=True), flush=True)
     except BrokenPipeError:
         raise SystemExit(0)
 
@@ -3267,6 +3702,43 @@ def build_parser() -> argparse.ArgumentParser:
         default="succeeded",
         help="Job terminal state that makes the follow-up task ready",
     )
+
+    manager_parser = subparsers.add_parser("manager", help="Start or inspect a visible long-task manager pane")
+    manager_subparsers = manager_parser.add_subparsers(dest="manager_action", required=True)
+    manager_start_parser = manager_subparsers.add_parser("start", help="Start a visible manager dashboard and worker pane")
+    manager_start_parser.add_argument("--manager-id")
+    manager_start_parser.add_argument("--job-id", required=True)
+    manager_start_command = manager_start_parser.add_mutually_exclusive_group(required=True)
+    manager_start_command.add_argument("--command", dest="command_text")
+    manager_start_command.add_argument("--command-file")
+    manager_start_parser.add_argument("--notify", choices=["bridge", "none"], default="bridge")
+    manager_start_parser.add_argument("--thread-id")
+    manager_start_parser.add_argument("--endpoint")
+    manager_start_parser.add_argument("--cwd")
+    manager_start_parser.add_argument("--workspace")
+    manager_start_parser.add_argument("--state-dir")
+    manager_start_parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
+
+    manager_status_parser = manager_subparsers.add_parser("status", help="Show one manager record")
+    manager_status_parser.add_argument("--manager-id")
+    manager_status_parser.add_argument("--workspace")
+    manager_status_parser.add_argument("--state-dir")
+
+    manager_next_parser = manager_subparsers.add_parser("run-next", help="Queue follow-up work for a manager")
+    manager_next_parser.add_argument("--manager-id")
+    manager_next_parser.add_argument("--job-id", required=True)
+    manager_next_command = manager_next_parser.add_mutually_exclusive_group(required=True)
+    manager_next_command.add_argument("--command", dest="command_text")
+    manager_next_command.add_argument("--command-file")
+    manager_next_parser.add_argument("--cwd")
+    manager_next_parser.add_argument("--workspace")
+    manager_next_parser.add_argument("--state-dir")
+
+    manager_cancel_parser = manager_subparsers.add_parser("cancel", help="Stop a manager dashboard loop")
+    manager_cancel_parser.add_argument("--manager-id")
+    manager_cancel_parser.add_argument("--stop-worker", action="store_true")
+    manager_cancel_parser.add_argument("--workspace")
+    manager_cancel_parser.add_argument("--state-dir")
 
     monitor_parser = subparsers.add_parser("monitor", help="Start a background single-trigger pane monitor")
     monitor_parser.add_argument("--pane", required=True, help="Stable tmux pane ID, such as %%3")
@@ -3553,6 +4025,36 @@ def main() -> None:
         print_json(result)
         if not result.get("sent"):
             raise SystemExit(2)
+    elif args.action == "manager":
+        result = manager(args)
+        if args.manager_action == "start":
+            print_json_line(result)
+        else:
+            print_json(result)
+        if args.manager_action == "start" and not result.get("started"):
+            raise SystemExit(2)
+        if args.manager_action == "run-next" and not result.get("queued"):
+            raise SystemExit(2)
+        if args.manager_action == "cancel" and not result.get("cancelled"):
+            raise SystemExit(2)
+        if args.manager_action == "start" and result.get("start_process_mode") != "existing":
+            loop_args = argparse.Namespace(
+                manager_id=result["manager_id"],
+                workspace=result["workspace"],
+                state_dir=result["state_dir"] if "state_dir" in result else (result.get("record") or {}).get("state_dir"),
+                poll_seconds=args.poll_seconds,
+                dashboard_file=result.get("dashboard_path"),
+            )
+            try:
+                raise SystemExit(tmux_manager.dashboard_loop(loop_args))
+            except KeyboardInterrupt:
+                paths = tmux_manager.manager_paths(loop_args.workspace, loop_args.state_dir)
+                record, _error = tmux_manager.read_manager_record(paths, loop_args.manager_id)
+                if record is not None:
+                    record["status"] = "cancelled"
+                    record["cancel_requested_at"] = tmux_state.utc_now()
+                    tmux_manager.write_manager_record(paths, record)
+                raise SystemExit(130)
     elif args.action == "monitor":
         if not args.match_regex and not args.idle_shell and args.timeout_seconds is None:
             die("monitor requires --match-regex, --idle-shell, or --timeout-seconds")

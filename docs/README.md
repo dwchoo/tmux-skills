@@ -13,7 +13,6 @@ This directory is the LLM wiki for tmux-skills. It is the canonical place for de
 | Choose the right workflow or feature | [`workflows-and-features.md`](workflows-and-features.md) |
 | Work on managed `watch` or queue behavior | [`managed-workers.md`](managed-workers.md) |
 | Validate real tmux lifecycle behavior | [`real-use-e2e.md`](real-use-e2e.md) |
-| Install or update Codex hooks | [`../references/HOOKS.md`](../references/HOOKS.md) |
 | Copy common workflows | [`../references/WORKFLOWS.md`](../references/WORKFLOWS.md) |
 
 ## Maintenance rules

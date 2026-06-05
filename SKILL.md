@@ -6,7 +6,7 @@ description: Use when Codex needs to operate tmux sessions, windows, or panes; r
 # tmux Control
 
 ## Purpose
-Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over pane positions, keep user-owned tmux state intact, and use status files plus Codex command hooks for long-running jobs.
+Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over pane positions, keep user-owned tmux state intact, and use status files plus visible manager panes for long-running jobs.
 
 ## Quick Start
 1. Run `python scripts/tmux_control.py current` to identify the tmux socket, session, window, and pane that commands will use.
@@ -16,12 +16,13 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 5. Resolve human pane references before acting, for example `python scripts/tmux_control.py resolve --current-window --pane-index 3`.
 6. Send commands with `python scripts/tmux_control.py send --pane <pane_id> --command '<command>' --enter --require-idle-shell` unless the pane is explicitly intended to receive input while busy.
 7. Capture results with `python scripts/tmux_control.py capture --pane <pane_id> --lines 200`; add `--strip-ansi` for tqdm/color/control-heavy output.
-8. For long-running commands, use `python scripts/tmux_control.py run --pane <pane_id> --command '<command>'` so completion/failure is recorded under `.codex/tmux-skills`.
-9. For delayed checks or follow-up submissions, use managed `watch`, `queue-after-idle`, or `queue-after-status` instead of raw shell `sleep` watchers.
-10. Add resume-only follow-up instructions with `run --next-instruction TEXT`, `run --next-instruction-file PATH`, or anchored `task add --after-job JOB_ID|--after-event EVENT_ID`.
-11. Use `autopilot start` only when a Codex Desktop heartbeat will wake this thread to continue bounded repair work later.
-12. Use `bridge register|start|status|cancel` only after the PoC app-server same-thread wake gate has passed for the workspace/thread.
-13. Summarize the important output and continue with code edits or further tmux commands only when the result supports it.
+8. For long-running commands that should remain visible, use `python scripts/tmux_control.py manager start [--manager-id <id>] --job-id <id> --command '<command>' --notify bridge --thread-id THREAD --endpoint unix://PATH`.
+9. Use `python scripts/tmux_control.py run --pane <pane_id> --command '<command>'` when you only need a managed worker status/log record for an already selected pane.
+10. For delayed checks or follow-up submissions, use managed `watch`, `queue-after-idle`, or `queue-after-status` instead of raw shell `sleep` watchers.
+11. Add resume-only follow-up instructions with `run --next-instruction TEXT`, `run --next-instruction-file PATH`, or anchored `task add --after-job JOB_ID|--after-event EVENT_ID`.
+12. Use `autopilot start` only when a Codex Desktop heartbeat will wake this thread to continue bounded repair work later.
+13. Use `bridge register|start|status|cancel` only after the PoC app-server same-thread wake gate has passed for the workspace/thread.
+14. Summarize the important output and continue with code edits or further tmux commands only when the result supports it.
 
 ## Target Selection
 - Prefer the current tmux session/window when `$TMUX` is set. Every process that the user should observe, including long-running scripts, managed watches, queues, Autopilot attempts, and bridge daemons, should run in that session by default.
@@ -58,12 +59,21 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 - Require this subagent format: `Can judge`, `Key conclusion`, `Important verbatim excerpts`, `Errors or risks`, `Recommended next action`, `Uncertainty`.
 - If the subagent cannot judge confidently, capture the relevant pane output in the main agent and inspect it directly.
 
-## Long-Running Jobs and Hooks
+## Long-Running Jobs and Managers
 - `run` stores command files, logs, status JSON, and acknowledgements in `.codex/tmux-skills` by default.
 - Prefer `python scripts/tmux_control.py run` for long-running commands. If the helper is unavailable and a manual raw tmux fallback is required, launch the installed wrapper from the skill directory: `tmux new-session -d -s <job_id> "cd ~/.codex/skills/tmux-control && bash scripts/run_managed_job.sh <workspace>/logs/jobs/<job_id> <command> <args...>"`.
 - The fallback wrapper preserves `command.sh`, combined `stdout.log`, `status.json`, `exitcode`, `started_at`, `finished_at`, and direct child `pid`; it executes argv without shell re-parsing and does not create `stderr.log`.
 - Managed worker contracts are canonical in [docs/managed-workers.md](docs/managed-workers.md).
 - Real-use E2E coverage is canonical in [docs/real-use-e2e.md](docs/real-use-e2e.md).
+- The default long-task workflow is one Codex-owned foreground manager process plus one long worker pane and one compact manager pane. Keep `manager start` running so Codex `/ps` can show it; if Codex exits, the manager exits too.
+- When no worker pane is already assigned, split the current Codex pane vertically first so the worker gets a tall right-side pane for readable long output. Then place only the compact manager dashboard below the Codex pane.
+- The manager pane is a reusable dashboard/control surface, not a tmux-resident manager loop. If an idle pane already exists directly below the current Codex pane, reuse it; otherwise split once below Codex.
+- If the same manager process is already alive, a repeated `manager start` queues work to that process and exits instead of starting a second manager loop.
+- The manager process starts worker jobs through `tmux_control.py run` and updates dashboard text without leaving a persistent tmux renderer process. Worker jobs run in the tmux worker pane and continue if the Codex-owned manager exits.
+- When a manager observes `succeeded`, `failed`, `stopped`, `timeout`, `cancelled`, `stale`, or a missing worker pane, it records `waiting_for_codex`, sends at most one bridge notification for that terminal event, and waits for main Codex to inspect paths and decide the next action.
+- To verify it is monitoring, inspect `manager status`: `heartbeat_at` advances while alive, `last_terminal_event_id` records the terminal event, and `notified_event_ids` contains that event once. To verify Codex wake delivery, inspect `last_notification.delivered`, `delivery.response_id`, `delivery.turn_id`, and `prompt_sha256`; `--notify none` intentionally has no Codex delivery.
+- A single manager record owns multiple `job_id` entries in the current workspace/window. `manager run-next` starts follow-up work in the same worker pane and manager dashboard. `manager cancel` stops only the manager by default; `--stop-worker` is required before it attempts to stop the active worker job.
+- `manager start --notify bridge` requires `--thread-id` and `--endpoint unix://PATH` before starting work. Use `--notify none` for visible-dashboard-only mode.
 - `watch`, `queue-after-idle`, and `queue-after-status` store managed worker records in `.codex/tmux-skills/jobs`; inspect them with compact output first, for example `watch list --compact --no-observed-tail` or `job status --compact`.
 - Use `queue-after-idle` when the next command should run only after a busy pane returns to an idle shell.
 - Use `queue-after-status` when a status TSV must reach required row states before the next command is submitted.
@@ -72,16 +82,16 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 - Use `job gc --stale` or `watch gc --stale` when `effective_status` shows dead, orphaned, or stale managed workers. GC marks records as stale and preserves evidence.
 - Use `--include-pane-state` when status, cancel, or GC output should report whether the target pane still exists. Do not close panes or windows unless the user explicitly asks.
 - `run --next-instruction`, `run --next-instruction-file`, and anchored `task add` store Codex instructions in `.codex/tmux-skills/tasks`; they do not execute while Codex is absent.
-- Codex hooks do not directly observe independent tmux jobs. Use `SessionStart`, `UserPromptSubmit`, and `Stop` command hooks to read status files.
-- `SessionStart` resume/compact context can expose ready follow-up tasks. A new startup should use explicit `task load --for-skill` instead of auto-running prior work.
-- `Stop` can continue a current turn for an unacknowledged terminal event or ready task; hooks do not wake a dormant thread by themselves.
+- Use visible manager panes, status files, and explicit `task load --for-skill` when resuming prior work.
+- A new startup should inspect prior work explicitly with `task load --for-skill` instead of auto-running prior work.
+- Status files do not wake a dormant Codex thread by themselves.
 - `autopilot` objectives do not wake Codex by themselves. Pair them with a current-thread Codex Desktop heartbeat using `autopilot heartbeat-prompt`.
 - `bridge` observes terminal events and ready tasks under `.codex/tmux-skills` and wakes a user-specified main Codex thread through the same local `codex app-server`.
 - Bridge wake prompts are path-only. They include workspace/job/status/task/log paths, but never status/log summaries, task instruction bodies, traceback text, diagnosis, suggested commands, or retry instructions.
 - Bridge v1 uses stdlib WebSocket-over-Unix transport for explicit `unix://PATH` endpoints only. It does not call the OpenAI API directly, require `OPENAI_API_KEY`, discover threads, run standalone `codex`, run `codex app-server proxy`, run `codex exec resume`, call `turn/steer`, call `thread/shellCommand`, or send keys to tmux panes.
 - Autopilot uses adaptive context: start with `tick --for-agent --max-chars 1200`, then use bounded `autopilot evidence` only when the summary is insufficient.
 - Autopilot bounded repair allows workspace diagnostics, code/config edits, focused tests, and rerun. Block before destructive cleanup, force git operations, push/deploy, dependency installation, secrets/auth changes, or expanding to higher-cost/longer training.
-- Use `references/HOOKS.md` for copyable hook snippets and `references/WORKFLOWS.md` for examples.
+- Use `references/WORKFLOWS.md` for copyable examples.
 
 ## Safety Rules
 - Run ordinary long-running commands when the user asks for tmux execution.
@@ -102,6 +112,10 @@ python scripts/tmux_control.py spawn [--target SESSION:WINDOW] [--cwd PATH] [--v
 python scripts/tmux_control.py new-window --cwd PATH [--target SESSION] [--name NAME]
 python scripts/tmux_control.py send --pane PANE_ID --command TEXT [--require-idle-shell] [--strict-preflight] [--bash-if-not-executable] (--enter|--no-enter)
 python scripts/tmux_control.py run --pane PANE_ID (--command TEXT|--command-file PATH) [--job-id ID] [(--next-instruction TEXT|--next-instruction-file PATH)] [--next-on succeeded|failed|terminal]
+python scripts/tmux_control.py manager start [--manager-id ID] --job-id ID (--command TEXT|--command-file PATH) [--notify bridge --thread-id THREAD --endpoint unix://PATH|--notify none]
+python scripts/tmux_control.py manager status [--manager-id ID]
+python scripts/tmux_control.py manager run-next [--manager-id ID] --job-id ID (--command TEXT|--command-file PATH)
+python scripts/tmux_control.py manager cancel [--manager-id ID] [--stop-worker]
 python scripts/tmux_control.py watch --job-id ID --pane PANE_ID [--interval N] [--capture-lines N] [--status-lines N] [--status-max-chars N] [--status-file PATH] [--low-token] [--timeout-seconds N] [--replace] [--allow-duplicate]
 python scripts/tmux_control.py watch list [--compact] [--no-observed-tail] [--max-chars N]
 python scripts/tmux_control.py watch status|cancel --job-id ID [--compact] [--include-pane-state]

@@ -13,6 +13,36 @@ Blank command text, whitespace-only command files, blank `--command-file` paths,
 
 For `queue-after-status`, the status file path and row specs must be nonblank; blank row specs are never treated as wildcard matches.
 
+## Visible manager long task
+
+```bash
+python scripts/tmux_control.py manager start --job-id train-1 --command "python train.py" --notify bridge --thread-id THREAD --endpoint unix://"$PWD/.codex/tmux-skills/bridge/sockets/codex-bridge.sock"
+```
+
+Use this as the default long-task workflow when the manager process should remain visible to Codex `/ps`, worker output should stay readable in a long side pane, and one reusable compact manager pane should remain visible below Codex in tmux. Inside tmux it uses the current session/window. Outside tmux it creates a normal visible default-socket session and prints the `tmux attach -t SESSION` command.
+
+`manager start` is foreground and Codex-owned by default. Keep the command running so Codex `/ps` can report it. If Codex exits, this manager loop exits too; worker jobs already submitted to the tmux worker pane continue independently.
+
+The manager writes `.codex/tmux-skills/managers/<manager_id>.json`, starts the worker through `tmux_control.py run`, and updates the reusable manager pane with heartbeat, status path, log path, task path, and worker pane details. The manager pane must not run a persistent renderer loop. On success, failure, stop, timeout, cancellation, stale status, or missing worker pane, the Codex-owned process stays alive as `waiting_for_codex`.
+
+When no worker pane is assigned, `manager start` splits Codex vertically first so the worker gets a tall right-side pane. Only the compact manager pane is placed below Codex. Repeated starts reuse the idle manager pane directly below Codex and reuse an existing idle tall worker pane when possible. A single manager record owns multiple job ids instead of creating a new manager for each job.
+By default the manager id is stable per workspace/session/window. Pass `--manager-id` only when you need an explicit compatibility id.
+If that manager process is already alive, another `manager start` queues the new job to the live process and exits instead of creating a second manager loop.
+
+Bridge notifications are path-only and are sent once per terminal event. They include workspace, manager path, job/status/log/task paths, and no status summaries, log excerpts, task instruction bodies, diagnosis, retry commands, or model/delegation text. `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH`; use `--notify none` for dashboard-only mode.
+Use `manager status` to verify the loop: `heartbeat_at` advances while alive, `last_terminal_event_id` records the observed terminal event, and `notified_event_ids` contains that event once. Bridge delivery success appears in `last_notification.delivered`, `delivery.response_id`, `delivery.turn_id`, and `prompt_sha256`; delivery failure appears as `last_notification.error`.
+
+Follow-up and cancellation:
+
+```bash
+python scripts/tmux_control.py manager status
+python scripts/tmux_control.py manager run-next --job-id train-2 --command "python eval.py"
+python scripts/tmux_control.py manager cancel
+python scripts/tmux_control.py manager cancel --stop-worker
+```
+
+`manager cancel` leaves panes/windows intact by default. `--stop-worker` is required before cancellation attempts to stop the active worker job.
+
 ## Resume or load prior work
 
 ```bash
@@ -21,7 +51,8 @@ python scripts/tmux_control.py task next --json
 python scripts/tmux_control.py task claim --task-id TASK_ID
 ```
 
-Use `task load --for-skill` in a new Codex session to quickly understand prior tmux work. In a resumed Codex CLI session, the `SessionStart` hook can inject the same ready-task clue automatically.
+Use `task load --for-skill` in a new Codex session to quickly understand prior tmux work. This is the explicit resume path for ready tasks, recent jobs, running managed workers, and stale records.
+Use `task next --json` when you need the next ready task in machine-readable form.
 
 Use `--max-items N` with a positive integer when you need a shorter load report.
 Text task reports compact multiline fields and bound long task instructions or output tails; use `--json` or the evidence files when the full stored text is needed.
@@ -61,8 +92,9 @@ Uncertainty:
 
 If the subagent says it cannot judge, inspect the relevant output directly in the main agent.
 
-## Hook status flow
+## Status review flow
 
 1. `tmux_job.py` or `tmux_monitor.py` writes terminal status.
-2. `codex_tmux_hook.py context` reports useful status and ready task instructions on `SessionStart` resume/compact or `UserPromptSubmit`.
-3. `codex_tmux_hook.py stop` returns `decision: block` for the next ready task or newest unacknowledged terminal event. It does not claim or complete tasks. When a ready task is tied to a terminal event, Stop acknowledges that event so the same event is not reported again after the task is handled. If acknowledgement fails, Stop still returns the block reason and includes an acknowledgement warning. If state files are unreadable, Stop includes a skipped-file warning with the block reason.
+2. A visible manager pane can poll heartbeat/status files while the worker runs.
+3. A resumed Codex session uses `task load --for-skill`, `job status`, `watch status`, or direct status/log paths to inspect prior work explicitly.
+4. If dormant Codex wakeup is required, use the bridge workflow after the same-thread app-server PoC gate has passed.

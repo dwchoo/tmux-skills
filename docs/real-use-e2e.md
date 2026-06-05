@@ -30,7 +30,7 @@ Options:
 Current code facts from `scripts/e2e_real_use.py`:
 
 - `smoke` has 7 scenarios.
-- `all` has 25 scenarios.
+- `all` has 30 scenarios.
 - `all` is `smoke` plus the full-only scenarios.
 
 Smoke scenarios:
@@ -61,8 +61,13 @@ Full-only scenarios:
 - `status-timeout-blocks`
 - `pane-dies-mid-wait`
 - `task-followup-flow`
-- `stop-hook-blocks-terminal`
 - `autopilot-repair-rerun`
+- `manager-visible-success`
+- `manager-visible-failure`
+- `manager-run-next`
+- `manager-start-reuses-live-process`
+- `manager-cancel`
+- `manager-process-exit-keeps-worker`
 
 ## Scenario Matrix
 
@@ -76,7 +81,7 @@ Each harness run uses a temporary workspace, a temporary `TMUX_TMPDIR`, and an i
 | `concurrent-duplicate-race` | Registry lock and dedupe under simultaneous CLI starts. | Put the pane in `sleep` so both queues remain active long enough to race. | Launch two `queue-after-idle` CLI subprocesses with the same pane and command but different job ids and owners. | Exactly one process returns `started: true`; exactly one exits `2` with `duplicate: true`; only one active record exists for the dedupe key. |
 | `duplicate-block` | Sequential duplicate reject compatibility path. | Put the pane in `sleep` and start a first active queue with owner A. | Start a second same-dedupe queue with owner B. | Second start exits `2`, JSON has `duplicate: true`, `existing_job_id` points to the first job, and the duplicate command must not submit. |
 | `preflight-strict` | Strict send preflight. | Create a non-executable `.sh` script that would write an output file if executed. | Call `send --strict-preflight --enter` with the script path. | Command exits `2`, JSON reports `sent_to_pane: false`, and the output file is absent. |
-| `watch-visibility` | Managed watch appears in hook context. | Start an isolated pane and a short-timeout `watch`. | Poll `codex_tmux_hook.py context` for active managed job text. | Hook context includes `managed job <id>: running`; after timeout, job reaches `timeout` and the watch log exists. |
+| `watch-visibility` | Managed watch appears in status review. | Start an isolated pane and a short-timeout `watch`. | Poll `job list --compact` for the active managed job. | The active managed job is visible while running; after timeout, job reaches `timeout` and the watch log exists. |
 | `capture-strips-ansi` | Capture strips terminal control noise. | Start an idle isolated pane. | Send a command that prints ANSI color and carriage-return progress noise, then run `capture --strip-ansi`. | Stripped capture contains visible output such as `DONE`, contains no ESC byte or raw CSI sequence, and plain capture remains callable. |
 | `busy-pane-wait` | Queue after idle does not submit prematurely. | Put the pane in `sleep` and choose an output file. | Start `queue-after-idle` while the pane is busy. | Output file is absent during sleep; after idle, job reaches `submitted` and output is written. |
 | `queue-command-file` | Queue command-file submission. | Write a command file in the temporary workspace and choose an output file. | Start `queue-after-idle` with `--command-file`. | Job reaches `submitted`, output file is written, and the command file is copied into managed state before the worker runs it. |
@@ -87,14 +92,19 @@ Each harness run uses a temporary workspace, a temporary `TMUX_TMPDIR`, and an i
 | `replace-same-job-only` | Replace semantics. | Start a queue with one job id, then start another queue with the same job id and `--replace`. | Wait for the replacement command to submit, then attempt `--replace` using a different job id but same dedupe input. | Same job id replacement runs the second command; different job id is duplicate-rejected with exit `2`. |
 | `cancel-active-queue` | User cancellation before delayed submission. | Put the pane in `sleep`, start a queue, and wait for `waiting_pane_idle`. | Call `job cancel --job-id <id>`. | Job reaches `cancelled`, `pid_running` becomes false, and the queued command output file is absent. |
 | `stale-gc-recovery` | Stale record marking and dedupe reuse. | Create a submitted seed record, then write a fake old active record with the same dedupe key and stale timestamps. | Run `job gc --stale --dry-run`, then `job gc --stale`, then recreate the same queue. | Dry run reports the stale job, GC marks it `stale`, and a new job with the same dedupe input can start. |
-| `corrupted-state-degrades` | Reader CLIs tolerate unreadable state files. | Run a quick successful job, create one valid managed queue record, then write malformed or non-UTF-8 JSON into the workspace status and jobs state directories. | Call `job list` and `codex_tmux_hook.py context` while corrupted files are present. | Both calls exit `0` without a Python traceback, the valid managed job remains visible in `job list`, and hook context reports skipped unreadable state files. |
+| `corrupted-state-degrades` | Reader CLIs tolerate unreadable state files. | Run a quick successful job, create one valid managed queue record, then write malformed or non-UTF-8 JSON into the workspace status and jobs state directories. | Call `job list` and `task load --for-skill` while corrupted files are present. | Both calls exit `0` without a Python traceback, the valid managed job remains visible in `job list`, and task load reports skipped unreadable state files. |
 | `replace-rejects-foreign-pid` | Foreign PID safety. | Start a live non-`tmux_queue.py` process and write a managed job record pointing at its PID. | Start the same job id with `--replace`. | Command exits `2`, reason says the PID no longer looks like this tmux-skills worker, and the foreign process remains alive until harness cleanup. |
 | `pane-missing-failure` | Missing pane terminal failure. | Use a pane id that should not resolve. | Start `queue-after-idle` targeting the missing pane. | Job reaches `failed` quickly and the queued command output file is absent. |
 | `status-timeout-blocks` | Status wait timeout does not submit. | Write a status TSV that stays in a non-matching state and choose an output file. | Start `queue-after-status` with an unsatisfied `--require-row`, short polling, and a one-second timeout. | Job reaches `timeout`, output file is absent, status diagnostics preserve `matched_required_rows`, and no send result is recorded. |
 | `pane-dies-mid-wait` | Queue wait handles a pane disappearing. | Put the target pane in `sleep` and choose an output file. | Start `queue-after-idle`, wait for `waiting_pane_idle`, then kill the target pane. | Job reaches a terminal failure state instead of hanging, no send result is recorded, output file is absent, and the harness recreates the isolated pane for later scenarios. |
-| `task-followup-flow` | Run-created follow-up tasks become ready and claimable. | Start with an idle pane. | Run a quick successful job with `--next-instruction` and `--next-on succeeded`, then poll task APIs. | The task becomes `ready`, hook context exposes the ready task and instruction, `task claim` succeeds, and `task next --json` no longer returns that task as ready. |
-| `stop-hook-blocks-terminal` | Stop hook blocks once for terminal events. | Drain previous terminal stop notifications, then run a quick job without follow-up task creation. | Call `codex_tmux_hook.py stop --workspace <workspace>` twice with stdin `{}`. | First call returns `decision: block` with a terminal-event reason; second identical call returns no block because the event was acknowledged. |
+| `task-followup-flow` | Run-created follow-up tasks become ready and claimable. | Start with an idle pane. | Run a quick successful job with `--next-instruction` and `--next-on succeeded`, then poll task APIs. | The task becomes `ready`, `task load --for-skill` exposes the ready task and instruction, `task claim` succeeds, and `task next --json` no longer returns that task as ready. |
 | `autopilot-repair-rerun` | Heartbeat-style Autopilot repair loop. | Start with an idle pane and choose an objective id. | Start an Autopilot objective whose first attempt fails with long output, call bounded `tick`, expand bounded log evidence, call duplicate `tick`, rerun with a fixed command, then tick again. | First tick returns `repair` with bounded `attempt_summary` and evidence commands, log evidence returns failure output without a full dump, duplicate tick returns `no_action`, rerun starts attempt 2, attempt 2 succeeds, final tick completes the objective without extra evidence commands, and heartbeat prompt includes the wake contract. |
+| `manager-visible-success` | Codex-owned visible manager waits for review after success. | Start with an isolated tmux pane and choose an output file. | Start foreground `manager start --notify none` with a successful command. | A tall right-side worker pane and compact manager pane below Codex are created, output is written, job status reaches `succeeded`, manager status remains `waiting_for_codex`, and the manager process can be cancelled without stopping the worker result. |
+| `manager-visible-failure` | Codex-owned visible manager waits for review after failure. | Start with an isolated tmux pane. | Start foreground `manager start --notify none` with a failing command. | Job status reaches `failed`, the log path exists, and manager status remains `waiting_for_codex`. |
+| `manager-run-next` | Main Codex can start follow-up work through the manager. | Start a manager and let its first job succeed. | Call `manager run-next` with a second job and command. | The second command runs in the same manager workflow, the second output file is written, and manager status returns to `waiting_for_codex` for the second job. |
+| `manager-start-reuses-live-process` | Repeated `manager start` does not create a second live manager or extra panes. | Start a manager and let its first job reach `waiting_for_codex`. | Call `manager start` again with the same manager id while the first manager process is still alive. | The second job is queued to the existing manager, the manager PID stays the same, and manager/worker pane ids and pane count stay unchanged. |
+| `manager-cancel` | Manager cancellation preserves panes unless worker stop is requested. | Start a manager with a long-running worker command. | Call `manager cancel` once without `--stop-worker`, then call it again with `--stop-worker`. | The first cancel does not stop the worker or close panes; the second cancel sends an interrupt and the worker job records `stopped`. |
+| `manager-process-exit-keeps-worker` | Worker job survives Codex-owned manager exit. | Start a foreground manager with a delayed worker command. | Terminate the manager process directly to simulate Codex exit. | The manager process exits, the worker job keeps running in tmux, then reaches `succeeded` and writes the expected output. |
 
 ## Scenario Design Rules
 

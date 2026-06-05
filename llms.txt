@@ -1,6 +1,6 @@
 # tmux-skills
 
-> Codex skill for controlled tmux usage, managed watch/queue workers, hook-aware status records, and real-use tmux E2E validation.
+> Codex skill for controlled tmux usage, managed watch/queue workers, visible status records, and real-use tmux E2E validation.
 
 Bridge wakeup adds a path-only app-server notification flow for dormant main Codex threads. Treat the PoC same-thread wake fixture as the hard gate before relying on daemon lifecycle commands.
 
@@ -21,7 +21,6 @@ Use this file as the LLM entry point. Start with the core files for orientation,
 
 ## References
 
-- [Hook snippets](references/HOOKS.md): Copyable Codex command hook snippets for tmux status and follow-up task context.
 - [Workflows](references/WORKFLOWS.md): Copyable tmux-skills workflow examples for long-running jobs, resume, monitors, and output review.
 
 ## Optional

@@ -1,6 +1,6 @@
 # tmux-skills
 
-Codex skill for controlled tmux usage. It provides concise skill instructions, Python helpers for tmux panes/windows, long-running job wrappers, managed watch/queue workers, resumable follow-up task records, hook status readers, and reusable pane monitors.
+Codex skill for controlled tmux usage. It provides concise skill instructions, Python helpers for tmux panes/windows, long-running job wrappers, managed watch/queue workers, resumable follow-up task records, visible status review flows, and reusable pane monitors.
 
 ## Requirements
 
@@ -12,14 +12,13 @@ Codex skill for controlled tmux usage. It provides concise skill instructions, P
 - `SKILL.md`: skill instructions and safety rules.
 - `llms.txt`: LLM-friendly documentation index.
 - `docs/`: canonical detailed contracts and runbooks.
-- `references/`: copyable hook snippets and workflow examples.
+- `references/`: copyable workflow examples.
 - `scripts/tmux_control.py`: main tmux helper used by the skill.
 - `scripts/tmux_job.py`: long-running command wrapper.
 - `scripts/tmux_queue.py`: managed watch and queue-after worker.
 - `scripts/tmux_monitor.py`: single-trigger pane monitor.
 - `scripts/codex_app_server_client.py`: minimal stdlib Unix socket WebSocket client for bridge wake delivery.
 - `scripts/tmux_bridge.py`: bridge PoC, artifact validation, and daemon entrypoint for path-only Codex thread wakeups.
-- `scripts/codex_tmux_hook.py`: command hook status reader.
 - `scripts/run_managed_job.sh`: raw tmux fallback wrapper for helper-unavailable managed jobs.
 - `.codex/tmux-skills/tasks/`: runtime follow-up task records created by anchored `task add` and `run --next-instruction`.
 - `.codex/tmux-skills/jobs/`: managed background worker records created by `watch` and queue commands.

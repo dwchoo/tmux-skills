@@ -24,7 +24,7 @@ Keep each type of information in one primary place:
 | Desired operating flow and feature map | `docs/workflows-and-features.md` |
 | Managed worker contracts | `docs/managed-workers.md` |
 | Real-use E2E scenario intent and coverage | `docs/real-use-e2e.md` |
-| Copyable hook and workflow snippets | `references/` |
+| Copyable workflow snippets | `references/` |
 
 Do not duplicate long contracts in README or SKILL. Link to the canonical doc instead.
 

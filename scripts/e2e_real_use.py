@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
 import shlex
 import shutil
 import signal
@@ -23,7 +24,6 @@ import tmux_state
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROL = ROOT / "scripts" / "tmux_control.py"
-HOOK = ROOT / "scripts" / "codex_tmux_hook.py"
 SKIP_EXIT_CODE = 77
 COMMAND_TIMEOUT_SECONDS = 30.0
 COMMAND_TIMEOUT_EXIT_CODE = 124
@@ -55,8 +55,13 @@ FULL_ONLY_SCENARIOS = [
     "status-timeout-blocks",
     "pane-dies-mid-wait",
     "task-followup-flow",
-    "stop-hook-blocks-terminal",
     "autopilot-repair-rerun",
+    "manager-visible-success",
+    "manager-visible-failure",
+    "manager-run-next",
+    "manager-start-reuses-live-process",
+    "manager-cancel",
+    "manager-process-exit-keeps-worker",
 ]
 
 ALL_SCENARIOS = SMOKE_SCENARIOS + FULL_ONLY_SCENARIOS
@@ -216,6 +221,7 @@ class Harness:
         self.jobs: list[str] = []
         self.current_scenario = "setup"
         self.last_command: CommandResult | None = None
+        self.manager_processes: list[tuple[subprocess.Popen[str], list[str]]] = []
         self.removed_repo_artifacts: list[str] = []
         self.remove_repo_runtime_artifacts()
 
@@ -263,6 +269,46 @@ class Harness:
             stderr=subprocess.PIPE,
         )
 
+    def start_manager_process(self, manager_id: str, job_id: str, command_text: str) -> tuple[subprocess.Popen[str], CommandResult, list[str]]:
+        args = [
+            "manager",
+            "start",
+            "--manager-id",
+            manager_id,
+            "--job-id",
+            job_id,
+            "--command",
+            command_text,
+            "--notify",
+            "none",
+            "--workspace",
+            str(self.workspace),
+            "--poll-seconds",
+            "0.1",
+        ]
+        proc = self.popen_control(args)
+        self.manager_processes.append((proc, args))
+        start = self.read_process_json(proc, args)
+        if not isinstance(start.json_data, dict) or start.json_data.get("started") is not True:
+            raise ScenarioFailure(self.current_scenario, f"manager-start-{manager_id}", "manager did not start", start)
+        return proc, start, args
+
+    def collect_manager_process(self, proc: subprocess.Popen[str], args: list[str], *, step: str) -> CommandResult:
+        command = self.collect_process(proc, args)
+        self.manager_processes = [(item_proc, item_args) for item_proc, item_args in self.manager_processes if item_proc is not proc]
+        if command.returncode not in {0, 130}:
+            raise ScenarioFailure(self.current_scenario, step, f"manager process exited with {command.returncode}", command)
+        return command
+
+    def terminate_one_manager_process(self, proc: subprocess.Popen[str], args: list[str], *, step: str) -> CommandResult:
+        if proc.poll() is None:
+            proc.terminate()
+        command = self.collect_process(proc, args)
+        self.manager_processes = [(item_proc, item_args) for item_proc, item_args in self.manager_processes if item_proc is not proc]
+        if command.returncode == COMMAND_TIMEOUT_EXIT_CODE:
+            raise ScenarioFailure(self.current_scenario, step, "manager process did not terminate", command)
+        return command
+
     def collect_process(self, proc: subprocess.Popen[str], args: list[str]) -> CommandResult:
         try:
             stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT_SECONDS)
@@ -289,6 +335,44 @@ class Harness:
         self.last_command = command
         return command
 
+    def read_process_json(self, proc: subprocess.Popen[str], args: list[str], *, timeout: float = 5.0) -> CommandResult:
+        if proc.stdout is None:
+            raise ScenarioFailure(self.current_scenario, "process-json-stdout", "process stdout is not captured")
+        deadline = time.monotonic() + timeout
+        stdout_parts: list[str] = []
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if ready:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                stdout_parts.append(line)
+                text = "".join(stdout_parts)
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                command = CommandResult(
+                    args=self.control_args(args),
+                    returncode=proc.poll() if proc.poll() is not None else 0,
+                    stdout=text,
+                    stderr="",
+                    json_data=parsed,
+                )
+                self.last_command = command
+                return command
+            if proc.poll() is not None:
+                break
+        stderr = ""
+        if proc.poll() is not None:
+            try:
+                _stdout, stderr = proc.communicate(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                stderr = ""
+        command = CommandResult(args=self.control_args(args), returncode=proc.poll() or 1, stdout="".join(stdout_parts), stderr=stderr)
+        self.last_command = command
+        raise ScenarioFailure(self.current_scenario, "process-json-timeout", "process did not print a JSON start payload", command)
+
     def require_success(self, command: CommandResult, *, step: str) -> CommandResult:
         if command.returncode != 0:
             raise ScenarioFailure(self.current_scenario, step, f"command failed with exit {command.returncode}", command)
@@ -298,36 +382,6 @@ class Harness:
         command = self.run(self.control_args(args))
         if check:
             self.require_success(command, step=step)
-        return command
-
-    def hook_context(self, *, step: str) -> CommandResult:
-        command = self.run(
-            [
-                sys.executable,
-                str(HOOK),
-                "context",
-                "--event",
-                "UserPromptSubmit",
-                "--workspace",
-                str(self.workspace),
-            ],
-            input_text="{}",
-        )
-        self.require_success(command, step=step)
-        return command
-
-    def hook_stop(self, *, step: str) -> CommandResult:
-        command = self.run(
-            [
-                sys.executable,
-                str(HOOK),
-                "stop",
-                "--workspace",
-                str(self.workspace),
-            ],
-            input_text="{}",
-        )
-        self.require_success(command, step=step)
         return command
 
     def setup_tmux(self) -> None:
@@ -426,12 +480,95 @@ class Harness:
             self.run(["tmux", "send-keys", "-t", self.pane, "C-c"])
             time.sleep(0.2)
 
+    def terminate_manager_processes(self) -> None:
+        for proc, _args in self.manager_processes:
+            if proc.poll() is not None:
+                continue
+            proc.terminate()
+            try:
+                proc.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+        self.manager_processes = []
+
+    def tmux_pane_exists(self, pane_id: str) -> bool:
+        return self.run(["tmux", "display-message", "-p", "-t", pane_id, "#{pane_id}"]).returncode == 0
+
+    def manager_status_data(self, manager_id: str) -> dict[str, Any]:
+        command = self.control(
+            ["manager", "status", "--manager-id", manager_id, "--workspace", str(self.workspace)],
+            step=f"manager-status-{manager_id}",
+            check=False,
+        )
+        return command.json_data if isinstance(command.json_data, dict) else {}
+
+    def wait_manager_status(
+        self,
+        manager_id: str,
+        expected_manager_status: str,
+        *,
+        expected_job_status: str | None = None,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        def check_manager() -> dict[str, Any] | None:
+            data = self.manager_status_data(manager_id)
+            record = data.get("record") if isinstance(data.get("record"), dict) else {}
+            current_status = data.get("current_job_status") if isinstance(data.get("current_job_status"), dict) else {}
+            if record.get("status") != expected_manager_status:
+                return None
+            if expected_job_status and current_status.get("status") != expected_job_status:
+                return None
+            return data
+
+        return self.poll_until(f"wait-manager-{manager_id}-{expected_manager_status}", timeout, check_manager)
+
+    def assert_manager_layout_geometry(self, manager_pane_id: str, worker_pane_id: str) -> dict[str, Any]:
+        panes = self.control(["list"], step=f"{self.current_scenario}-layout-list").json_data.get("panes", [])
+        manager_pane = next((pane for pane in panes if pane.get("pane_id") == manager_pane_id), None)
+        worker_pane = next((pane for pane in panes if pane.get("pane_id") == worker_pane_id), None)
+        if not isinstance(manager_pane, dict) or not isinstance(worker_pane, dict):
+            raise ScenarioFailure(self.current_scenario, "manager-layout-panes", "manager or worker pane was not listed")
+        codex_candidates = [
+            pane
+            for pane in panes
+            if pane.get("session_name") == manager_pane.get("session_name")
+            and pane.get("window_id") == manager_pane.get("window_id")
+            and pane.get("pane_id") not in {manager_pane_id, worker_pane_id}
+        ]
+        if len(codex_candidates) != 1:
+            raise ScenarioFailure(
+                self.current_scenario,
+                "manager-layout-codex-pane",
+                f"expected one Codex pane candidate, found {len(codex_candidates)}",
+            )
+        codex_pane = codex_candidates[0]
+        codex_right = int(codex_pane.get("pane_left") or 0) + int(codex_pane.get("pane_width") or 0)
+        worker_left = int(worker_pane.get("pane_left") or 0)
+        if worker_left < codex_right - 2:
+            raise ScenarioFailure(self.current_scenario, "manager-layout-worker-side", "worker pane is not to the right of Codex")
+        if int(worker_pane.get("pane_height") or 0) < int(codex_pane.get("pane_height") or 0):
+            raise ScenarioFailure(self.current_scenario, "manager-layout-worker-height", "worker pane is not tall enough for long output")
+        codex_bottom = int(codex_pane.get("pane_top") or 0) + int(codex_pane.get("pane_height") or 0)
+        manager_top = int(manager_pane.get("pane_top") or 0)
+        if manager_top < codex_bottom or manager_top - codex_bottom > 2:
+            raise ScenarioFailure(self.current_scenario, "manager-layout-manager-below", "manager pane is not directly below Codex")
+        if int(manager_pane.get("pane_height") or 0) > int(codex_pane.get("pane_height") or 0):
+            raise ScenarioFailure(self.current_scenario, "manager-layout-manager-compact", "manager pane is not compact relative to Codex")
+        return {
+            "codex_pane_id": codex_pane.get("pane_id"),
+            "codex_height": codex_pane.get("pane_height"),
+            "manager_height": manager_pane.get("pane_height"),
+            "worker_height": worker_pane.get("pane_height"),
+        }
+
     def before_scenario(self, name: str) -> None:
         self.current_scenario = name
         self.cancel_active_jobs()
         self.interrupt_pane()
 
     def after_scenario(self) -> None:
+        self.terminate_manager_processes()
         self.cancel_active_jobs()
         self.interrupt_pane()
 
@@ -539,6 +676,7 @@ class Harness:
         return signalled
 
     def cleanup(self, *, remove_artifacts: bool = True) -> dict[str, Any]:
+        self.terminate_manager_processes()
         self.cancel_active_jobs()
         self.run(["tmux", "kill-session", "-t", self.session])
         self.run(["tmux", "kill-server"])
@@ -759,12 +897,13 @@ class Harness:
             step="start-watch",
         )
 
-        def hook_has_job() -> bool:
-            data = self.hook_context(step="hook-context").json_data or {}
-            context = ((data.get("hookSpecificOutput") or {}).get("additionalContext") or "")
-            return f"managed job {job_id}: running" in context
+        def job_list_has_active_watch() -> bool:
+            for job in self.job_list():
+                if job.get("job_id") == job_id and is_active_managed_job(job):
+                    return True
+            return False
 
-        self.poll_until("hook-active-watch", 3.0, hook_has_job)
+        self.poll_until("job-list-active-watch", 3.0, job_list_has_active_watch)
         self.wait_status(job_id, "timeout", timeout=5.0)
         status = self.job_status(job_id).get("status") or {}
         log_path = Path(str(status.get("log_path") or ""))
@@ -1171,13 +1310,13 @@ class Harness:
         if not any(isinstance(job, dict) and job.get("job_id") == managed_id for job in jobs):
             raise ScenarioFailure(self.current_scenario, "job-list-valid-entry", "valid job missing from job list", listed)
 
-        context = self.hook_context(step="hook-context-corrupt")
-        if "Traceback (most recent call last)" in context.stderr:
-            raise ScenarioFailure(self.current_scenario, "hook-context-traceback", "hook context emitted a traceback", context)
-        context_data = context.json_data if isinstance(context.json_data, dict) else {}
-        additional_context = str(((context_data.get("hookSpecificOutput") or {}).get("additionalContext") or ""))
-        if "unreadable" not in additional_context:
-            raise ScenarioFailure(self.current_scenario, "hook-context-unreadable", "hook context did not report unreadable state files", context)
+        loaded = self.control(["task", "load", "--for-skill", "--workspace", str(self.workspace)], step="task-load-corrupt", check=False)
+        if loaded.returncode != 0:
+            raise ScenarioFailure(self.current_scenario, "task-load-returncode", "task load failed on corrupt state", loaded)
+        if "Traceback (most recent call last)" in loaded.stderr:
+            raise ScenarioFailure(self.current_scenario, "task-load-traceback", "task load emitted a traceback", loaded)
+        if "unreadable" not in loaded.stdout:
+            raise ScenarioFailure(self.current_scenario, "task-load-unreadable", "task load did not report unreadable state files", loaded)
         return {
             "run_id": run_id,
             "managed_id": managed_id,
@@ -1379,10 +1518,12 @@ class Harness:
             return None
 
         ready = self.poll_until("task-ready", 5.0, ready_task)
-        context = self.hook_context(step="hook-context-ready").json_data or {}
-        additional = ((context.get("hookSpecificOutput") or {}).get("additionalContext") or "")
-        if "ready task" not in additional or instruction not in additional:
-            raise ScenarioFailure(self.current_scenario, "hook-ready-task", "hook context did not expose the ready follow-up task")
+        loaded = self.control(
+            ["task", "load", "--for-skill", "--workspace", str(self.workspace)],
+            step="task-load-ready",
+        )
+        if "ready task" not in loaded.stdout or instruction not in loaded.stdout:
+            raise ScenarioFailure(self.current_scenario, "task-load-ready-task", "task load did not expose the ready follow-up task", loaded)
         claimed = self.control(
             ["task", "claim", "--task-id", task_id, "--workspace", str(self.workspace)],
             step="task-claim",
@@ -1399,48 +1540,228 @@ class Harness:
             raise ScenarioFailure(self.current_scenario, "task-next-claimed", "claimed task was still returned as ready", next_after_claim)
         return {"job_id": job_id, "task_id": task_id, "ready_status": ready.get("effective_status"), "claimed_status": claimed_data.get("status")}
 
-    def scenario_stop_hook_blocks_terminal(self) -> dict[str, Any]:
-        self.current_scenario = "stop-hook-blocks-terminal"
-        job_id = "stop-hook-e2e"
-        output = self.workspace / "stop-hook.out"
+    def scenario_manager_visible_success(self) -> dict[str, Any]:
+        self.current_scenario = "manager-visible-success"
+        manager_id = "manager-success"
+        job_id = "manager-success-job"
+        output = self.workspace / "manager-success.out"
+        manager_proc, start, manager_args = self.start_manager_process(
+            manager_id,
+            job_id,
+            "printf manager-ok > manager-success.out",
+        )
+        start_data = start.json_data if isinstance(start.json_data, dict) else {}
+        self.wait_file(output, "manager-ok", timeout=10.0)
+        status = self.wait_manager_status(manager_id, "waiting_for_codex", expected_job_status="succeeded", timeout=10.0)
+        record = status.get("record") if isinstance(status.get("record"), dict) else {}
+        if record.get("last_notification", {}).get("mode") != "none":
+            raise ScenarioFailure(self.current_scenario, "manager-notify-none", "manager did not record dashboard-only notification")
+        layout = self.assert_manager_layout_geometry(str(start_data.get("manager_pane_id")), str(start_data.get("worker_pane_id")))
+        self.control(["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace)], step="manager-success-cancel")
+        self.collect_manager_process(manager_proc, manager_args, step="manager-success-process-exit")
+        return {
+            "manager_id": manager_id,
+            "job_id": job_id,
+            "manager_pane_id": start_data.get("manager_pane_id"),
+            "worker_pane_id": start_data.get("worker_pane_id"),
+            "layout": layout,
+            "output": str(output),
+        }
 
-        for index in range(30):
-            drained = self.hook_stop(step=f"drain-stop-{index}")
-            data = drained.json_data if isinstance(drained.json_data, dict) else {}
-            if data.get("decision") != "block":
-                break
-            if "ready task" in str(data.get("reason") or ""):
-                raise ScenarioFailure(self.current_scenario, "drain-ready-task", "ready task interfered with stop hook terminal drain", drained)
-        else:
-            raise ScenarioFailure(self.current_scenario, "drain-stop-hooks", "could not drain existing terminal stop notifications")
+    def scenario_manager_visible_failure(self) -> dict[str, Any]:
+        self.current_scenario = "manager-visible-failure"
+        manager_id = "manager-failure"
+        job_id = "manager-failure-job"
+        manager_proc, start, manager_args = self.start_manager_process(
+            manager_id,
+            job_id,
+            "python3 -c 'print(\"manager-failed\"); raise SystemExit(7)'",
+        )
+        status = self.wait_manager_status(manager_id, "waiting_for_codex", expected_job_status="failed", timeout=10.0)
+        current_status = status.get("current_job_status") if isinstance(status.get("current_job_status"), dict) else {}
+        log_path = Path(str(current_status.get("log_path") or ""))
+        if not log_path.exists():
+            raise ScenarioFailure(self.current_scenario, "manager-failure-log", "failed manager job did not write a log", start)
+        self.control(["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace)], step="manager-failure-cancel")
+        self.collect_manager_process(manager_proc, manager_args, step="manager-failure-process-exit")
+        return {"manager_id": manager_id, "job_id": job_id, "log_path": str(log_path)}
 
-        self.jobs.append(job_id)
-        self.control(
+    def scenario_manager_run_next(self) -> dict[str, Any]:
+        self.current_scenario = "manager-run-next"
+        manager_id = "manager-next"
+        first_job = "manager-next-first"
+        second_job = "manager-next-second"
+        first_output = self.workspace / "manager-next-first.out"
+        second_output = self.workspace / "manager-next-second.out"
+        manager_proc, _start, manager_args = self.start_manager_process(
+            manager_id,
+            first_job,
+            "printf first-ok > manager-next-first.out",
+        )
+        self.wait_file(first_output, "first-ok", timeout=10.0)
+        self.wait_manager_status(manager_id, "waiting_for_codex", expected_job_status="succeeded", timeout=10.0)
+        queued = self.control(
             [
-                "run",
-                "--pane",
-                str(self.pane),
+                "manager",
+                "run-next",
+                "--manager-id",
+                manager_id,
                 "--job-id",
-                job_id,
+                second_job,
                 "--command",
-                "printf stop-ok > stop-hook.out",
+                "printf second-ok > manager-next-second.out",
                 "--workspace",
                 str(self.workspace),
             ],
-            step="run-terminal-job",
+            step="manager-run-next",
         )
+        if not isinstance(queued.json_data, dict) or queued.json_data.get("queued") is not True:
+            raise ScenarioFailure(self.current_scenario, "manager-run-next-queued", "manager run-next did not queue follow-up work", queued)
+        self.wait_file(second_output, "second-ok", timeout=10.0)
+        final_status = self.wait_manager_status(manager_id, "waiting_for_codex", expected_job_status="succeeded", timeout=10.0)
+        current_status = final_status.get("current_job_status") if isinstance(final_status.get("current_job_status"), dict) else {}
+        if current_status.get("id") != second_job:
+            raise ScenarioFailure(self.current_scenario, "manager-run-next-current-job", "manager did not switch to the follow-up job")
+        self.control(["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace)], step="manager-next-cancel")
+        self.collect_manager_process(manager_proc, manager_args, step="manager-next-process-exit")
+        return {"manager_id": manager_id, "first_job": first_job, "second_job": second_job}
+
+    def scenario_manager_start_reuses_live_process(self) -> dict[str, Any]:
+        self.current_scenario = "manager-start-reuses-live-process"
+        manager_id = "manager-reuse"
+        first_job = "manager-reuse-first"
+        second_job = "manager-reuse-second"
+        first_output = self.workspace / "manager-reuse-first.out"
+        second_output = self.workspace / "manager-reuse-second.out"
+        manager_proc, _start, manager_args = self.start_manager_process(
+            manager_id,
+            first_job,
+            "printf first-ok > manager-reuse-first.out",
+        )
+        self.wait_file(first_output, "first-ok", timeout=10.0)
+        first_status = self.wait_manager_status(manager_id, "waiting_for_codex", expected_job_status="succeeded", timeout=10.0)
+        first_record = first_status.get("record") if isinstance(first_status.get("record"), dict) else {}
+        first_manager_pid = first_record.get("manager_pid")
+        first_manager_pane = first_record.get("manager_pane_id")
+        first_worker_pane = first_record.get("worker_pane_id")
+        panes_before = self.control(["list"], step="manager-reuse-list-before").json_data.get("panes", [])
+        session_panes_before = [pane for pane in panes_before if pane.get("session_name") == self.session]
+        second_start = self.control(
+            [
+                "manager",
+                "start",
+                "--manager-id",
+                manager_id,
+                "--job-id",
+                second_job,
+                "--command",
+                "printf second-ok > manager-reuse-second.out",
+                "--notify",
+                "none",
+                "--workspace",
+                str(self.workspace),
+                "--poll-seconds",
+                "0.1",
+            ],
+            step="manager-reuse-second-start",
+        )
+        data = second_start.json_data if isinstance(second_start.json_data, dict) else {}
+        if data.get("queued_on_existing_manager") is not True or data.get("start_process_mode") != "existing":
+            raise ScenarioFailure(self.current_scenario, "manager-reuse-existing-process", "second manager start did not queue to the live manager", second_start)
+        if manager_proc.poll() is not None:
+            raise ScenarioFailure(self.current_scenario, "manager-reuse-original-process", "original manager process exited before second job")
+        self.wait_file(second_output, "second-ok", timeout=10.0)
+        final_status = self.wait_manager_status(manager_id, "waiting_for_codex", expected_job_status="succeeded", timeout=10.0)
+        final_record = final_status.get("record") if isinstance(final_status.get("record"), dict) else {}
+        if final_record.get("manager_pid") != first_manager_pid:
+            raise ScenarioFailure(self.current_scenario, "manager-reuse-pid", "manager pid changed after second start")
+        if final_record.get("manager_pane_id") != first_manager_pane or final_record.get("worker_pane_id") != first_worker_pane:
+            raise ScenarioFailure(self.current_scenario, "manager-reuse-pane-ids", "manager or worker pane id changed after second start")
+        panes_after = self.control(["list"], step="manager-reuse-list-after").json_data.get("panes", [])
+        session_panes_after = [pane for pane in panes_after if pane.get("session_name") == self.session]
+        if len(session_panes_after) != len(session_panes_before):
+            raise ScenarioFailure(self.current_scenario, "manager-reuse-pane-count", "second manager start created or removed a pane")
+        self.control(["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace)], step="manager-reuse-cancel")
+        self.collect_manager_process(manager_proc, manager_args, step="manager-reuse-process-exit")
+        return {
+            "manager_id": manager_id,
+            "first_job": first_job,
+            "second_job": second_job,
+            "manager_pid": first_manager_pid,
+            "manager_pane_id": first_manager_pane,
+            "worker_pane_id": first_worker_pane,
+        }
+
+    def scenario_manager_cancel(self) -> dict[str, Any]:
+        self.current_scenario = "manager-cancel"
+        manager_id = "manager-cancel"
+        job_id = "manager-cancel-job"
+        manager_proc, start, manager_args = self.start_manager_process(
+            manager_id,
+            job_id,
+            "sleep 10; printf should-not-finish > manager-cancel.out",
+        )
+        start_data = start.json_data if isinstance(start.json_data, dict) else {}
+        worker_pane = str(start_data.get("worker_pane_id") or "")
+        manager_pane = str(start_data.get("manager_pane_id") or "")
+        self.wait_manager_status(manager_id, "running", timeout=10.0)
+        first_cancel = self.control(
+            ["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace)],
+            step="manager-cancel-dashboard-only",
+        )
+        first_data = first_cancel.json_data if isinstance(first_cancel.json_data, dict) else {}
+        if first_data.get("worker_stop_result") is not None:
+            raise ScenarioFailure(self.current_scenario, "manager-cancel-no-stop", "default cancel attempted to stop the worker", first_cancel)
+        self.collect_manager_process(manager_proc, manager_args, step="manager-cancel-process-exit")
+        time.sleep(0.3)
+        running_status = self.job_status(job_id)
+        status = (running_status.get("status") or {}).get("status")
+        if status not in {"pending", "running"}:
+            raise ScenarioFailure(self.current_scenario, "manager-cancel-worker-running", f"worker was not left running: {status}")
+        if not self.tmux_pane_exists(worker_pane) or not self.tmux_pane_exists(manager_pane):
+            raise ScenarioFailure(self.current_scenario, "manager-cancel-pane-preserved", "manager cancel closed a pane")
+        stop_cancel = self.control(
+            ["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace), "--stop-worker"],
+            step="manager-cancel-stop-worker",
+        )
+        stop_data = stop_cancel.json_data if isinstance(stop_cancel.json_data, dict) else {}
+        worker_stop = stop_data.get("worker_stop_result") if isinstance(stop_data.get("worker_stop_result"), dict) else {}
+        if worker_stop.get("sent") is not True:
+            raise ScenarioFailure(self.current_scenario, "manager-cancel-stop-sent", "stop-worker did not send an interrupt", stop_cancel)
+        stopped = self.wait_status(job_id, "stopped", timeout=10.0)
+        return {
+            "manager_id": manager_id,
+            "job_id": job_id,
+            "worker_pane_id": worker_pane,
+            "manager_pane_id": manager_pane,
+            "stopped_status": (stopped.get("status") or {}).get("status"),
+        }
+
+    def scenario_manager_process_exit_keeps_worker(self) -> dict[str, Any]:
+        self.current_scenario = "manager-process-exit-keeps-worker"
+        manager_id = "manager-exit"
+        job_id = "manager-exit-job"
+        output = self.workspace / "manager-exit.out"
+        manager_proc, _start, manager_args = self.start_manager_process(
+            manager_id,
+            job_id,
+            "sleep 1.5; printf worker-survived > manager-exit.out",
+        )
+        self.wait_manager_status(manager_id, "running", timeout=10.0)
+        terminated = self.terminate_one_manager_process(manager_proc, manager_args, step="manager-process-terminate")
+        time.sleep(0.3)
+        running_status = self.job_status(job_id)
+        status = (running_status.get("status") or {}).get("status")
+        if status not in {"pending", "running", "succeeded"}:
+            raise ScenarioFailure(self.current_scenario, "worker-after-manager-exit", f"worker did not survive manager exit: {status}")
         self.wait_status(job_id, "succeeded", timeout=10.0)
-        self.wait_file(output, "stop-ok", timeout=5.0)
-        first = self.hook_stop(step="stop-first")
-        first_data = first.json_data if isinstance(first.json_data, dict) else {}
-        first_reason = str(first_data.get("reason") or "")
-        if first_data.get("decision") != "block" or "terminal event" not in first_reason:
-            raise ScenarioFailure(self.current_scenario, "stop-first-block", "first stop hook call did not block on terminal event", first)
-        second = self.hook_stop(step="stop-second")
-        second_data = second.json_data if isinstance(second.json_data, dict) else {}
-        if second_data.get("decision") == "block":
-            raise ScenarioFailure(self.current_scenario, "stop-second-ack", "second stop hook call blocked after ack", second)
-        return {"job_id": job_id, "first_decision": first_data.get("decision"), "second": second_data}
+        self.wait_file(output, "worker-survived", timeout=5.0)
+        return {
+            "manager_id": manager_id,
+            "job_id": job_id,
+            "manager_returncode": terminated.returncode,
+            "output": str(output),
+        }
 
     def scenario_autopilot_repair_rerun(self) -> dict[str, Any]:
         self.current_scenario = "autopilot-repair-rerun"
@@ -1606,8 +1927,13 @@ SCENARIO_METHODS = {
     "status-timeout-blocks": Harness.scenario_status_timeout_blocks,
     "pane-dies-mid-wait": Harness.scenario_pane_dies_mid_wait,
     "task-followup-flow": Harness.scenario_task_followup_flow,
-    "stop-hook-blocks-terminal": Harness.scenario_stop_hook_blocks_terminal,
     "autopilot-repair-rerun": Harness.scenario_autopilot_repair_rerun,
+    "manager-visible-success": Harness.scenario_manager_visible_success,
+    "manager-visible-failure": Harness.scenario_manager_visible_failure,
+    "manager-run-next": Harness.scenario_manager_run_next,
+    "manager-start-reuses-live-process": Harness.scenario_manager_start_reuses_live_process,
+    "manager-cancel": Harness.scenario_manager_cancel,
+    "manager-process-exit-keeps-worker": Harness.scenario_manager_process_exit_keeps_worker,
 }
 
 
