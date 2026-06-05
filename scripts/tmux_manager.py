@@ -23,6 +23,8 @@ MANAGER_VERSION = 1
 DEFAULT_MANAGER_LOG_MAX_BYTES = 65536
 MANAGER_STATUSES = {"starting", "idle", "queued", "running", "waiting_for_codex", "cancel_requested", "cancelled", "failed"}
 MANAGER_CANCEL_STATUSES = {"cancel_requested", "cancelled"}
+MANAGER_PROCESS_MODES = {"foreground", "background"}
+MANAGER_PS_POC_STATUS_UNSUPPORTED = "unsupported_by_current_codex_surface"
 MANAGER_TERMINAL_JOB_STATUSES = {"succeeded", "failed", "stopped", "timeout", "cancelled", "stale"}
 BRIDGE_VERIFICATION_STATUSES = {"unverified", "awaiting_ack", "verified", "expired", "mismatched_config", "submission_failed"}
 
@@ -41,6 +43,93 @@ def manager_paths(workspace: str | None = None, state_dir: str | None = None) ->
 
 def manager_record_path(paths: dict[str, Path], manager_id: str) -> Path:
     return paths["managers"] / f"{manager_id_value(manager_id)}.json"
+
+
+def manager_process_mode_value(value: str | None) -> str:
+    mode = tmux_state.token_text(value) or "foreground"
+    return mode if mode in MANAGER_PROCESS_MODES else "foreground"
+
+
+def manager_proofs_dir(paths: dict[str, Path]) -> Path:
+    return paths["root"] / "proofs"
+
+
+def manager_ps_poc_paths(paths: dict[str, Path], timestamp: str | None = None) -> dict[str, Path]:
+    stamp = timestamp or f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{time.time_ns() % 1_000_000:06d}"
+    proof_dir = manager_proofs_dir(paths)
+    return {
+        "json": proof_dir / f"manager-ps-poc-{stamp}.json",
+        "manual": proof_dir / f"manager-ps-poc-{stamp}.manual.md",
+    }
+
+
+def write_manager_ps_poc_manual_note(path: Path, proof: dict[str, Any]) -> None:
+    lines = [
+        "# tmux-skills manager /ps PoC manual evidence",
+        "",
+        f"status: {proof.get('status')}",
+        f"workspace: {proof.get('workspace')}",
+        f"checked_at: {proof.get('checked_at')}",
+        "",
+        "This artifact is not a passing proof. Mark it passing only after the same launcher planned for",
+        "`manager start --process-mode background` satisfies every item below.",
+        "",
+        "- manager start returns quickly and main Codex is idle.",
+        "- Codex `/ps` shows the manager process by name or pid.",
+        "- Manager heartbeat continues while Codex is idle.",
+        "- Stopping/exiting Codex stops only the manager.",
+        "- An already submitted tmux worker job keeps running and emitting output.",
+        "- No hook wakeup or tmux send-keys into the Codex pane is used.",
+        "",
+        "operator_confirmation: pending",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def manager_ps_poc(workspace: str | None = None, state_dir: str | None = None) -> dict[str, Any]:
+    paths = manager_paths(workspace, state_dir)
+    artifact_paths = manager_ps_poc_paths(paths)
+    proof = {
+        "poc": "manager_ps_background_terminal",
+        "status": MANAGER_PS_POC_STATUS_UNSUPPORTED,
+        "supported": False,
+        "checked_at": tmux_state.utc_now(),
+        "workspace": str(paths["workspace"]),
+        "state_dir": str(paths["root"]),
+        "reason": (
+            "tmux-skills has no verified Codex-owned background terminal launcher. "
+            "A detached daemon, tmux-resident manager loop, OS ps check, or bridge-only daemon "
+            "does not prove Codex /ps visibility while main Codex is idle."
+        ),
+        "checks": [
+            {
+                "name": "codex_background_terminal_launch_surface",
+                "status": "missing",
+                "required": "start a long-running manager from Codex and return control to an idle main Codex thread",
+            },
+            {
+                "name": "codex_ps_visibility",
+                "status": "unverified",
+                "required": "Codex /ps shows the manager process, not just an OS process listing",
+            },
+            {
+                "name": "codex_exit_stops_manager_only",
+                "status": "unverified",
+                "required": "Codex exit stops the manager but not an already submitted tmux worker job",
+            },
+            {
+                "name": "forbidden_wakeup_mechanisms",
+                "status": "not_used",
+                "required": "no hook wakeup and no tmux send-keys into a Codex pane",
+            },
+        ],
+        "proof_path": str(artifact_paths["json"]),
+        "manual_note_path": str(artifact_paths["manual"]),
+    }
+    tmux_state.atomic_write_json(artifact_paths["json"], proof)
+    write_manager_ps_poc_manual_note(artifact_paths["manual"], proof)
+    return proof
 
 
 def manager_command_request_path(paths: dict[str, Path], manager_id: str, job_id: str) -> Path:
@@ -259,8 +348,11 @@ def normalize_manager_record(record: dict[str, Any], paths: dict[str, Path] | No
     normalized.setdefault("last_ack", None)
     normalized.setdefault("last_error", None)
     normalized.setdefault("dashboard_path", str(manager_dashboard_path(paths, manager_id)) if paths else None)
-    normalized.setdefault("manager_process_mode", "foreground")
+    normalized["manager_process_mode"] = manager_process_mode_value(str(normalized.get("manager_process_mode") or "foreground"))
     normalized.setdefault("manager_pid", None)
+    normalized.setdefault("manager_launcher", "foreground-codex-command")
+    normalized.setdefault("manager_exit_watch", "foreground-command-lifetime")
+    normalized.setdefault("manager_dashboard_owner", "manager-loop")
     normalized.setdefault("manager_process_started_at", None)
     try:
         log_max_bytes = int(normalized.get("log_max_bytes") or DEFAULT_MANAGER_LOG_MAX_BYTES)
@@ -337,6 +429,7 @@ def build_manager_record(
     attach_command: str | None = None,
     poll_seconds: float = 2.0,
     log_max_bytes: int = DEFAULT_MANAGER_LOG_MAX_BYTES,
+    process_mode: str = "foreground",
 ) -> dict[str, Any]:
     paths = manager_paths(workspace, state_dir)
     now = tmux_state.utc_now()
@@ -365,8 +458,11 @@ def build_manager_record(
             "last_ack": None,
             "last_error": None,
             "dashboard_path": str(manager_dashboard_path(paths, manager_id)),
-            "manager_process_mode": "foreground",
+            "manager_process_mode": manager_process_mode_value(process_mode),
             "manager_pid": os.getpid(),
+            "manager_launcher": "foreground-codex-command",
+            "manager_exit_watch": "foreground-command-lifetime",
+            "manager_dashboard_owner": "manager-loop",
             "manager_process_started_at": now,
             "attach_command": attach_command,
             "poll_seconds": poll_seconds,
@@ -1341,6 +1437,8 @@ def dashboard_text(record: dict[str, Any], job_status: dict[str, Any] | None = N
         "tmux-skills manager",
         f"manager_id: {record.get('manager_id')}",
         f"status: {record.get('status')}",
+        f"manager_process_mode: {record.get('manager_process_mode') or 'foreground'}",
+        f"manager_launcher: {record.get('manager_launcher') or 'none'}",
         f"manager_pane_id: {record.get('manager_pane_id')}",
         f"worker_pane_id: {record.get('worker_pane_id')}",
         f"current_job_id: {current_job_id}",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -85,6 +86,27 @@ class TmuxManagerTests(unittest.TestCase):
             ):
                 self.assertIn(key, loaded)
             self.assertEqual(record["manager_path"], str(paths["managers"] / "manager-one.json"))
+            self.assertEqual(loaded["manager_process_mode"], "foreground")
+            self.assertEqual(loaded["manager_launcher"], "foreground-codex-command")
+
+    def test_manager_ps_poc_writes_unsupported_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+
+            result = tmux_manager.manager_ps_poc(str(workspace))
+
+            self.assertFalse(result["supported"])
+            self.assertEqual(result["status"], tmux_manager.MANAGER_PS_POC_STATUS_UNSUPPORTED)
+            proof_path = Path(result["proof_path"])
+            manual_path = Path(result["manual_note_path"])
+            self.assertTrue(proof_path.exists())
+            self.assertTrue(manual_path.exists())
+            self.assertEqual(proof_path.parent, (workspace / ".codex" / "tmux-skills" / "proofs").resolve())
+            proof = json.loads(proof_path.read_text(encoding="utf-8"))
+            self.assertEqual(proof["status"], tmux_manager.MANAGER_PS_POC_STATUS_UNSUPPORTED)
+            self.assertIn("codex_ps_visibility", {item["name"] for item in proof["checks"]})
+            self.assertIn("operator_confirmation: pending", manual_path.read_text(encoding="utf-8"))
 
     def test_idle_manager_record_waits_for_run_next(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:

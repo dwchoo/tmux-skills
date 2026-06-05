@@ -129,10 +129,15 @@ Expected layout:
 
 Expected process ownership:
 
-- `manager start` is a foreground Codex-owned process by default. Do not detach it into tmux; keep it running so Codex `/ps` can report it.
-- If Codex exits or stops the process, the manager loop exits and no longer sends bridge notifications or updates the dashboard.
-- The worker job already submitted to the worker pane continues independently because it runs through `tmux_control.py run` inside tmux.
-- The dashboard pane is only a visible display surface for manager state; it is not the manager process and must not run a persistent renderer loop.
+| Mode | Launcher | Codex state | `/ps` expectation | Codex exit behavior | Worker behavior | Dashboard ownership |
+| --- | --- | --- | --- | --- | --- | --- |
+| `foreground-debug` | `manager start --process-mode foreground` in the current Codex command process | Codex remains working while the manager loop runs | Best effort only, because the foreground command may appear as current work rather than an idle background terminal | Stopping Codex or the foreground command stops the manager loop | Jobs already submitted through `tmux_control.py run` continue in the worker pane | Manager loop writes a bounded dashboard file and refreshes the compact pane |
+| `background-operating` | A Codex-owned background terminal launch surface, only after `manager ps-poc` proves it | Main Codex must become idle after start returns | Required: the manager process must be identifiable in Codex `/ps` | Codex-owned background terminal shutdown stops only the manager | Jobs already submitted through `tmux_control.py run` continue in the worker pane | Background manager updates the same compact dashboard surface |
+| `unsupported_by_current_codex_surface` | No supported launcher | Not supported | Not supported | Not supported | Existing worker jobs are unaffected by this refusal | Existing dashboard/evidence is left intact |
+
+`manager start --process-mode background` must refuse to queue work until the PoC proves the launch surface. Do not replace this with a plain daemon, tmux-resident manager process, bridge-only daemon, OS `ps` check, or `tmux send-keys`; those alternatives do not prove Codex `/ps` visibility while main Codex is idle.
+
+Run `python scripts/tmux_control.py manager ps-poc` before changing the operating default. The PoC records evidence under `.codex/tmux-skills/proofs/` and is successful only when the same launch path planned for `manager start` returns quickly, leaves main Codex idle, shows the manager in `/ps`, keeps manager heartbeat advancing, stops the manager when Codex exits, and leaves an already submitted worker job running in tmux. If `/ps` cannot be verified automatically, the evidence artifact must say so explicitly; an OS process listing is not an equivalent proof.
 
 Expected state:
 
@@ -159,6 +164,7 @@ Terminal behavior:
 Follow-up and cancellation:
 
 ```bash
+python scripts/tmux_control.py manager ps-poc
 python scripts/tmux_control.py manager status
 python scripts/tmux_control.py manager bridge-check
 python scripts/tmux_control.py manager ack --event-id EVENT_ID

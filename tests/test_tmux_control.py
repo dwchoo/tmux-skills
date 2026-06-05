@@ -226,6 +226,14 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(start_args.action, "manager")
         self.assertEqual(start_args.manager_action, "start")
         self.assertEqual(start_args.notify, "bridge")
+        self.assertEqual(start_args.process_mode, "foreground")
+
+        background_start_args = parser.parse_args(["manager", "start", "--notify", "none", "--process-mode", "background"])
+        self.assertEqual(background_start_args.manager_action, "start")
+        self.assertEqual(background_start_args.process_mode, "background")
+
+        ps_poc_args = parser.parse_args(["manager", "ps-poc", "--workspace", "/tmp/workspace"])
+        self.assertEqual(ps_poc_args.manager_action, "ps-poc")
 
         default_start_args = parser.parse_args(
             ["manager", "start", "--job-id", "job-one", "--command", "echo ok", "--notify", "none"]
@@ -302,6 +310,42 @@ class TmuxControlTests(unittest.TestCase):
         self.assertFalse(result["started"])
         self.assertEqual(result["status"], "failed")
         self.assertIn("--job-id", result["reason"])
+
+    def test_manager_start_background_refuses_before_layout_and_command_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            parser = tmux_control.build_parser()
+            args = parser.parse_args(
+                [
+                    "manager",
+                    "start",
+                    "--manager-id",
+                    "manager-one",
+                    "--job-id",
+                    "job-one",
+                    "--command",
+                    "echo ok",
+                    "--notify",
+                    "none",
+                    "--process-mode",
+                    "background",
+                    "--workspace",
+                    str(workspace),
+                ]
+            )
+
+            with mock.patch.object(tmux_control, "manager_layout") as layout:
+                result = tmux_control.manager(args)
+
+            layout.assert_not_called()
+            self.assertFalse(result["started"])
+            self.assertEqual(result["status"], tmux_manager.MANAGER_PS_POC_STATUS_UNSUPPORTED)
+            self.assertEqual(result["manager_process_mode"], "background")
+            self.assertTrue(Path(result["proof_path"]).exists())
+            paths = tmux_manager.manager_paths(str(workspace))
+            self.assertFalse(tmux_manager.manager_command_request_path(paths, "manager-one", "job-one").exists())
+            self.assertFalse(tmux_manager.manager_record_path(paths, "manager-one").exists())
 
     def test_manager_start_with_bridge_command_requires_verified_receipt_before_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:

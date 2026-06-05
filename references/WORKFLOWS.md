@@ -21,11 +21,21 @@ python scripts/tmux_control.py manager bridge-check
 python scripts/tmux_control.py manager run-next --job-id train-1 --command "python train.py"
 ```
 
-Use this as the default long-task workflow when the manager process should remain visible to Codex `/ps`, worker output should stay readable in a long side pane, and one reusable compact manager pane should remain visible below Codex in tmux. Start one manager first, then submit the first and later scripts with `manager run-next`. Inside tmux it uses the current session/window. Outside tmux it creates a normal visible default-socket session and prints the `tmux attach -t SESSION` command.
+Use the current `foreground-debug` manager workflow when worker output should stay readable in a long side pane and one reusable compact manager pane should remain visible below Codex in tmux. This mode is for debug/demo use because the manager command keeps main Codex working while it runs. The intended `background-operating` workflow must not become the default until `manager ps-poc` proves that the same launcher can return quickly, leave Codex idle, show the manager in Codex `/ps`, stop the manager when Codex exits, and leave an already submitted tmux worker running.
 
-`manager start` is foreground and Codex-owned by default. Keep the command running so Codex `/ps` can report it. If Codex exits, this manager loop exits too; worker jobs already submitted to the tmux worker pane continue independently.
+`manager start --process-mode foreground` is the supported mode. `manager start --process-mode background` fails with `unsupported_by_current_codex_surface` until the PoC evidence exists; do not replace it with a detached daemon, tmux-resident manager loop, OS `ps` check, or bridge-only daemon because those do not satisfy Codex `/ps` visibility while Codex is idle. In foreground-debug, if Codex exits or stops the command, this manager loop exits too; worker jobs already submitted to the tmux worker pane continue independently.
 
 The manager writes `.codex/tmux-skills/managers/<manager_id>.json`, starts the worker through `tmux_control.py run`, and updates the reusable manager pane with heartbeat, status path, log path, task path, and worker pane details. The manager pane must not run a persistent renderer loop. Manager-owned logs are trimmed to a bounded tail while the manager is alive. When Codex receives a bridge turn, it should read the manager path from the prompt, acknowledge the current target event, then use `capture` on the worker pane for live terminal output when responding. For bridge preflight prompts, acknowledge `bridge_verification.event_id`; for terminal prompts, acknowledge `last_terminal_event_id`. On success, failure, stop, timeout, cancellation, stale status, or missing worker pane, the Codex-owned process stays alive as `waiting_for_codex`.
+
+Proof gate:
+
+```bash
+python scripts/tmux_control.py manager ps-poc
+python scripts/tmux_control.py manager start --process-mode foreground --notify none
+python scripts/tmux_control.py manager start --process-mode background --notify none
+```
+
+The background command refuses until PoC evidence proves the Codex-owned background terminal launch surface.
 
 When no worker pane is assigned, `manager start` splits Codex vertically first so the worker gets a tall right-side pane. Only the compact manager pane is placed below Codex. Repeated starts reuse the idle manager pane directly below Codex and reuse an existing idle tall worker pane when possible. A single manager record owns multiple job ids instead of creating a new manager for each job.
 By default the manager id is stable per workspace/session/window. Pass `--manager-id` only when you need an explicit compatibility id.

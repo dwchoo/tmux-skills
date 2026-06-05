@@ -1290,6 +1290,21 @@ def manager_start(args: argparse.Namespace) -> dict[str, Any]:
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir, current)
     except Exception as exc:
         return {"manager_id": args.manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": str(exc)}
+    process_mode = tmux_manager.manager_process_mode_value(getattr(args, "process_mode", "foreground"))
+    if process_mode == "background":
+        proof = tmux_manager.manager_ps_poc(args.workspace, args.state_dir)
+        return {
+            "manager_id": manager_id,
+            "job_id": job_id,
+            "started": False,
+            "status": tmux_manager.MANAGER_PS_POC_STATUS_UNSUPPORTED,
+            "reason": proof["reason"],
+            "manager_process_mode": "background",
+            "proof_path": proof["proof_path"],
+            "manual_note_path": proof["manual_note_path"],
+            "workspace": str(paths["workspace"]),
+            "state_dir": str(paths["root"]),
+        }
     existing_record, record_error = tmux_manager.read_manager_record(paths, manager_id)
     if record_error:
         return {"manager_id": manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": record_error}
@@ -1341,7 +1356,10 @@ def manager_start(args: argparse.Namespace) -> dict[str, Any]:
                 "state_dir": str(paths["root"]),
                 "attach_command": layout.get("attach_command"),
                 "poll_seconds": args.poll_seconds,
-                "manager_process_mode": "foreground",
+                "manager_process_mode": process_mode,
+                "manager_launcher": "foreground-codex-command",
+                "manager_exit_watch": "foreground-command-lifetime",
+                "manager_dashboard_owner": "manager-loop",
                 "last_error": None,
                 "log_max_bytes": getattr(args, "log_max_bytes", tmux_manager.DEFAULT_MANAGER_LOG_MAX_BYTES),
             }
@@ -1362,6 +1380,7 @@ def manager_start(args: argparse.Namespace) -> dict[str, Any]:
             attach_command=layout.get("attach_command"),
             poll_seconds=args.poll_seconds,
             log_max_bytes=getattr(args, "log_max_bytes", tmux_manager.DEFAULT_MANAGER_LOG_MAX_BYTES),
+            process_mode=process_mode,
         )
     record = tmux_manager.write_manager_record(paths, record)
     dashboard_path = Path(str(record["dashboard_path"]))
@@ -1374,7 +1393,7 @@ def manager_start(args: argparse.Namespace) -> dict[str, Any]:
         "manager_path": record["manager_path"],
         "dashboard_path": record["dashboard_path"],
         "manager_process_mode": record.get("manager_process_mode") or "foreground",
-        "start_process_mode": "existing" if existing_manager_alive else "foreground",
+        "start_process_mode": "existing" if existing_manager_alive else process_mode,
         "queued_on_existing_manager": existing_manager_alive,
         "command_request_path": str(request_path) if request_path else None,
         "workspace": str(paths["workspace"]),
@@ -1390,6 +1409,8 @@ def manager(args: argparse.Namespace) -> dict[str, Any]:
     if args.manager_action == "status":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
         return tmux_manager.manager_status(manager_id, args.workspace, args.state_dir)
+    if args.manager_action == "ps-poc":
+        return tmux_manager.manager_ps_poc(args.workspace, args.state_dir)
     if args.manager_action == "bridge-check":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
         return tmux_manager.bridge_check_manager(
@@ -3791,6 +3812,11 @@ def build_parser() -> argparse.ArgumentParser:
     manager_start_parser.add_argument("--state-dir")
     manager_start_parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
     manager_start_parser.add_argument("--log-max-bytes", type=positive_int, default=tmux_manager.DEFAULT_MANAGER_LOG_MAX_BYTES)
+    manager_start_parser.add_argument("--process-mode", choices=["foreground", "background"], default="foreground")
+
+    manager_ps_poc_parser = manager_subparsers.add_parser("ps-poc", help="Write manager /ps background-terminal PoC evidence")
+    manager_ps_poc_parser.add_argument("--workspace")
+    manager_ps_poc_parser.add_argument("--state-dir")
 
     manager_status_parser = manager_subparsers.add_parser("status", help="Show one manager record")
     manager_status_parser.add_argument("--manager-id")
