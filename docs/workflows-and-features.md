@@ -24,7 +24,7 @@ The preferred flow is:
 | Pane discovery | Find stable pane ids instead of relying on visual pane positions. | `list`, `current`, `resolve` | `SKILL.md` |
 | Safe send | Avoid injecting commands into busy panes or non-executable scripts by accident. | `send --require-idle-shell`, `send --strict-preflight`, `send --bash-if-not-executable` | `managed-workers.md` |
 | Long-running jobs | Run work with command files, logs, status JSON, and optional follow-up tasks. | `run --command`, `run --next-instruction` | `SKILL.md`, `references/WORKFLOWS.md` |
-| Visible manager | Keep a Codex-owned manager process plus worker/dashboard panes visible, then notify main Codex through bridge when terminal work needs review. | `manager start`, `manager status`, `manager run-next`, `manager cancel` | `SKILL.md`, `references/WORKFLOWS.md` |
+| Visible manager | Keep a Codex-owned manager process plus worker/dashboard panes visible, then notify main Codex through bridge when terminal work needs review. | `manager start`, `manager status`, `manager ack`, `manager run-next`, `manager cancel` | `SKILL.md`, `references/WORKFLOWS.md` |
 | Pane monitor | Watch a pane until one match, idle-shell event, timeout, or stop signal writes terminal status. | `monitor --match-regex`, `monitor --idle-shell` | `references/WORKFLOWS.md` |
 | Managed watch | Keep active pane/status observation in managed records without raw shell watcher processes. | `watch`, `watch status`, `watch cancel` | `managed-workers.md` |
 | Queue after idle | Submit the next command only after a busy pane returns to an idle shell. | `queue-after-idle` | `managed-workers.md` |
@@ -138,22 +138,24 @@ Expected state:
 - Required fields include `manager_id`, `status`, `manager_pane_id`, `worker_pane_id`, `current_job_id`, `job_ids`, `notify`, `heartbeat_at`, `last_terminal_event_id`, `workspace`, and `state_dir`.
 - The default manager id is one stable id per workspace/session/window; `--manager-id` is kept for explicit compatibility, but the default workflow uses one manager to own multiple jobs.
 - The Codex-owned manager starts jobs through `tmux_control.py run`, so normal command, log, status, acknowledgement, and optional task files still use the existing `.codex/tmux-skills` directories.
-- Manager-owned logs are bounded by `log_max_bytes` and are trimmed to a tail while the manager is alive, so log files do not grow without limit. Codex should use `tmux_control.py capture --pane <worker_pane_id>` for live or recent terminal output, and read bounded status/log files only when that is sufficient.
+- Manager-owned logs are bounded by `log_max_bytes` and are trimmed to a tail while the manager is alive, so log files do not grow without limit. When Codex receives a bridge turn, it should first acknowledge the event with `manager ack --event-id <last_terminal_event_id>`, then use `tmux_control.py capture --pane <worker_pane_id>` for live or recent terminal output, and read bounded status/log files only when that is sufficient.
 
 Terminal behavior:
 
 - On `succeeded`, `failed`, `stopped`, `timeout`, `cancelled`, `stale`, or missing worker pane, the manager records `waiting_for_codex` and keeps the dashboard open.
 - With bridge notification enabled, the manager submits a path-only prompt for the terminal event, then waits. The prompt includes workspace, manager path, job/status/log/task paths, and no summaries, task instruction bodies, diagnosis, retry commands, or model/delegation instructions.
 - Normal operation must not rely on Codex polling `manager status`. Main Codex should learn about terminal work from the manager's bridge turn, then inspect only the paths listed in that prompt.
-- If bridge delivery fails, the manager keeps retrying while it remains alive and does not mark the event as notified until delivery succeeds. Successful delivery is recorded once per terminal event in `notified_event_ids`.
-- Use `manager status` only for manual diagnostics or tests: `heartbeat_at` should advance while the manager loop is alive, `last_terminal_event_id` should match the terminal job event, and `last_notification` should show either successful bridge delivery metadata or the latest retryable delivery error.
-- `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH` before work starts. Use `--notify none` only for manual visible-dashboard debugging; it intentionally records no Codex delivery.
+- Successful app-server submission is recorded once per terminal event in `submitted_event_ids` and `last_notification.submitted_to_app_server`; it does not prove Codex received or acted on the turn. Codex receipt is recorded only after main Codex runs `manager ack --event-id <last_terminal_event_id>`.
+- If bridge submission fails, the manager keeps retrying while it remains alive and does not mark the event as submitted until submission succeeds. `last_notification.error` records the latest retryable submission failure.
+- Use `manager status` only for manual diagnostics or tests: `heartbeat_at` should advance while the manager loop is alive, `last_terminal_event_id` should match the terminal job event, and `notifications` should show lifecycle states such as `awaiting_ack`, `acknowledged`, and `handled`.
+- `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH` before work starts. Use `--notify none` only for manual visible-dashboard debugging; it intentionally records no Codex ack.
 - The manager never uses `tmux send-keys` to inject text into a Codex pane.
 
 Follow-up and cancellation:
 
 ```bash
 python scripts/tmux_control.py manager status
+python scripts/tmux_control.py manager ack --event-id EVENT_ID
 python scripts/tmux_control.py manager run-next --job-id train-2 --command 'python eval.py'
 python scripts/tmux_control.py manager cancel
 python scripts/tmux_control.py manager cancel --stop-worker

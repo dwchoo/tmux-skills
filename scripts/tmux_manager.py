@@ -120,8 +120,17 @@ def normalize_manager_record(record: dict[str, Any], paths: dict[str, Path] | No
     normalized.setdefault("updated_at", normalized.get("created_at"))
     normalized.setdefault("pending_job", None)
     normalized.setdefault("jobs", {})
-    normalized.setdefault("notified_event_ids", [])
+    notified_event_ids = normalized.get("notified_event_ids")
+    normalized["notified_event_ids"] = [str(value) for value in notified_event_ids] if isinstance(notified_event_ids, list) else []
+    submitted_event_ids = normalized.get("submitted_event_ids")
+    if isinstance(submitted_event_ids, list):
+        normalized["submitted_event_ids"] = [str(value) for value in submitted_event_ids]
+    else:
+        normalized["submitted_event_ids"] = list(normalized["notified_event_ids"])
+    notifications = normalized.get("notifications")
+    normalized["notifications"] = [dict(value) for value in notifications if isinstance(value, dict)] if isinstance(notifications, list) else []
     normalized.setdefault("last_notification", None)
+    normalized.setdefault("last_ack", None)
     normalized.setdefault("last_error", None)
     normalized.setdefault("dashboard_path", str(manager_dashboard_path(paths, manager_id)) if paths else None)
     normalized.setdefault("manager_process_mode", "foreground")
@@ -221,7 +230,10 @@ def build_manager_record(
             "pending_job": pending_job,
             "jobs": {},
             "notified_event_ids": [],
+            "submitted_event_ids": [],
+            "notifications": [],
             "last_notification": None,
+            "last_ack": None,
             "last_error": None,
             "dashboard_path": str(manager_dashboard_path(paths, manager_id)),
             "manager_process_mode": "foreground",
@@ -232,6 +244,61 @@ def build_manager_record(
             "log_max_bytes": log_max_bytes,
         },
         paths,
+    )
+
+
+def append_unique_text(record: dict[str, Any], field: str, value: str) -> None:
+    values = [tmux_state.one_line_text(item) for item in record.get(field, []) if tmux_state.one_line_text(item)]
+    if value not in values:
+        values.append(value)
+    record[field] = values
+
+
+def notification_for_event(record: dict[str, Any], event_id: str) -> dict[str, Any] | None:
+    for notification in record.get("notifications", []):
+        if isinstance(notification, dict) and str(notification.get("event_id") or "") == event_id:
+            return dict(notification)
+    return None
+
+
+def upsert_notification(record: dict[str, Any], event_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    notifications: list[dict[str, Any]] = []
+    updated: dict[str, Any] | None = None
+    for value in record.get("notifications", []):
+        if not isinstance(value, dict):
+            continue
+        item = dict(value)
+        if str(item.get("event_id") or "") == event_id:
+            item.update(fields)
+            updated = item
+        notifications.append(item)
+    if updated is None:
+        updated = dict(fields)
+        updated["event_id"] = event_id
+        notifications.append(updated)
+    record["notifications"] = notifications
+    record["last_notification"] = updated
+    return record
+
+
+def mark_last_terminal_event_handled(record: dict[str, Any], *, next_job_id: str) -> dict[str, Any]:
+    event_id = str(record.get("last_terminal_event_id") or "")
+    if not event_id:
+        return record
+    notification = notification_for_event(record, event_id)
+    if notification is None:
+        return record
+    now = tmux_state.utc_now()
+    acknowledged = bool(notification.get("acknowledged_by_codex"))
+    return upsert_notification(
+        record,
+        event_id,
+        {
+            "status": "handled" if acknowledged else "handled_without_ack",
+            "handled_at": now,
+            "handled_by_job_id": next_job_id,
+            "handled_without_ack": not acknowledged,
+        },
     )
 
 
@@ -266,6 +333,7 @@ def queue_manager_job(
         return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "command is blank"}
 
     request_path = write_command_request(paths, record["manager_id"], item_id, str(text))
+    record = mark_last_terminal_event_handled(record, next_job_id=item_id)
     record["pending_job"] = build_pending_job(item_id, request_path, cwd)
     record["status"] = "queued"
     record["last_error"] = None
@@ -276,6 +344,69 @@ def queue_manager_job(
         "queued": True,
         "manager_path": record["manager_path"],
         "command_request_path": str(request_path),
+        "record": record,
+    }
+
+
+def ack_manager_event(
+    *,
+    manager_id: str,
+    event_id: str,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    turn_id: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    item_id = manager_id_value(manager_id)
+    if not tmux_state.one_line_text(event_id):
+        return {"manager_id": item_id, "event_id": event_id, "acked": False, "reason": "manager ack requires nonblank --event-id"}
+    paths = manager_paths(workspace, state_dir)
+    record, error = read_manager_record(paths, item_id)
+    target_event_id = str(event_id)
+    if error:
+        return {"manager_id": item_id, "event_id": target_event_id, "acked": False, "reason": error}
+    if record is None:
+        return {"manager_id": item_id, "event_id": target_event_id, "acked": False, "reason": "manager record not found"}
+
+    existing = notification_for_event(record, target_event_id)
+    if existing is None and target_event_id != str(record.get("last_terminal_event_id") or ""):
+        return {"manager_id": item_id, "event_id": target_event_id, "acked": False, "reason": "event not found in manager record"}
+
+    now = tmux_state.utc_now()
+    existing_status = str((existing or {}).get("status") or "")
+    status = "handled" if existing_status.startswith("handled") else "acknowledged"
+    ack_fields = {
+        "event_id": target_event_id,
+        "mode": (existing or {}).get("mode") or "manual",
+        "source": (existing or {}).get("source") or "manager_ack",
+        "job_id": (existing or {}).get("job_id") or record.get("current_job_id"),
+        "status": status,
+        "acknowledged_by_codex": True,
+        "acknowledged_at": now,
+        "ack_turn_id": tmux_state.one_line_text(turn_id),
+        "ack_note": tmux_state.one_line_text(note),
+    }
+    if existing_status.startswith("handled"):
+        ack_fields["handled_without_ack"] = False
+    elif existing and "handled_without_ack" in existing:
+        ack_fields["handled_without_ack"] = existing["handled_without_ack"]
+    record = upsert_notification(
+        record,
+        target_event_id,
+        ack_fields,
+    )
+    record["last_ack"] = {
+        "event_id": target_event_id,
+        "acknowledged_at": now,
+        "turn_id": tmux_state.one_line_text(turn_id),
+        "note": tmux_state.one_line_text(note),
+    }
+    record = write_manager_record(paths, record)
+    return {
+        "manager_id": item_id,
+        "event_id": target_event_id,
+        "acked": True,
+        "manager_path": record["manager_path"],
         "record": record,
     }
 
@@ -479,31 +610,45 @@ def worker_missing_event_id(record: dict[str, Any]) -> str:
 def build_manager_wake_prompt(record: dict[str, Any], candidate: dict[str, Any]) -> str:
     return "\n".join(
         [
-            "tmux-control manager observed a terminal event.",
-            "",
             f"Workspace: {record.get('workspace')}",
             f"Manager path: {record.get('manager_path') or 'none'}",
-            f"Job ID: {candidate.get('job_id') or 'unknown'}",
             f"Status path: {candidate.get('status_path') or 'none'}",
             f"Task path: {candidate.get('task_path') or 'none'}",
             f"Log path: {candidate.get('log_path') or 'none'}",
-            "",
-            "Please inspect these paths and continue the requested work.",
         ]
     )
 
 
 def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     event_id = str(candidate["event_id"])
-    notified = list(record.get("notified_event_ids") or [])
-    if event_id in notified:
+    submitted = list(record.get("submitted_event_ids") or [])
+    if event_id in submitted:
         return record
     notify = record.get("notify") if isinstance(record.get("notify"), dict) else {"mode": "none"}
     now = tmux_state.utc_now()
+    existing = notification_for_event(record, event_id) or {}
+    base = {
+        "event_id": event_id,
+        "source": candidate.get("source"),
+        "job_id": candidate.get("job_id"),
+        "status_path": candidate.get("status_path"),
+        "task_path": candidate.get("task_path"),
+        "log_path": candidate.get("log_path"),
+        "observed_at": existing.get("observed_at") or now,
+        "acknowledged_by_codex": bool(existing.get("acknowledged_by_codex")),
+    }
     if notify.get("mode") == "none":
-        record["last_notification"] = {"event_id": event_id, "mode": "none", "attempted_at": now, "delivered": False}
-        notified.append(event_id)
-        record["notified_event_ids"] = notified
+        record = upsert_notification(
+            record,
+            event_id,
+            base
+            | {
+                "mode": "none",
+                "status": "dashboard_only",
+                "submit_attempted_at": now,
+                "submitted_to_app_server": False,
+            },
+        )
         return record
     prompt = build_manager_wake_prompt(record, candidate)
     bridge_record = {
@@ -513,24 +658,35 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
     }
     try:
         delivery = tmux_bridge.deliver_bridge_candidate(bridge_record, candidate, prompt)
-        record["last_notification"] = {
-            "event_id": event_id,
-            "mode": "bridge",
-            "attempted_at": now,
-            "delivered": True,
-            "prompt_sha256": delivery.get("prompt_sha256"),
-            "delivery": delivery,
-        }
-        notified.append(event_id)
-        record["notified_event_ids"] = notified
+        record = upsert_notification(
+            record,
+            event_id,
+            base
+            | {
+                "mode": "bridge",
+                "status": "acknowledged" if existing.get("acknowledged_by_codex") else "awaiting_ack",
+                "submit_attempted_at": now,
+                "submitted_at": now,
+                "submitted_to_app_server": True,
+                "prompt_sha256": delivery.get("prompt_sha256"),
+                "delivery": delivery,
+            },
+        )
+        append_unique_text(record, "submitted_event_ids", event_id)
+        append_unique_text(record, "notified_event_ids", event_id)
     except Exception as exc:
-        record["last_notification"] = {
-            "event_id": event_id,
-            "mode": "bridge",
-            "attempted_at": now,
-            "delivered": False,
-            "error": str(exc),
-        }
+        record = upsert_notification(
+            record,
+            event_id,
+            base
+            | {
+                "mode": "bridge",
+                "status": "submission_failed",
+                "submit_attempted_at": now,
+                "submitted_to_app_server": False,
+                "error": str(exc),
+            },
+        )
     return record
 
 
@@ -583,8 +739,8 @@ def manager_cycle(record: dict[str, Any], *, paths: dict[str, Path]) -> dict[str
         candidate = record.get("last_terminal_candidate")
         notify = record.get("notify") if isinstance(record.get("notify"), dict) else {}
         event_id = str(candidate.get("event_id") or "") if isinstance(candidate, dict) else ""
-        notified = list(record.get("notified_event_ids") or [])
-        if notify.get("mode") == "bridge" and event_id and event_id not in notified:
+        submitted = list(record.get("submitted_event_ids") or [])
+        if notify.get("mode") == "bridge" and event_id and event_id not in submitted:
             record = notify_terminal_event(record, candidate)
         return record
     if record.get("current_job_id") and not pane_exists(str(record.get("worker_pane_id") or "")):
@@ -790,13 +946,24 @@ def dashboard_text(record: dict[str, Any], job_status: dict[str, Any] | None = N
         )
     notification = record.get("last_notification")
     if isinstance(notification, dict):
-        lines.append(f"last_notification: {notification.get('mode')} delivered={notification.get('delivered')}")
+        lines.append(
+            "last_notification: "
+            f"{notification.get('mode')} "
+            f"status={notification.get('status') or 'unknown'} "
+            f"submitted_to_app_server={notification.get('submitted_to_app_server')} "
+            f"acknowledged_by_codex={notification.get('acknowledged_by_codex')}"
+        )
         delivery = notification.get("delivery") if isinstance(notification.get("delivery"), dict) else {}
-        if notification.get("delivered"):
-            lines.append(f"last_notification_response_id: {delivery.get('response_id') or 'none'}")
-            lines.append(f"last_notification_turn_id: {delivery.get('turn_id') or 'none'}")
-        elif notification.get("error"):
+        if notification.get("submitted_to_app_server"):
+            lines.append(f"last_submission_response_id: {delivery.get('response_id') or 'none'}")
+            lines.append(f"last_submission_turn_id: {delivery.get('turn_id') or 'none'}")
+        if notification.get("acknowledged_by_codex"):
+            lines.append(f"last_ack_turn_id: {notification.get('ack_turn_id') or 'none'}")
+        if notification.get("error"):
             lines.append(f"last_notification_error: {notification.get('error')}")
+    last_ack = record.get("last_ack") if isinstance(record.get("last_ack"), dict) else {}
+    if last_ack:
+        lines.append(f"last_ack_event_id: {last_ack.get('event_id') or 'none'}")
     if record.get("last_error"):
         lines.append(f"last_error: {record.get('last_error')}")
     return "\n".join(lines)

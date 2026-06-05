@@ -24,20 +24,21 @@ Use this as the default long-task workflow when the manager process should remai
 
 `manager start` is foreground and Codex-owned by default. Keep the command running so Codex `/ps` can report it. If Codex exits, this manager loop exits too; worker jobs already submitted to the tmux worker pane continue independently.
 
-The manager writes `.codex/tmux-skills/managers/<manager_id>.json`, starts the worker through `tmux_control.py run`, and updates the reusable manager pane with heartbeat, status path, log path, task path, and worker pane details. The manager pane must not run a persistent renderer loop. Manager-owned logs are trimmed to a bounded tail while the manager is alive, and Codex should use `capture` on the worker pane for live terminal output when responding. On success, failure, stop, timeout, cancellation, stale status, or missing worker pane, the Codex-owned process stays alive as `waiting_for_codex`.
+The manager writes `.codex/tmux-skills/managers/<manager_id>.json`, starts the worker through `tmux_control.py run`, and updates the reusable manager pane with heartbeat, status path, log path, task path, and worker pane details. The manager pane must not run a persistent renderer loop. Manager-owned logs are trimmed to a bounded tail while the manager is alive. When Codex receives a bridge turn, it should first run `manager ack --event-id <last_terminal_event_id>`, then use `capture` on the worker pane for live terminal output when responding. On success, failure, stop, timeout, cancellation, stale status, or missing worker pane, the Codex-owned process stays alive as `waiting_for_codex`.
 
 When no worker pane is assigned, `manager start` splits Codex vertically first so the worker gets a tall right-side pane. Only the compact manager pane is placed below Codex. Repeated starts reuse the idle manager pane directly below Codex and reuse an existing idle tall worker pane when possible. A single manager record owns multiple job ids instead of creating a new manager for each job.
 By default the manager id is stable per workspace/session/window. Pass `--manager-id` only when you need an explicit compatibility id.
 If that manager process is already alive, another `manager start` exits instead of creating a second manager loop. Submit work with `manager run-next`; the same manager monitors the first and subsequent jobs.
 
-Bridge notifications are path-only and are delivered by the manager, not by Codex polling status files. They include workspace, manager path, job/status/log/task paths, and no status summaries, log excerpts, task instruction bodies, diagnosis, retry commands, or model/delegation text. `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH`; use `--notify none` only for manual visible-dashboard debugging.
-If bridge delivery fails, the live manager retries while it remains in `waiting_for_codex` and does not mark the event notified until delivery succeeds. Successful delivery is recorded once per terminal event in `notified_event_ids`.
-Use `manager status` only for manual diagnostics or tests: `heartbeat_at` advances while alive, `last_terminal_event_id` records the observed terminal event, and `last_notification` shows either bridge delivery metadata or the latest retryable delivery error.
+Bridge notifications are path-only and are submitted by the manager, not by Codex polling status files. They include workspace, manager path, job/status/log/task paths, and no status summaries, log excerpts, task instruction bodies, diagnosis, retry commands, or model/delegation text. `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH`; use `--notify none` only for manual visible-dashboard debugging.
+Successful app-server submission is recorded once per terminal event in `submitted_event_ids` and `last_notification.submitted_to_app_server`; it does not prove Codex received or acted on the turn. Codex receipt is recorded only after main Codex runs `manager ack --event-id <last_terminal_event_id>`.
+If bridge submission fails, the live manager retries while it remains in `waiting_for_codex` and does not mark the event submitted until submission succeeds. Use `manager status` only for manual diagnostics or tests: `heartbeat_at` advances while alive, `last_terminal_event_id` records the observed terminal event, and `notifications` shows lifecycle states such as `awaiting_ack`, `acknowledged`, and `handled`.
 
 Follow-up and cancellation:
 
 ```bash
 python scripts/tmux_control.py manager status
+python scripts/tmux_control.py manager ack --event-id EVENT_ID
 python scripts/tmux_control.py manager run-next --job-id train-2 --command "python eval.py"
 python scripts/tmux_control.py manager cancel
 python scripts/tmux_control.py manager cancel --stop-worker

@@ -242,6 +242,13 @@ class TmuxControlTests(unittest.TestCase):
         default_status_args = parser.parse_args(["manager", "status"])
         self.assertIsNone(default_status_args.manager_id)
 
+        ack_args = parser.parse_args(
+            ["manager", "ack", "--manager-id", "manager-one", "--event-id", "evt-one", "--turn-id", "turn-main"]
+        )
+        self.assertEqual(ack_args.manager_action, "ack")
+        self.assertEqual(ack_args.event_id, "evt-one")
+        self.assertEqual(ack_args.turn_id, "turn-main")
+
         next_args = parser.parse_args(
             ["manager", "run-next", "--manager-id", "manager-one", "--job-id", "job-two", "--command", "echo next"]
         )
@@ -289,6 +296,39 @@ class TmuxControlTests(unittest.TestCase):
         self.assertFalse(result["started"])
         self.assertEqual(result["status"], "failed")
         self.assertIn("--job-id", result["reason"])
+
+    def test_manager_ack_dispatches_to_tmux_manager(self) -> None:
+        parser = tmux_control.build_parser()
+        args = parser.parse_args(
+            [
+                "manager",
+                "ack",
+                "--manager-id",
+                "manager-one",
+                "--event-id",
+                "evt-one",
+                "--turn-id",
+                "turn-main",
+                "--note",
+                "received",
+                "--workspace",
+                "/tmp/workspace",
+            ]
+        )
+        result = {"manager_id": "manager-one", "event_id": "evt-one", "acked": True}
+
+        with mock.patch.object(tmux_manager, "ack_manager_event", return_value=result) as ack:
+            actual = tmux_control.manager(args)
+
+        self.assertEqual(actual, result)
+        ack.assert_called_once_with(
+            manager_id="manager-one",
+            event_id="evt-one",
+            workspace="/tmp/workspace",
+            state_dir=None,
+            turn_id="turn-main",
+            note="received",
+        )
 
     def test_manager_cleanup_refuses_live_manager_without_force(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:

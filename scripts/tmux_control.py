@@ -1379,6 +1379,16 @@ def manager(args: argparse.Namespace) -> dict[str, Any]:
     if args.manager_action == "status":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
         return tmux_manager.manager_status(manager_id, args.workspace, args.state_dir)
+    if args.manager_action == "ack":
+        manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
+        return tmux_manager.ack_manager_event(
+            manager_id=manager_id,
+            event_id=args.event_id,
+            workspace=args.workspace,
+            state_dir=args.state_dir,
+            turn_id=args.turn_id,
+            note=args.note,
+        )
     if args.manager_action == "run-next":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
         return tmux_manager.queue_manager_job(
@@ -3768,6 +3778,14 @@ def build_parser() -> argparse.ArgumentParser:
     manager_status_parser.add_argument("--workspace")
     manager_status_parser.add_argument("--state-dir")
 
+    manager_ack_parser = manager_subparsers.add_parser("ack", help="Acknowledge that Codex received a manager terminal event")
+    manager_ack_parser.add_argument("--manager-id")
+    manager_ack_parser.add_argument("--event-id", required=True)
+    manager_ack_parser.add_argument("--turn-id")
+    manager_ack_parser.add_argument("--note")
+    manager_ack_parser.add_argument("--workspace")
+    manager_ack_parser.add_argument("--state-dir")
+
     manager_next_parser = manager_subparsers.add_parser("run-next", help="Queue follow-up work for a manager")
     manager_next_parser.add_argument("--manager-id")
     manager_next_parser.add_argument("--job-id", required=True)
@@ -4083,6 +4101,8 @@ def main() -> None:
         else:
             print_json(result)
         if args.manager_action == "start" and not result.get("started"):
+            raise SystemExit(2)
+        if args.manager_action == "ack" and not result.get("acked"):
             raise SystemExit(2)
         if args.manager_action == "run-next" and not result.get("queued"):
             raise SystemExit(2)
