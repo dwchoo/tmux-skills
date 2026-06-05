@@ -100,15 +100,17 @@ Resume behavior:
 
 ## Workflow: Run a Visible Manager Long Task
 
-Use this as the default long-task workflow when a main Codex thread should be able to see the manager in `/ps`, keep worker output readable in a long side pane, see one compact reusable manager pane below Codex, and let worker jobs continue if Codex exits.
+Use this as the default long-task workflow when a main Codex thread should be able to see the manager in `/ps`, keep worker output readable in a long side pane, see one compact reusable manager pane below Codex, and let worker jobs continue if Codex exits. Start the manager first, then submit each long script to the live manager.
 
 ```bash
 python scripts/tmux_control.py manager start \
-  --job-id train-1 \
-  --command 'python train.py' \
   --notify bridge \
   --thread-id THREAD \
   --endpoint unix://"$PWD/.codex/tmux-skills/bridge/sockets/codex-bridge.sock"
+
+python scripts/tmux_control.py manager run-next \
+  --job-id train-1 \
+  --command 'python train.py'
 ```
 
 Expected layout:
@@ -119,6 +121,7 @@ Expected layout:
 - The manager pane is reused across repeated `manager start` calls in the same workspace/window. Repeated demos or jobs must not create another manager pane when the reusable pane is idle.
 - The worker pane is reused when the manager already has an idle tall side pane. A new worker pane is created only when no suitable worker pane exists or explicit parallel work is requested.
 - If the matching manager process is already alive, repeated `manager start` queues the new job to that process and exits instead of starting another manager loop.
+- `manager start` may be run without `--job-id` and `--command`; this starts an idle manager that waits for `manager run-next`.
 - If Codex is outside tmux, a visible default-socket session is created and the command output includes `tmux attach -t SESSION`.
 - The manager does not rename, clear, detach, or kill user-owned tmux objects.
 
@@ -135,14 +138,16 @@ Expected state:
 - Required fields include `manager_id`, `status`, `manager_pane_id`, `worker_pane_id`, `current_job_id`, `job_ids`, `notify`, `heartbeat_at`, `last_terminal_event_id`, `workspace`, and `state_dir`.
 - The default manager id is one stable id per workspace/session/window; `--manager-id` is kept for explicit compatibility, but the default workflow uses one manager to own multiple jobs.
 - The Codex-owned manager starts jobs through `tmux_control.py run`, so normal command, log, status, acknowledgement, and optional task files still use the existing `.codex/tmux-skills` directories.
+- Manager-owned logs are bounded by `log_max_bytes` and are trimmed to a tail while the manager is alive, so log files do not grow without limit. Codex should use `tmux_control.py capture --pane <worker_pane_id>` for live or recent terminal output, and read bounded status/log files only when that is sufficient.
 
 Terminal behavior:
 
 - On `succeeded`, `failed`, `stopped`, `timeout`, `cancelled`, `stale`, or missing worker pane, the manager records `waiting_for_codex` and keeps the dashboard open.
-- With bridge notification enabled, the manager submits one path-only prompt for the terminal event, then waits. The prompt includes workspace, manager path, job/status/log/task paths, and no summaries, task instruction bodies, diagnosis, retry commands, or model/delegation instructions.
-- Verify monitoring through `manager status`: `heartbeat_at` should advance while the manager loop is alive, `last_terminal_event_id` should match the terminal job event, and `notified_event_ids` should contain that event exactly once.
-- Verify Codex wake delivery through `record.last_notification`: bridge success records `delivered: true` plus delivery metadata such as `response_id`, `turn_id`, and `prompt_sha256`; bridge failure records `delivered: false` plus `error`. A `--notify none` run intentionally records no Codex delivery.
-- `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH` before work starts. Use `--notify none` for visible-dashboard-only mode.
+- With bridge notification enabled, the manager submits a path-only prompt for the terminal event, then waits. The prompt includes workspace, manager path, job/status/log/task paths, and no summaries, task instruction bodies, diagnosis, retry commands, or model/delegation instructions.
+- Normal operation must not rely on Codex polling `manager status`. Main Codex should learn about terminal work from the manager's bridge turn, then inspect only the paths listed in that prompt.
+- If bridge delivery fails, the manager keeps retrying while it remains alive and does not mark the event as notified until delivery succeeds. Successful delivery is recorded once per terminal event in `notified_event_ids`.
+- Use `manager status` only for manual diagnostics or tests: `heartbeat_at` should advance while the manager loop is alive, `last_terminal_event_id` should match the terminal job event, and `last_notification` should show either successful bridge delivery metadata or the latest retryable delivery error.
+- `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH` before work starts. Use `--notify none` only for manual visible-dashboard debugging; it intentionally records no Codex delivery.
 - The manager never uses `tmux send-keys` to inject text into a Codex pane.
 
 Follow-up and cancellation:
@@ -152,9 +157,12 @@ python scripts/tmux_control.py manager status
 python scripts/tmux_control.py manager run-next --job-id train-2 --command 'python eval.py'
 python scripts/tmux_control.py manager cancel
 python scripts/tmux_control.py manager cancel --stop-worker
+python scripts/tmux_control.py manager cleanup --jobs
 ```
 
-`manager run-next` starts the next job in the same worker pane and returns the Codex-owned manager to `running`. `manager cancel` stops the manager loop only by default and leaves the worker job intact; `--stop-worker` is required to ask the active worker job to stop. The reusable manager pane remains available for the next manager start instead of being duplicated.
+`manager run-next` starts the first or next job in the same worker pane and returns the Codex-owned manager to `running`. After any terminal event, Codex can submit another `manager run-next` command and the same manager resumes monitoring. `manager cancel` stops the manager loop only by default and leaves the worker job intact; `--stop-worker` is required to ask the active worker job to stop. The reusable manager pane remains available for the next manager start instead of being duplicated.
+
+`manager cleanup` is a separate evidence cleanup step for demos or throwaway managers. By default it removes only the manager record and dashboard. With `--jobs`, it also removes manager-owned command, status, and log files for the manager's recorded jobs. Cleanup refuses to run while the manager process is still alive unless `--force` is used, and it never closes panes or windows.
 
 ## Workflow: Run a Heartbeat Autopilot Objective
 

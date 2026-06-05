@@ -16,21 +16,23 @@ For `queue-after-status`, the status file path and row specs must be nonblank; b
 ## Visible manager long task
 
 ```bash
-python scripts/tmux_control.py manager start --job-id train-1 --command "python train.py" --notify bridge --thread-id THREAD --endpoint unix://"$PWD/.codex/tmux-skills/bridge/sockets/codex-bridge.sock"
+python scripts/tmux_control.py manager start --notify bridge --thread-id THREAD --endpoint unix://"$PWD/.codex/tmux-skills/bridge/sockets/codex-bridge.sock"
+python scripts/tmux_control.py manager run-next --job-id train-1 --command "python train.py"
 ```
 
-Use this as the default long-task workflow when the manager process should remain visible to Codex `/ps`, worker output should stay readable in a long side pane, and one reusable compact manager pane should remain visible below Codex in tmux. Inside tmux it uses the current session/window. Outside tmux it creates a normal visible default-socket session and prints the `tmux attach -t SESSION` command.
+Use this as the default long-task workflow when the manager process should remain visible to Codex `/ps`, worker output should stay readable in a long side pane, and one reusable compact manager pane should remain visible below Codex in tmux. Start one manager first, then submit the first and later scripts with `manager run-next`. Inside tmux it uses the current session/window. Outside tmux it creates a normal visible default-socket session and prints the `tmux attach -t SESSION` command.
 
 `manager start` is foreground and Codex-owned by default. Keep the command running so Codex `/ps` can report it. If Codex exits, this manager loop exits too; worker jobs already submitted to the tmux worker pane continue independently.
 
-The manager writes `.codex/tmux-skills/managers/<manager_id>.json`, starts the worker through `tmux_control.py run`, and updates the reusable manager pane with heartbeat, status path, log path, task path, and worker pane details. The manager pane must not run a persistent renderer loop. On success, failure, stop, timeout, cancellation, stale status, or missing worker pane, the Codex-owned process stays alive as `waiting_for_codex`.
+The manager writes `.codex/tmux-skills/managers/<manager_id>.json`, starts the worker through `tmux_control.py run`, and updates the reusable manager pane with heartbeat, status path, log path, task path, and worker pane details. The manager pane must not run a persistent renderer loop. Manager-owned logs are trimmed to a bounded tail while the manager is alive, and Codex should use `capture` on the worker pane for live terminal output when responding. On success, failure, stop, timeout, cancellation, stale status, or missing worker pane, the Codex-owned process stays alive as `waiting_for_codex`.
 
 When no worker pane is assigned, `manager start` splits Codex vertically first so the worker gets a tall right-side pane. Only the compact manager pane is placed below Codex. Repeated starts reuse the idle manager pane directly below Codex and reuse an existing idle tall worker pane when possible. A single manager record owns multiple job ids instead of creating a new manager for each job.
 By default the manager id is stable per workspace/session/window. Pass `--manager-id` only when you need an explicit compatibility id.
-If that manager process is already alive, another `manager start` queues the new job to the live process and exits instead of creating a second manager loop.
+If that manager process is already alive, another `manager start` exits instead of creating a second manager loop. Submit work with `manager run-next`; the same manager monitors the first and subsequent jobs.
 
-Bridge notifications are path-only and are sent once per terminal event. They include workspace, manager path, job/status/log/task paths, and no status summaries, log excerpts, task instruction bodies, diagnosis, retry commands, or model/delegation text. `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH`; use `--notify none` for dashboard-only mode.
-Use `manager status` to verify the loop: `heartbeat_at` advances while alive, `last_terminal_event_id` records the observed terminal event, and `notified_event_ids` contains that event once. Bridge delivery success appears in `last_notification.delivered`, `delivery.response_id`, `delivery.turn_id`, and `prompt_sha256`; delivery failure appears as `last_notification.error`.
+Bridge notifications are path-only and are delivered by the manager, not by Codex polling status files. They include workspace, manager path, job/status/log/task paths, and no status summaries, log excerpts, task instruction bodies, diagnosis, retry commands, or model/delegation text. `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH`; use `--notify none` only for manual visible-dashboard debugging.
+If bridge delivery fails, the live manager retries while it remains in `waiting_for_codex` and does not mark the event notified until delivery succeeds. Successful delivery is recorded once per terminal event in `notified_event_ids`.
+Use `manager status` only for manual diagnostics or tests: `heartbeat_at` advances while alive, `last_terminal_event_id` records the observed terminal event, and `last_notification` shows either bridge delivery metadata or the latest retryable delivery error.
 
 Follow-up and cancellation:
 
@@ -39,9 +41,10 @@ python scripts/tmux_control.py manager status
 python scripts/tmux_control.py manager run-next --job-id train-2 --command "python eval.py"
 python scripts/tmux_control.py manager cancel
 python scripts/tmux_control.py manager cancel --stop-worker
+python scripts/tmux_control.py manager cleanup --jobs
 ```
 
-`manager cancel` leaves panes/windows intact by default. `--stop-worker` is required before cancellation attempts to stop the active worker job.
+`manager cancel` leaves panes/windows and evidence intact by default. `--stop-worker` is required before cancellation attempts to stop the active worker job. Use `manager cleanup --jobs` after demos or throwaway work to remove the cancelled manager record, dashboard, and manager-owned command/status/log files. Cleanup never closes panes or windows, and refuses a live manager unless `--force` is passed.
 
 ## Resume or load prior work
 

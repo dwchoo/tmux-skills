@@ -71,6 +71,27 @@ class TmuxManagerTests(unittest.TestCase):
                 self.assertIn(key, loaded)
             self.assertEqual(record["manager_path"], str(paths["managers"] / "manager-one.json"))
 
+    def test_idle_manager_record_waits_for_run_next(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+
+            record = tmux_manager.build_manager_record(
+                manager_id="manager-one",
+                manager_pane_id="%3",
+                worker_pane_id="%2",
+                pending_job=None,
+                notify={"mode": "none"},
+                workspace=str(paths["workspace"]),
+                state_dir=str(paths["root"]),
+            )
+            updated = tmux_manager.manager_cycle(record, paths=paths)
+
+            self.assertEqual(updated["status"], "idle")
+            self.assertIsNone(updated["current_job_id"])
+            self.assertIsNone(updated["pending_job"])
+
     def test_terminal_transition_waits_for_codex_and_does_not_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             workspace = Path(tmp_name) / "workspace"
@@ -125,6 +146,106 @@ class TmuxManagerTests(unittest.TestCase):
             for forbidden in ("SECRET OUTPUT", "last_output", "traceback", "retry", "command was"):
                 self.assertNotIn(forbidden, prompt)
             self.assertEqual(second["status"], "waiting_for_codex")
+
+    def test_bridge_delivery_failure_retries_until_delivered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            status = self.build_terminal_status(paths)
+
+            with mock.patch.object(
+                tmux_manager.tmux_bridge,
+                "deliver_bridge_candidate",
+                side_effect=[
+                    RuntimeError("connection refused"),
+                    {"prompt_sha256": "abc123", "event_id": status["event_id"]},
+                ],
+            ) as deliver:
+                first = tmux_manager.transition_terminal(record, paths=paths, status=status)
+                self.assertEqual(first["status"], "waiting_for_codex")
+                self.assertEqual(first["last_notification"]["delivered"], False)
+                self.assertEqual(first.get("notified_event_ids"), [])
+                second = tmux_manager.manager_cycle(first, paths=paths)
+                third = tmux_manager.manager_cycle(second, paths=paths)
+
+            self.assertEqual(deliver.call_count, 2)
+            self.assertEqual(second["last_notification"]["delivered"], True)
+            self.assertEqual(second["notified_event_ids"], [status["event_id"]])
+            self.assertEqual(third["notified_event_ids"], [status["event_id"]])
+
+    def test_manager_cycle_trims_current_job_log_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            record["job_ids"] = ["job-one"]
+            record["status"] = "running"
+            record["log_max_bytes"] = 10
+            log_path = tmux_state.log_path(paths, "job-one")
+            log_path.write_bytes(b"0123456789abcdef")
+            record["jobs"] = {"job-one": {"job_id": "job-one", "log_path": str(log_path)}}
+
+            with mock.patch.object(tmux_manager, "pane_exists", return_value=True):
+                updated = tmux_manager.manager_cycle(record, paths=paths)
+
+            self.assertEqual(log_path.read_bytes(), b"6789abcdef")
+            self.assertEqual(updated["last_log_trim"]["job_id"], "job-one")
+            self.assertEqual(updated["last_log_trim"]["size_after"], 10)
+
+    def test_cleanup_manager_removes_manager_and_job_evidence_only_in_state_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            record["job_ids"] = ["job-one"]
+            record["status"] = "cancelled"
+            status_path = tmux_state.status_path(paths, "job-one")
+            log_path = tmux_state.log_path(paths, "job-one")
+            command_path = tmux_state.command_path(paths, "job-one")
+            tmux_state.write_status(status_path, self.build_terminal_status(paths))
+            log_path.write_text("job log\n", encoding="utf-8")
+            command_path.write_text("echo ok\n", encoding="utf-8")
+            outside_path = Path(tmp_name) / "outside.log"
+            outside_path.write_text("keep\n", encoding="utf-8")
+            record["jobs"] = {
+                "job-one": {
+                    "job_id": "job-one",
+                    "status_path": str(status_path),
+                    "log_path": str(outside_path),
+                    "run_result": {"command_path": str(command_path), "status_path": str(status_path)},
+                }
+            }
+            tmux_manager.write_manager_record(paths, record)
+            dashboard_path = tmux_manager.manager_dashboard_path(paths, "manager-one")
+            dashboard_path.write_text("dashboard\n", encoding="utf-8")
+
+            result = tmux_manager.cleanup_manager("manager-one", workspace=str(workspace), include_jobs=True)
+
+            self.assertFalse(result["cleaned"])
+            self.assertFalse(tmux_manager.manager_record_path(paths, "manager-one").exists())
+            self.assertFalse(dashboard_path.exists())
+            self.assertFalse(status_path.exists())
+            self.assertFalse(command_path.exists())
+            self.assertTrue(outside_path.exists())
+            self.assertEqual(result["skipped"][0]["path"], str(outside_path))
 
     def test_run_next_queues_command_for_existing_manager(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:

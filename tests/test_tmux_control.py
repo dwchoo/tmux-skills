@@ -232,6 +232,11 @@ class TmuxControlTests(unittest.TestCase):
         )
         self.assertIsNone(default_start_args.manager_id)
 
+        idle_start_args = parser.parse_args(["manager", "start", "--notify", "none"])
+        self.assertIsNone(idle_start_args.job_id)
+        self.assertIsNone(idle_start_args.command_text)
+        self.assertEqual(idle_start_args.log_max_bytes, tmux_manager.DEFAULT_MANAGER_LOG_MAX_BYTES)
+
         status_args = parser.parse_args(["manager", "status", "--manager-id", "manager-one"])
         self.assertEqual(status_args.manager_action, "status")
         default_status_args = parser.parse_args(["manager", "status"])
@@ -245,6 +250,10 @@ class TmuxControlTests(unittest.TestCase):
         cancel_args = parser.parse_args(["manager", "cancel", "--manager-id", "manager-one", "--stop-worker"])
         self.assertEqual(cancel_args.manager_action, "cancel")
         self.assertTrue(cancel_args.stop_worker)
+
+        cleanup_args = parser.parse_args(["manager", "cleanup", "--manager-id", "manager-one", "--jobs"])
+        self.assertEqual(cleanup_args.manager_action, "cleanup")
+        self.assertTrue(cleanup_args.jobs)
 
     def test_manager_start_missing_bridge_config_returns_json_error_before_tmux(self) -> None:
         parser = tmux_control.build_parser()
@@ -268,6 +277,50 @@ class TmuxControlTests(unittest.TestCase):
         self.assertFalse(result["started"])
         self.assertEqual(result["status"], "failed")
         self.assertIn("--thread-id", result["reason"])
+
+    def test_manager_start_rejects_command_without_job_before_tmux(self) -> None:
+        parser = tmux_control.build_parser()
+        args = parser.parse_args(["manager", "start", "--command", "echo ok", "--notify", "none"])
+
+        with mock.patch.object(tmux_control, "manager_layout") as layout:
+            result = tmux_control.manager(args)
+
+        layout.assert_not_called()
+        self.assertFalse(result["started"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("--job-id", result["reason"])
+
+    def test_manager_cleanup_refuses_live_manager_without_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            request_path = tmux_manager.write_command_request(paths, "manager-one", "job-one", "echo ok")
+            record = tmux_manager.build_manager_record(
+                manager_id="manager-one",
+                manager_pane_id="%2",
+                worker_pane_id="%3",
+                pending_job=tmux_manager.build_pending_job("job-one", request_path, str(workspace)),
+                notify={"mode": "none"},
+                workspace=str(workspace),
+                state_dir=str(paths["root"]),
+            )
+            record["manager_pid"] = 424242
+            tmux_manager.write_manager_record(paths, record)
+            args = argparse.Namespace(
+                manager_action="cleanup",
+                manager_id="manager-one",
+                jobs=True,
+                force=False,
+                workspace=str(workspace),
+                state_dir=None,
+            )
+
+            with mock.patch.object(tmux_control, "pid_is_running", return_value=True):
+                result = tmux_control.manager(args)
+
+            self.assertFalse(result["cleaned"])
+            self.assertIn("live manager", result["reason"])
 
     def test_manager_layout_reuses_record_panes_without_splitting(self) -> None:
         codex_pane = {

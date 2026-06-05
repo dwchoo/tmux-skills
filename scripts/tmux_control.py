@@ -1260,19 +1260,28 @@ def manager_layout(
 
 
 def manager_start(args: argparse.Namespace) -> dict[str, Any]:
-    if not tmux_state.one_line_text(args.job_id):
-        return {"manager_id": args.manager_id, "started": False, "status": "failed", "reason": "manager start requires nonblank --job-id"}
-    job_id = tmux_state.safe_id(args.job_id)
+    has_job = bool(tmux_state.one_line_text(args.job_id))
+    has_command = args.command_text is not None or args.command_file is not None
+    if has_job != has_command:
+        return {
+            "manager_id": args.manager_id,
+            "started": False,
+            "status": "failed",
+            "reason": "manager start requires --job-id and exactly one command source together, or neither for idle start",
+        }
+    job_id = tmux_state.safe_id(args.job_id) if has_job else None
     try:
         notify = tmux_manager.normalize_notify(args.notify, args.thread_id, args.endpoint)
     except Exception as exc:
         return {"manager_id": args.manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": str(exc)}
 
-    command_text, command_error = tmux_manager.command_text_from_source(args.command_text, args.command_file)
-    if command_error:
-        return {"manager_id": args.manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": command_error}
-    if not tmux_state.one_line_text(command_text):
-        return {"manager_id": args.manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": "command is blank"}
+    command_text = None
+    if has_command:
+        command_text, command_error = tmux_manager.command_text_from_source(args.command_text, args.command_file)
+        if command_error:
+            return {"manager_id": args.manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": command_error}
+        if not tmux_state.one_line_text(command_text):
+            return {"manager_id": args.manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": "command is blank"}
 
     paths = tmux_manager.manager_paths(args.workspace, args.state_dir)
     cwd = Path(args.cwd).expanduser().resolve() if args.cwd else paths["workspace"]
@@ -1284,28 +1293,38 @@ def manager_start(args: argparse.Namespace) -> dict[str, Any]:
     existing_record, record_error = tmux_manager.read_manager_record(paths, manager_id)
     if record_error:
         return {"manager_id": manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": record_error}
-    if existing_record and existing_record.get("pending_job"):
+    if existing_record and existing_record.get("pending_job") and has_command:
         return {"manager_id": manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": "manager already has a pending job"}
-    if existing_record and existing_record.get("status") == "running":
+    if existing_record and existing_record.get("status") == "running" and has_command:
         return {"manager_id": manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": "manager is already running a job"}
     existing_manager_alive = False
-    if existing_record and existing_record.get("status") in {"starting", "queued", "waiting_for_codex"}:
+    if existing_record and existing_record.get("status") in {"starting", "idle", "queued", "running", "waiting_for_codex"}:
         existing_manager_alive = pid_is_running(parse_int(str(existing_record.get("manager_pid") or "")))
 
     if existing_manager_alive and existing_record:
         layout = layout_from_existing_manager_record(existing_record, cwd)
     else:
         layout = manager_layout(cwd, paths=paths, manager_id=manager_id, existing_record=existing_record)
-    request_path = tmux_manager.write_command_request(paths, manager_id, job_id, str(command_text))
-    pending_job = tmux_manager.build_pending_job(job_id, request_path, str(cwd))
+    request_path = None
+    pending_job = None
+    if job_id and command_text is not None:
+        request_path = tmux_manager.write_command_request(paths, manager_id, job_id, str(command_text))
+        pending_job = tmux_manager.build_pending_job(job_id, request_path, str(cwd))
     if existing_record:
         record = dict(existing_record)
+        effective_pending_job = pending_job if pending_job is not None else record.get("pending_job")
+        if effective_pending_job:
+            next_status = "queued"
+        elif record.get("current_job_id"):
+            next_status = str(record.get("status") or "running")
+        else:
+            next_status = str(record.get("status") or "idle") if existing_manager_alive else "idle"
         record.update(
             {
-                "status": "queued",
+                "status": next_status,
                 "manager_pane_id": layout["manager_pane_id"],
                 "worker_pane_id": layout["worker_pane_id"],
-                "pending_job": pending_job,
+                "pending_job": effective_pending_job,
                 "notify": notify,
                 "workspace": str(paths["workspace"]),
                 "state_dir": str(paths["root"]),
@@ -1313,6 +1332,7 @@ def manager_start(args: argparse.Namespace) -> dict[str, Any]:
                 "poll_seconds": args.poll_seconds,
                 "manager_process_mode": "foreground",
                 "last_error": None,
+                "log_max_bytes": getattr(args, "log_max_bytes", tmux_manager.DEFAULT_MANAGER_LOG_MAX_BYTES),
             }
         )
         if not existing_manager_alive:
@@ -1330,6 +1350,7 @@ def manager_start(args: argparse.Namespace) -> dict[str, Any]:
             state_dir=str(paths["root"]),
             attach_command=layout.get("attach_command"),
             poll_seconds=args.poll_seconds,
+            log_max_bytes=getattr(args, "log_max_bytes", tmux_manager.DEFAULT_MANAGER_LOG_MAX_BYTES),
         )
     record = tmux_manager.write_manager_record(paths, record)
     dashboard_path = Path(str(record["dashboard_path"]))
@@ -1344,7 +1365,7 @@ def manager_start(args: argparse.Namespace) -> dict[str, Any]:
         "manager_process_mode": record.get("manager_process_mode") or "foreground",
         "start_process_mode": "existing" if existing_manager_alive else "foreground",
         "queued_on_existing_manager": existing_manager_alive,
-        "command_request_path": str(request_path),
+        "command_request_path": str(request_path) if request_path else None,
         "workspace": str(paths["workspace"]),
         "state_dir": str(paths["root"]),
         "record": record,
@@ -1376,6 +1397,28 @@ def manager(args: argparse.Namespace) -> dict[str, Any]:
             workspace=args.workspace,
             state_dir=args.state_dir,
             stop_worker=args.stop_worker,
+        )
+    if args.manager_action == "cleanup":
+        manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
+        paths = tmux_manager.manager_paths(args.workspace, args.state_dir)
+        record, error = tmux_manager.read_manager_record(paths, manager_id)
+        if error:
+            return {"manager_id": manager_id, "cleaned": False, "reason": error}
+        if record is not None and not args.force:
+            manager_pid = parse_int(str(record.get("manager_pid") or ""))
+            if pid_is_running(manager_pid):
+                return {
+                    "manager_id": manager_id,
+                    "cleaned": False,
+                    "reason": "manager cleanup refuses live manager without --force; run manager cancel first",
+                    "manager_pid": manager_pid,
+                }
+        return tmux_manager.cleanup_manager(
+            manager_id,
+            workspace=args.workspace,
+            state_dir=args.state_dir,
+            include_jobs=args.jobs,
+            force=args.force,
         )
     die(f"unknown manager command: {args.manager_action}")
 
@@ -3707,8 +3750,8 @@ def build_parser() -> argparse.ArgumentParser:
     manager_subparsers = manager_parser.add_subparsers(dest="manager_action", required=True)
     manager_start_parser = manager_subparsers.add_parser("start", help="Start a visible manager dashboard and worker pane")
     manager_start_parser.add_argument("--manager-id")
-    manager_start_parser.add_argument("--job-id", required=True)
-    manager_start_command = manager_start_parser.add_mutually_exclusive_group(required=True)
+    manager_start_parser.add_argument("--job-id")
+    manager_start_command = manager_start_parser.add_mutually_exclusive_group()
     manager_start_command.add_argument("--command", dest="command_text")
     manager_start_command.add_argument("--command-file")
     manager_start_parser.add_argument("--notify", choices=["bridge", "none"], default="bridge")
@@ -3718,6 +3761,7 @@ def build_parser() -> argparse.ArgumentParser:
     manager_start_parser.add_argument("--workspace")
     manager_start_parser.add_argument("--state-dir")
     manager_start_parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
+    manager_start_parser.add_argument("--log-max-bytes", type=positive_int, default=tmux_manager.DEFAULT_MANAGER_LOG_MAX_BYTES)
 
     manager_status_parser = manager_subparsers.add_parser("status", help="Show one manager record")
     manager_status_parser.add_argument("--manager-id")
@@ -3739,6 +3783,13 @@ def build_parser() -> argparse.ArgumentParser:
     manager_cancel_parser.add_argument("--stop-worker", action="store_true")
     manager_cancel_parser.add_argument("--workspace")
     manager_cancel_parser.add_argument("--state-dir")
+
+    manager_cleanup_parser = manager_subparsers.add_parser("cleanup", help="Remove cancelled manager records and optional job evidence")
+    manager_cleanup_parser.add_argument("--manager-id")
+    manager_cleanup_parser.add_argument("--jobs", action="store_true")
+    manager_cleanup_parser.add_argument("--force", action="store_true")
+    manager_cleanup_parser.add_argument("--workspace")
+    manager_cleanup_parser.add_argument("--state-dir")
 
     monitor_parser = subparsers.add_parser("monitor", help="Start a background single-trigger pane monitor")
     monitor_parser.add_argument("--pane", required=True, help="Stable tmux pane ID, such as %%3")
@@ -4036,6 +4087,8 @@ def main() -> None:
         if args.manager_action == "run-next" and not result.get("queued"):
             raise SystemExit(2)
         if args.manager_action == "cancel" and not result.get("cancelled"):
+            raise SystemExit(2)
+        if args.manager_action == "cleanup" and not result.get("cleaned"):
             raise SystemExit(2)
         if args.manager_action == "start" and result.get("start_process_mode") != "existing":
             loop_args = argparse.Namespace(

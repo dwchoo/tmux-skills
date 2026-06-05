@@ -20,7 +20,8 @@ import tmux_state
 
 
 MANAGER_VERSION = 1
-MANAGER_STATUSES = {"starting", "queued", "running", "waiting_for_codex", "cancel_requested", "cancelled", "failed"}
+DEFAULT_MANAGER_LOG_MAX_BYTES = 65536
+MANAGER_STATUSES = {"starting", "idle", "queued", "running", "waiting_for_codex", "cancel_requested", "cancelled", "failed"}
 MANAGER_TERMINAL_JOB_STATUSES = {"succeeded", "failed", "stopped", "timeout", "cancelled", "stale"}
 
 
@@ -126,6 +127,11 @@ def normalize_manager_record(record: dict[str, Any], paths: dict[str, Path] | No
     normalized.setdefault("manager_process_mode", "foreground")
     normalized.setdefault("manager_pid", None)
     normalized.setdefault("manager_process_started_at", None)
+    try:
+        log_max_bytes = int(normalized.get("log_max_bytes") or DEFAULT_MANAGER_LOG_MAX_BYTES)
+    except (TypeError, ValueError):
+        log_max_bytes = DEFAULT_MANAGER_LOG_MAX_BYTES
+    normalized["log_max_bytes"] = max(1, log_max_bytes)
     if paths:
         normalized["workspace"] = str(paths["workspace"])
         normalized["state_dir"] = str(paths["root"])
@@ -186,12 +192,13 @@ def build_manager_record(
     manager_id: str,
     manager_pane_id: str,
     worker_pane_id: str,
-    pending_job: dict[str, Any],
+    pending_job: dict[str, Any] | None,
     notify: dict[str, Any],
     workspace: str,
     state_dir: str,
     attach_command: str | None = None,
     poll_seconds: float = 2.0,
+    log_max_bytes: int = DEFAULT_MANAGER_LOG_MAX_BYTES,
 ) -> dict[str, Any]:
     paths = manager_paths(workspace, state_dir)
     now = tmux_state.utc_now()
@@ -199,7 +206,7 @@ def build_manager_record(
         {
             "version": MANAGER_VERSION,
             "manager_id": manager_id,
-            "status": "starting",
+            "status": "queued" if pending_job else "idle",
             "manager_pane_id": manager_pane_id,
             "worker_pane_id": worker_pane_id,
             "current_job_id": None,
@@ -222,6 +229,7 @@ def build_manager_record(
             "manager_process_started_at": now,
             "attach_command": attach_command,
             "poll_seconds": poll_seconds,
+            "log_max_bytes": log_max_bytes,
         },
         paths,
     )
@@ -329,6 +337,10 @@ def start_pending_job(record: dict[str, Any]) -> dict[str, Any]:
     record["jobs"] = jobs
     record["pending_job"] = None
     record["current_job_id"] = job_id
+    record["last_terminal_event_id"] = None
+    record["last_terminal_candidate"] = None
+    record["last_notification"] = None
+    record["last_log_trim"] = None
     job_ids = list(record.get("job_ids") or [])
     if job_id not in job_ids:
         job_ids.append(job_id)
@@ -377,6 +389,59 @@ def send_worker_interrupt(pane_id: str | None) -> dict[str, Any]:
     except FileNotFoundError:
         return {"sent": False, "reason": "tmux is not installed or is not on PATH"}
     return {"sent": proc.returncode == 0, "returncode": proc.returncode, "stderr": proc.stderr.strip()}
+
+
+def trim_log_tail(log_path: str | None, max_bytes: int) -> dict[str, Any]:
+    if not tmux_state.one_line_text(log_path):
+        return {"trimmed": False, "reason": "log path is blank"}
+    path = Path(str(log_path))
+    if max_bytes <= 0:
+        return {"trimmed": False, "reason": "max bytes must be positive", "log_path": str(path)}
+    try:
+        size_before = path.stat().st_size
+    except FileNotFoundError:
+        return {"trimmed": False, "reason": "log file not found", "log_path": str(path)}
+    except OSError as exc:
+        return {"trimmed": False, "reason": str(exc), "log_path": str(path)}
+    if size_before <= max_bytes:
+        return {"trimmed": False, "log_path": str(path), "size_before": size_before, "size_after": size_before}
+    try:
+        with path.open("r+b") as handle:
+            handle.seek(-max_bytes, os.SEEK_END)
+            tail = handle.read(max_bytes)
+            handle.seek(0)
+            handle.write(tail)
+            handle.truncate()
+        size_after = path.stat().st_size
+    except OSError as exc:
+        return {"trimmed": False, "reason": str(exc), "log_path": str(path), "size_before": size_before}
+    return {
+        "trimmed": True,
+        "log_path": str(path),
+        "size_before": size_before,
+        "size_after": size_after,
+        "max_bytes": max_bytes,
+        "trimmed_at": tmux_state.utc_now(),
+    }
+
+
+def enforce_log_retention(record: dict[str, Any]) -> dict[str, Any]:
+    job_id = str(record.get("current_job_id") or "")
+    if not job_id:
+        return record
+    try:
+        max_bytes = int(record.get("log_max_bytes") or DEFAULT_MANAGER_LOG_MAX_BYTES)
+    except (TypeError, ValueError):
+        max_bytes = DEFAULT_MANAGER_LOG_MAX_BYTES
+    if max_bytes <= 0:
+        return record
+    job = (record.get("jobs") or {}).get(job_id, {})
+    log_path = job.get("log_path") if isinstance(job, dict) else None
+    result = trim_log_tail(str(log_path) if log_path else None, max_bytes)
+    if result.get("trimmed"):
+        result["job_id"] = job_id
+        record["last_log_trim"] = result
+    return record
 
 
 def load_job_status(paths: dict[str, Path], job_id: str | None) -> dict[str, Any] | None:
@@ -456,6 +521,8 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
             "prompt_sha256": delivery.get("prompt_sha256"),
             "delivery": delivery,
         }
+        notified.append(event_id)
+        record["notified_event_ids"] = notified
     except Exception as exc:
         record["last_notification"] = {
             "event_id": event_id,
@@ -464,8 +531,6 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
             "delivered": False,
             "error": str(exc),
         }
-    notified.append(event_id)
-    record["notified_event_ids"] = notified
     return record
 
 
@@ -500,6 +565,7 @@ def transition_terminal(
     else:
         return record
     record["last_terminal_event_id"] = candidate["event_id"]
+    record["last_terminal_candidate"] = candidate
     record = notify_terminal_event(record, candidate)
     record["status"] = "waiting_for_codex"
     return record
@@ -513,14 +579,25 @@ def manager_cycle(record: dict[str, Any], *, paths: dict[str, Path]) -> dict[str
     if record.get("pending_job"):
         record = start_pending_job(record)
     elif record.get("status") == "waiting_for_codex":
+        record = enforce_log_retention(record)
+        candidate = record.get("last_terminal_candidate")
+        notify = record.get("notify") if isinstance(record.get("notify"), dict) else {}
+        event_id = str(candidate.get("event_id") or "") if isinstance(candidate, dict) else ""
+        notified = list(record.get("notified_event_ids") or [])
+        if notify.get("mode") == "bridge" and event_id and event_id not in notified:
+            record = notify_terminal_event(record, candidate)
         return record
     if record.get("current_job_id") and not pane_exists(str(record.get("worker_pane_id") or "")):
+        record = enforce_log_retention(record)
         return transition_terminal(record, paths=paths, status=None, worker_missing=True)
+    record = enforce_log_retention(record)
     status = load_job_status(paths, str(record.get("current_job_id") or ""))
     if status and tmux_state.is_terminal(status):
         return transition_terminal(record, paths=paths, status=status)
     if record.get("current_job_id"):
         record["status"] = "running"
+    elif record.get("status") not in {"cancel_requested", "cancelled", "failed"}:
+        record["status"] = "idle"
     return record
 
 
@@ -531,7 +608,7 @@ def merge_external_manager_update(record: dict[str, Any], latest: dict[str, Any]
         merged = dict(latest)
         merged["heartbeat_at"] = record.get("heartbeat_at")
         return merged
-    if latest.get("pending_job") and not record.get("pending_job") and record.get("status") == "waiting_for_codex":
+    if latest.get("pending_job") and not record.get("pending_job") and record.get("status") in {"waiting_for_codex", "idle"}:
         merged = dict(latest)
         merged["heartbeat_at"] = record.get("heartbeat_at")
         return merged
@@ -582,6 +659,100 @@ def cancel_manager(
     }
 
 
+def cleanup_path_allowed(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def cleanup_manager(
+    manager_id: str,
+    *,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    include_jobs: bool = False,
+    force: bool = False,
+) -> dict[str, Any]:
+    paths = manager_paths(workspace, state_dir)
+    item_id = manager_id_value(manager_id)
+    record, error = read_manager_record(paths, item_id)
+    if error:
+        return {"manager_id": item_id, "cleaned": False, "reason": error}
+    if record is None:
+        return {
+            "manager_id": item_id,
+            "cleaned": False,
+            "reason": "manager record not found",
+            "manager_path": str(manager_record_path(paths, item_id)),
+        }
+    job_ids = [str(value) for value in record.get("job_ids") or []]
+    current_job_id = str(record.get("current_job_id") or "")
+    if current_job_id and current_job_id not in job_ids:
+        job_ids.append(current_job_id)
+    if include_jobs and not force:
+        for job_id in job_ids:
+            status = load_job_status(paths, job_id)
+            if status and not tmux_state.is_terminal(status):
+                return {
+                    "manager_id": item_id,
+                    "cleaned": False,
+                    "reason": f"manager cleanup refuses non-terminal job without --force: {job_id}",
+                    "job_id": job_id,
+                }
+
+    candidates: list[Path] = [manager_record_path(paths, item_id), manager_dashboard_path(paths, item_id)]
+    if include_jobs:
+        pending = record.get("pending_job") if isinstance(record.get("pending_job"), dict) else {}
+        if pending.get("command_file"):
+            candidates.append(Path(str(pending["command_file"])))
+        jobs = record.get("jobs") if isinstance(record.get("jobs"), dict) else {}
+        for job_id in job_ids:
+            candidates.extend([tmux_state.command_path(paths, job_id), tmux_state.status_path(paths, job_id), tmux_state.log_path(paths, job_id)])
+            job = jobs.get(job_id) if isinstance(jobs.get(job_id), dict) else {}
+            for key in ("command_request_path", "status_path", "log_path"):
+                if job.get(key):
+                    candidates.append(Path(str(job[key])))
+            run_result = job.get("run_result") if isinstance(job.get("run_result"), dict) else {}
+            for key in ("command_path", "status_path", "log_path"):
+                if run_result.get(key):
+                    candidates.append(Path(str(run_result[key])))
+
+    removed: list[str] = []
+    missing: list[str] = []
+    skipped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = candidate.expanduser()
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not cleanup_path_allowed(path, paths["root"]):
+            skipped.append({"path": str(path), "reason": "outside state directory"})
+            continue
+        try:
+            path.unlink()
+            removed.append(str(path))
+        except FileNotFoundError:
+            missing.append(str(path))
+        except IsADirectoryError:
+            skipped.append({"path": str(path), "reason": "is a directory"})
+        except OSError as exc:
+            skipped.append({"path": str(path), "reason": str(exc)})
+
+    return {
+        "manager_id": item_id,
+        "cleaned": not skipped,
+        "manager_path": str(manager_record_path(paths, item_id)),
+        "include_jobs": bool(include_jobs),
+        "removed": removed,
+        "missing": missing,
+        "skipped": skipped,
+    }
+
+
 def dashboard_text(record: dict[str, Any], job_status: dict[str, Any] | None = None) -> str:
     current_job_id = record.get("current_job_id") or "none"
     job = (record.get("jobs") or {}).get(current_job_id, {}) if current_job_id != "none" else {}
@@ -605,9 +776,18 @@ def dashboard_text(record: dict[str, Any], job_status: dict[str, Any] | None = N
         f"manager_path: {record.get('manager_path')}",
         f"status_path: {status_path}",
         f"log_path: {log_path}",
+        f"log_max_bytes: {record.get('log_max_bytes')}",
         f"task_path: {task_path}",
         f"last_terminal_event_id: {record.get('last_terminal_event_id') or 'none'}",
     ]
+    last_log_trim = record.get("last_log_trim") if isinstance(record.get("last_log_trim"), dict) else {}
+    if last_log_trim:
+        lines.append(
+            "last_log_trim: "
+            f"job={last_log_trim.get('job_id') or 'none'} "
+            f"size_before={last_log_trim.get('size_before') or 'none'} "
+            f"size_after={last_log_trim.get('size_after') or 'none'}"
+        )
     notification = record.get("last_notification")
     if isinstance(notification, dict):
         lines.append(f"last_notification: {notification.get('mode')} delivered={notification.get('delivered')}")
