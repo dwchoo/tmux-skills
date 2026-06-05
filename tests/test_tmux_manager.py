@@ -44,6 +44,21 @@ class TmuxManagerTests(unittest.TestCase):
             last_output="SECRET OUTPUT SHOULD NOT APPEAR",
         )
 
+    def mark_bridge_verified(self, paths: dict[str, Path], record: dict[str, object]) -> dict[str, object]:
+        record["bridge_verification"] = tmux_manager.bridge_notify_identity(record) | {
+            "event_id": "preflight-one",
+            "mode": "bridge",
+            "status": "verified",
+            "prompt_sha256": "preflight-sha",
+            "submitted_to_app_server": True,
+            "acknowledged_by_codex": True,
+            "submitted_at": "now",
+            "acknowledged_at": "now",
+            "ack_turn_id": "turn-main",
+            "expires_at": None,
+        }
+        return tmux_manager.write_manager_record(paths, record)
+
     def test_manager_state_read_write_has_required_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             workspace = Path(tmp_name) / "workspace"
@@ -193,6 +208,328 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertTrue(second["last_notification"]["submitted_to_app_server"])
             self.assertEqual(second["submitted_event_ids"], [status["event_id"]])
             self.assertEqual(third["submitted_event_ids"], [status["event_id"]])
+
+    def test_bridge_check_submits_path_only_preflight_and_times_out_without_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            record["pending_job"] = None
+            tmux_manager.write_manager_record(paths, record)
+
+            with mock.patch.object(
+                tmux_manager.tmux_bridge,
+                "deliver_bridge_candidate",
+                return_value={"prompt_sha256": "preflight-sha", "event_id": "ignored"},
+            ) as deliver:
+                result = tmux_manager.bridge_check_manager(
+                    manager_id="manager-one",
+                    workspace=str(workspace),
+                    ack_timeout_seconds=0,
+                )
+
+            self.assertFalse(result["verified"])
+            self.assertTrue(result["submitted_to_app_server"])
+            self.assertFalse(result["acknowledged_by_codex"])
+            self.assertEqual(result["reason"], "bridge receipt ack timed out")
+            verification = result["record"]["bridge_verification"]
+            self.assertEqual(verification["status"], "awaiting_ack")
+            self.assertEqual(verification["event_id"], result["event_id"])
+            prompt = deliver.call_args.args[2]
+            self.assertIn(f"Workspace: {paths['workspace']}", prompt)
+            self.assertIn(f"Manager path: {paths['managers'] / 'manager-one.json'}", prompt)
+            self.assertIn("Status path: none", prompt)
+            self.assertIn("Task path: none", prompt)
+            self.assertIn("Log path: none", prompt)
+            for forbidden in ("event_id", "preflight", "retry", "Please inspect", "Job ID", "last_output"):
+                self.assertNotIn(forbidden, prompt)
+
+    def test_ack_marks_bridge_preflight_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            record["pending_job"] = None
+            event_id = "preflight-one"
+            record["bridge_verification"] = tmux_manager.bridge_notify_identity(record) | {
+                "event_id": event_id,
+                "mode": "bridge",
+                "status": "awaiting_ack",
+                "prompt_sha256": "preflight-sha",
+                "submitted_to_app_server": True,
+                "acknowledged_by_codex": False,
+                "submitted_at": "now",
+                "acknowledged_at": None,
+                "expires_at": None,
+            }
+            record = tmux_manager.upsert_notification(
+                record,
+                event_id,
+                {
+                    "event_id": event_id,
+                    "mode": "bridge",
+                    "source": "manager_bridge_check",
+                    "status": "awaiting_ack",
+                    "submitted_to_app_server": True,
+                    "acknowledged_by_codex": False,
+                    "prompt_sha256": "preflight-sha",
+                },
+            )
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.ack_manager_event(
+                manager_id="manager-one",
+                event_id=event_id,
+                workspace=str(workspace),
+                turn_id="turn-main",
+                note="received",
+            )
+
+            self.assertTrue(result["acked"])
+            verification = result["record"]["bridge_verification"]
+            self.assertEqual(verification["status"], "verified")
+            self.assertTrue(verification["acknowledged_by_codex"])
+            self.assertEqual(verification["ack_turn_id"], "turn-main")
+            self.assertEqual(result["record"]["last_notification"]["source"], "manager_bridge_check")
+
+    def test_bridge_verification_is_invalidated_when_endpoint_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            record["pending_job"] = None
+            record = self.mark_bridge_verified(paths, record)
+            record["notify"] = {
+                "mode": "bridge",
+                "thread_id": "thr-test",
+                "endpoint": "unix:///tmp/other.sock",
+                "socket_path": "/tmp/other.sock",
+            }
+            normalized = tmux_manager.normalize_manager_record(record, paths)
+
+            self.assertEqual(normalized["bridge_verification"]["status"], "mismatched_config")
+            verified, reason = tmux_manager.bridge_receipt_verified(normalized)
+            self.assertFalse(verified)
+            self.assertIn("endpoint", reason or "")
+
+    def test_run_next_blocks_until_bridge_preflight_verified_without_writing_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            record["pending_job"] = None
+            record["status"] = "idle"
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.queue_manager_job(
+                manager_id="manager-one",
+                job_id="job-two",
+                command_text="echo next",
+                command_file=None,
+                workspace=str(workspace),
+            )
+
+            self.assertFalse(result["queued"])
+            self.assertIn("bridge receipt is not verified", result["reason"])
+            self.assertFalse(tmux_manager.manager_command_request_path(paths, "manager-one", "job-two").exists())
+
+    def test_run_next_queues_after_bridge_preflight_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            record["pending_job"] = None
+            record["status"] = "idle"
+            self.mark_bridge_verified(paths, record)
+
+            result = tmux_manager.queue_manager_job(
+                manager_id="manager-one",
+                job_id="job-two",
+                command_text="echo next",
+                command_file=None,
+                workspace=str(workspace),
+            )
+
+            self.assertTrue(result["queued"])
+            self.assertEqual(Path(result["command_request_path"]).read_text(encoding="utf-8"), "echo next")
+
+    def test_run_next_blocks_terminal_event_until_acknowledged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            record["pending_job"] = None
+            record["status"] = "waiting_for_codex"
+            record["last_terminal_event_id"] = "evt-one"
+            record = self.mark_bridge_verified(paths, record)
+            record = tmux_manager.upsert_notification(
+                record,
+                "evt-one",
+                {
+                    "event_id": "evt-one",
+                    "mode": "bridge",
+                    "status": "awaiting_ack",
+                    "submitted_to_app_server": True,
+                    "acknowledged_by_codex": False,
+                },
+            )
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.queue_manager_job(
+                manager_id="manager-one",
+                job_id="job-two",
+                command_text="echo next",
+                command_file=None,
+                workspace=str(workspace),
+            )
+
+            self.assertFalse(result["queued"])
+            self.assertIn("last terminal event has not been acknowledged", result["reason"])
+            self.assertFalse(tmux_manager.manager_command_request_path(paths, "manager-one", "job-two").exists())
+
+    def test_external_ack_fields_survive_dashboard_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            stale = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            stale["pending_job"] = None
+            stale["bridge_verification"] = tmux_manager.bridge_notify_identity(stale) | {
+                "event_id": "preflight-one",
+                "mode": "bridge",
+                "status": "awaiting_ack",
+                "prompt_sha256": "preflight-sha",
+                "submitted_to_app_server": True,
+                "acknowledged_by_codex": False,
+                "expires_at": None,
+            }
+            latest = dict(stale)
+            latest["bridge_verification"] = dict(stale["bridge_verification"]) | {
+                "status": "verified",
+                "acknowledged_by_codex": True,
+                "acknowledged_at": "now",
+                "ack_turn_id": "turn-main",
+            }
+            latest = tmux_manager.upsert_notification(
+                latest,
+                "preflight-one",
+                {
+                    "event_id": "preflight-one",
+                    "mode": "bridge",
+                    "source": "manager_bridge_check",
+                    "status": "acknowledged",
+                    "submitted_to_app_server": True,
+                    "acknowledged_by_codex": True,
+                    "ack_turn_id": "turn-main",
+                },
+            )
+            latest["last_ack"] = {"event_id": "preflight-one", "turn_id": "turn-main"}
+
+            merged = tmux_manager.merge_external_manager_update(stale, latest)
+
+            self.assertEqual(merged["bridge_verification"]["status"], "verified")
+            self.assertTrue(merged["bridge_verification"]["acknowledged_by_codex"])
+            self.assertEqual(merged["last_ack"]["event_id"], "preflight-one")
+
+    def test_external_preflight_ack_merge_preserves_newer_terminal_last_notification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            record["pending_job"] = None
+            record = self.mark_bridge_verified(paths, record)
+            latest = dict(record)
+            terminal = tmux_manager.upsert_notification(
+                dict(record),
+                "evt-terminal",
+                {
+                    "event_id": "evt-terminal",
+                    "mode": "bridge",
+                    "source": "manager_terminal",
+                    "job_id": "job-one",
+                    "status": "awaiting_ack",
+                    "submitted_to_app_server": True,
+                    "acknowledged_by_codex": False,
+                },
+            )
+            terminal["last_terminal_event_id"] = "evt-terminal"
+
+            merged = tmux_manager.merge_external_manager_update(terminal, latest)
+
+            self.assertEqual(merged["last_notification"]["event_id"], "evt-terminal")
+            self.assertEqual(merged["last_notification"]["status"], "awaiting_ack")
+            self.assertFalse(merged["last_notification"]["acknowledged_by_codex"])
 
     def test_ack_marks_notification_acknowledged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:

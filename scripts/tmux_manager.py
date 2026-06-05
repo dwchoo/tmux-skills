@@ -23,6 +23,7 @@ MANAGER_VERSION = 1
 DEFAULT_MANAGER_LOG_MAX_BYTES = 65536
 MANAGER_STATUSES = {"starting", "idle", "queued", "running", "waiting_for_codex", "cancel_requested", "cancelled", "failed"}
 MANAGER_TERMINAL_JOB_STATUSES = {"succeeded", "failed", "stopped", "timeout", "cancelled", "stale"}
+BRIDGE_VERIFICATION_STATUSES = {"unverified", "awaiting_ack", "verified", "expired", "mismatched_config", "submission_failed"}
 
 
 def manager_id_value(value: str | None) -> str:
@@ -98,6 +99,99 @@ def normalize_notify(mode: str, thread_id: str | None = None, endpoint: str | No
     }
 
 
+def bridge_notify_identity(record: dict[str, Any]) -> dict[str, str]:
+    notify = record.get("notify") if isinstance(record.get("notify"), dict) else {}
+    return {
+        "manager_id": str(record.get("manager_id") or ""),
+        "workspace": str(record.get("workspace") or ""),
+        "endpoint": str(notify.get("endpoint") or ""),
+        "thread_id": str(notify.get("thread_id") or ""),
+    }
+
+
+def bridge_verification_matches(record: dict[str, Any], verification: dict[str, Any]) -> tuple[bool, str | None]:
+    if not isinstance(record.get("notify"), dict) or record["notify"].get("mode") != "bridge":
+        return False, "manager notify mode is not bridge"
+    expected = bridge_notify_identity(record)
+    for key, value in expected.items():
+        if str(verification.get(key) or "") != value:
+            return False, f"bridge verification {key} does not match current manager"
+    return True, None
+
+
+def normalize_bridge_verification(record: dict[str, Any]) -> dict[str, Any]:
+    raw = record.get("bridge_verification")
+    verification = dict(raw) if isinstance(raw, dict) else {}
+    status = tmux_state.token_text(verification.get("status")) or "unverified"
+    if status not in BRIDGE_VERIFICATION_STATUSES:
+        status = "unverified"
+    verification["status"] = status
+    verification.setdefault("event_id", None)
+    verification.setdefault("mode", "bridge")
+    verification.setdefault("manager_id", str(record.get("manager_id") or ""))
+    verification.setdefault("workspace", str(record.get("workspace") or ""))
+    verification.setdefault("endpoint", None)
+    verification.setdefault("thread_id", None)
+    verification.setdefault("prompt_sha256", None)
+    verification.setdefault("submitted_to_app_server", False)
+    verification.setdefault("acknowledged_by_codex", False)
+    verification.setdefault("submitted_at", None)
+    verification.setdefault("acknowledged_at", None)
+    verification.setdefault("ack_turn_id", None)
+    verification.setdefault("expires_at", None)
+    if verification.get("expires_at") and (tmux_state.age_seconds(verification.get("expires_at")) or 0) > 0:
+        verification["status"] = "expired"
+    if verification["status"] in {"awaiting_ack", "verified", "submission_failed"}:
+        matches, reason = bridge_verification_matches(record, verification)
+        if not matches:
+            verification["status"] = "mismatched_config"
+            verification["acknowledged_by_codex"] = False
+            verification["mismatch_reason"] = reason
+    return verification
+
+
+def bridge_receipt_verified(record: dict[str, Any]) -> tuple[bool, str | None]:
+    notify = record.get("notify") if isinstance(record.get("notify"), dict) else {"mode": "none"}
+    if notify.get("mode") != "bridge":
+        return True, None
+    verification = normalize_bridge_verification(record)
+    status = verification.get("status") or "unverified"
+    if status != "verified" or not verification.get("acknowledged_by_codex"):
+        if status == "mismatched_config":
+            _matches, reason = bridge_verification_matches(record, verification)
+            return False, reason or "bridge receipt is not verified: mismatched_config"
+        return False, f"bridge receipt is not verified: {status}"
+    matches, reason = bridge_verification_matches(record, verification)
+    if not matches:
+        return False, reason
+    return True, None
+
+
+def terminal_event_acknowledged(record: dict[str, Any]) -> tuple[bool, str | None]:
+    notify = record.get("notify") if isinstance(record.get("notify"), dict) else {"mode": "none"}
+    if notify.get("mode") != "bridge":
+        return True, None
+    if record.get("status") != "waiting_for_codex":
+        return True, None
+    event_id = str(record.get("last_terminal_event_id") or "")
+    if not event_id:
+        return True, None
+    notification = notification_for_event(record, event_id)
+    if notification and notification.get("acknowledged_by_codex"):
+        return True, None
+    return False, f"last terminal event has not been acknowledged by Codex: {event_id}"
+
+
+def manager_queue_gate(record: dict[str, Any]) -> tuple[bool, str | None]:
+    verified, reason = bridge_receipt_verified(record)
+    if not verified:
+        return False, reason
+    acknowledged, reason = terminal_event_acknowledged(record)
+    if not acknowledged:
+        return False, reason
+    return True, None
+
+
 def normalize_manager_record(record: dict[str, Any], paths: dict[str, Path] | None = None, path: Path | None = None) -> dict[str, Any]:
     normalized = dict(record)
     manager_id = manager_id_value(str(path.stem if path else normalized.get("manager_id")))
@@ -148,6 +242,7 @@ def normalize_manager_record(record: dict[str, Any], paths: dict[str, Path] | No
         normalized["dashboard_path"] = str(manager_dashboard_path(paths, manager_id))
     else:
         normalized.setdefault("manager_path", str(path) if path else None)
+    normalized["bridge_verification"] = normalize_bridge_verification(normalized)
     return normalized
 
 
@@ -302,6 +397,182 @@ def mark_last_terminal_event_handled(record: dict[str, Any], *, next_job_id: str
     )
 
 
+def bridge_check_event_id(record: dict[str, Any], observed_at: str) -> str:
+    payload = bridge_notify_identity(record) | {"observed_at": observed_at, "event": "manager_bridge_check"}
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def build_bridge_check_candidate(record: dict[str, Any], event_id: str) -> dict[str, Any]:
+    return {
+        "source": "manager_bridge_check",
+        "event_id": event_id,
+        "job_id": record.get("current_job_id") or "none",
+        "status_path": None,
+        "task_path": None,
+        "log_path": None,
+    }
+
+
+def bridge_check_result(record: dict[str, Any], *, ack_timeout_seconds: float, reason: str | None = None) -> dict[str, Any]:
+    verification = record.get("bridge_verification") if isinstance(record.get("bridge_verification"), dict) else {}
+    return {
+        "manager_id": record.get("manager_id"),
+        "event_id": verification.get("event_id"),
+        "verified": bool(verification.get("status") == "verified" and verification.get("acknowledged_by_codex")),
+        "submitted_to_app_server": bool(verification.get("submitted_to_app_server")),
+        "acknowledged_by_codex": bool(verification.get("acknowledged_by_codex")),
+        "ack_timeout_seconds": ack_timeout_seconds,
+        "manager_path": record.get("manager_path"),
+        "reason": reason,
+        "record": record,
+    }
+
+
+def bridge_check_manager(
+    *,
+    manager_id: str,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    ack_timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    item_id = manager_id_value(manager_id)
+    paths = manager_paths(workspace, state_dir)
+    record, error = read_manager_record(paths, item_id)
+    timeout = max(0.0, float(ack_timeout_seconds))
+    if error:
+        return {
+            "manager_id": item_id,
+            "event_id": None,
+            "verified": False,
+            "submitted_to_app_server": False,
+            "acknowledged_by_codex": False,
+            "ack_timeout_seconds": timeout,
+            "manager_path": str(manager_record_path(paths, item_id)),
+            "reason": error,
+        }
+    if record is None:
+        return {
+            "manager_id": item_id,
+            "event_id": None,
+            "verified": False,
+            "submitted_to_app_server": False,
+            "acknowledged_by_codex": False,
+            "ack_timeout_seconds": timeout,
+            "manager_path": str(manager_record_path(paths, item_id)),
+            "reason": "manager record not found",
+        }
+    notify = record.get("notify") if isinstance(record.get("notify"), dict) else {"mode": "none"}
+    if notify.get("mode") != "bridge":
+        return bridge_check_result(record, ack_timeout_seconds=timeout, reason="manager bridge-check requires --notify bridge")
+
+    observed_at = tmux_state.utc_now()
+    event_id = bridge_check_event_id(record, observed_at)
+    candidate = build_bridge_check_candidate(record, event_id)
+    prompt = build_manager_wake_prompt(record, candidate)
+    prompt_hash = tmux_bridge.prompt_sha256(prompt)
+    verification = bridge_notify_identity(record) | {
+        "event_id": event_id,
+        "mode": "bridge",
+        "status": "awaiting_ack",
+        "source": "manager_bridge_check",
+        "prompt_sha256": prompt_hash,
+        "submitted_to_app_server": False,
+        "acknowledged_by_codex": False,
+        "observed_at": observed_at,
+        "submit_attempted_at": observed_at,
+        "submitted_at": None,
+        "acknowledged_at": None,
+        "ack_turn_id": None,
+        "ack_timeout_seconds": timeout,
+        "expires_at": None,
+    }
+    record["bridge_verification"] = verification
+    record = upsert_notification(
+        record,
+        event_id,
+        {
+            "event_id": event_id,
+            "mode": "bridge",
+            "source": "manager_bridge_check",
+            "job_id": candidate.get("job_id"),
+            "status": "awaiting_ack",
+            "status_path": None,
+            "task_path": None,
+            "log_path": None,
+            "observed_at": observed_at,
+            "submit_attempted_at": observed_at,
+            "submitted_to_app_server": False,
+            "acknowledged_by_codex": False,
+            "prompt_sha256": prompt_hash,
+        },
+    )
+    record = write_manager_record(paths, record)
+
+    bridge_record = {
+        "endpoint": notify.get("endpoint"),
+        "thread_id": notify.get("thread_id"),
+        "workspace": record.get("workspace"),
+    }
+    try:
+        delivery = tmux_bridge.deliver_bridge_candidate(bridge_record, candidate, prompt)
+    except Exception as exc:
+        record["bridge_verification"] = dict(record["bridge_verification"]) | {
+            "status": "submission_failed",
+            "submitted_to_app_server": False,
+            "error": str(exc),
+        }
+        record = upsert_notification(
+            record,
+            event_id,
+            {
+                "status": "submission_failed",
+                "submitted_to_app_server": False,
+                "error": str(exc),
+            },
+        )
+        record = write_manager_record(paths, record)
+        return bridge_check_result(record, ack_timeout_seconds=timeout, reason=str(exc))
+
+    submitted_at = tmux_state.utc_now()
+    latest, _latest_error = read_manager_record(paths, item_id)
+    if latest is not None:
+        record = merge_external_ack_fields(record, latest)
+    acknowledged = bool((record.get("bridge_verification") or {}).get("acknowledged_by_codex"))
+    record["bridge_verification"] = dict(record["bridge_verification"]) | {
+        "status": "verified" if acknowledged else "awaiting_ack",
+        "submitted_to_app_server": True,
+        "submitted_at": submitted_at,
+        "prompt_sha256": delivery.get("prompt_sha256") or prompt_hash,
+        "delivery": delivery,
+    }
+    record = upsert_notification(
+        record,
+        event_id,
+        {
+            "status": "acknowledged" if acknowledged else "awaiting_ack",
+            "submitted_at": submitted_at,
+            "submitted_to_app_server": True,
+            "prompt_sha256": delivery.get("prompt_sha256") or prompt_hash,
+            "delivery": delivery,
+        },
+    )
+    record = write_manager_record(paths, record)
+
+    deadline = time.monotonic() + timeout
+    while True:
+        latest, _latest_error = read_manager_record(paths, item_id)
+        if latest is not None:
+            record = latest
+        verification = record.get("bridge_verification") if isinstance(record.get("bridge_verification"), dict) else {}
+        if verification.get("event_id") == event_id and verification.get("status") == "verified" and verification.get("acknowledged_by_codex"):
+            return bridge_check_result(record, ack_timeout_seconds=timeout, reason=None)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return bridge_check_result(record, ack_timeout_seconds=timeout, reason="bridge receipt ack timed out")
+        time.sleep(min(0.25, remaining))
+
+
 def queue_manager_job(
     *,
     manager_id: str,
@@ -325,6 +596,9 @@ def queue_manager_job(
         return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager already has a pending job"}
     if record.get("status") == "running":
         return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager is already running a job"}
+    allowed, gate_reason = manager_queue_gate(record)
+    if not allowed:
+        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": gate_reason}
 
     text, read_error = command_text_from_source(command_text, command_file)
     if read_error:
@@ -367,6 +641,56 @@ def ack_manager_event(
         return {"manager_id": item_id, "event_id": target_event_id, "acked": False, "reason": error}
     if record is None:
         return {"manager_id": item_id, "event_id": target_event_id, "acked": False, "reason": "manager record not found"}
+
+    verification = record.get("bridge_verification") if isinstance(record.get("bridge_verification"), dict) else {}
+    if target_event_id == str(verification.get("event_id") or ""):
+        matches, match_reason = bridge_verification_matches(record, verification)
+        if not matches:
+            return {"manager_id": item_id, "event_id": target_event_id, "acked": False, "reason": match_reason}
+        if not verification.get("submitted_to_app_server"):
+            return {
+                "manager_id": item_id,
+                "event_id": target_event_id,
+                "acked": False,
+                "reason": "bridge verification event has not been submitted to app-server",
+            }
+        now = tmux_state.utc_now()
+        existing = notification_for_event(record, target_event_id) or {}
+        ack_fields = {
+            "event_id": target_event_id,
+            "mode": "bridge",
+            "source": "manager_bridge_check",
+            "job_id": existing.get("job_id") or record.get("current_job_id") or "none",
+            "status": "acknowledged",
+            "acknowledged_by_codex": True,
+            "acknowledged_at": now,
+            "ack_turn_id": tmux_state.one_line_text(turn_id),
+            "ack_note": tmux_state.one_line_text(note),
+            "submitted_to_app_server": bool(verification.get("submitted_to_app_server")),
+            "prompt_sha256": verification.get("prompt_sha256"),
+        }
+        record = upsert_notification(record, target_event_id, ack_fields)
+        record["bridge_verification"] = dict(verification) | {
+            "status": "verified",
+            "acknowledged_by_codex": True,
+            "acknowledged_at": now,
+            "ack_turn_id": tmux_state.one_line_text(turn_id),
+            "ack_note": tmux_state.one_line_text(note),
+        }
+        record["last_ack"] = {
+            "event_id": target_event_id,
+            "acknowledged_at": now,
+            "turn_id": tmux_state.one_line_text(turn_id),
+            "note": tmux_state.one_line_text(note),
+        }
+        record = write_manager_record(paths, record)
+        return {
+            "manager_id": item_id,
+            "event_id": target_event_id,
+            "acked": True,
+            "manager_path": record["manager_path"],
+            "record": record,
+        }
 
     existing = notification_for_event(record, target_event_id)
     if existing is None and target_event_id != str(record.get("last_terminal_event_id") or ""):
@@ -757,9 +1081,43 @@ def manager_cycle(record: dict[str, Any], *, paths: dict[str, Path]) -> dict[str
     return record
 
 
+def merge_external_ack_fields(record: dict[str, Any], latest: dict[str, Any] | None) -> dict[str, Any]:
+    if not latest:
+        return record
+    merged = dict(record)
+    original_last_notification = (
+        dict(record["last_notification"]) if isinstance(record.get("last_notification"), dict) else None
+    )
+    latest_ack = latest.get("last_ack") if isinstance(latest.get("last_ack"), dict) else None
+    if latest_ack:
+        merged["last_ack"] = dict(latest_ack)
+    for notification in latest.get("notifications", []):
+        if not isinstance(notification, dict):
+            continue
+        event_id = str(notification.get("event_id") or "")
+        if not event_id:
+            continue
+        if notification.get("acknowledged_by_codex") or str(notification.get("status") or "").startswith("handled"):
+            merged = upsert_notification(merged, event_id, dict(notification))
+    latest_verification = latest.get("bridge_verification") if isinstance(latest.get("bridge_verification"), dict) else None
+    if latest_verification and latest_verification.get("event_id"):
+        current_verification = merged.get("bridge_verification") if isinstance(merged.get("bridge_verification"), dict) else {}
+        if (
+            latest_verification.get("acknowledged_by_codex")
+            or latest_verification.get("status") in {"verified", "expired", "mismatched_config", "submission_failed"}
+            or latest_verification.get("event_id") == current_verification.get("event_id")
+        ):
+            merged["bridge_verification"] = dict(current_verification) | dict(latest_verification)
+    if original_last_notification and original_last_notification.get("event_id"):
+        event_id = str(original_last_notification.get("event_id") or "")
+        merged["last_notification"] = notification_for_event(merged, event_id) or original_last_notification
+    return merged
+
+
 def merge_external_manager_update(record: dict[str, Any], latest: dict[str, Any] | None) -> dict[str, Any]:
     if not latest:
         return record
+    record = merge_external_ack_fields(record, latest)
     if latest.get("status") == "cancel_requested" and record.get("status") != "cancelled":
         merged = dict(latest)
         merged["heartbeat_at"] = record.get("heartbeat_at")
@@ -944,6 +1302,16 @@ def dashboard_text(record: dict[str, Any], job_status: dict[str, Any] | None = N
             f"size_before={last_log_trim.get('size_before') or 'none'} "
             f"size_after={last_log_trim.get('size_after') or 'none'}"
         )
+    verification = record.get("bridge_verification") if isinstance(record.get("bridge_verification"), dict) else {}
+    if verification:
+        lines.append(
+            "bridge_verification: "
+            f"status={verification.get('status') or 'unknown'} "
+            f"submitted_to_app_server={verification.get('submitted_to_app_server')} "
+            f"acknowledged_by_codex={verification.get('acknowledged_by_codex')}"
+        )
+        if verification.get("event_id"):
+            lines.append(f"bridge_verification_event_id: {verification.get('event_id')}")
     notification = record.get("last_notification")
     if isinstance(notification, dict):
         lines.append(

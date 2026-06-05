@@ -242,6 +242,12 @@ class TmuxControlTests(unittest.TestCase):
         default_status_args = parser.parse_args(["manager", "status"])
         self.assertIsNone(default_status_args.manager_id)
 
+        bridge_check_args = parser.parse_args(
+            ["manager", "bridge-check", "--manager-id", "manager-one", "--ack-timeout-seconds", "0.5"]
+        )
+        self.assertEqual(bridge_check_args.manager_action, "bridge-check")
+        self.assertEqual(bridge_check_args.ack_timeout_seconds, 0.5)
+
         ack_args = parser.parse_args(
             ["manager", "ack", "--manager-id", "manager-one", "--event-id", "evt-one", "--turn-id", "turn-main"]
         )
@@ -297,6 +303,41 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("--job-id", result["reason"])
 
+    def test_manager_start_with_bridge_command_requires_verified_receipt_before_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            parser = tmux_control.build_parser()
+            args = parser.parse_args(
+                [
+                    "manager",
+                    "start",
+                    "--manager-id",
+                    "manager-one",
+                    "--job-id",
+                    "job-one",
+                    "--command",
+                    "echo ok",
+                    "--notify",
+                    "bridge",
+                    "--thread-id",
+                    "thr-test",
+                    "--endpoint",
+                    "unix:///tmp/app.sock",
+                    "--workspace",
+                    str(workspace),
+                ]
+            )
+
+            with mock.patch.object(tmux_control, "manager_layout") as layout:
+                result = tmux_control.manager(args)
+
+            layout.assert_not_called()
+            self.assertFalse(result["started"])
+            self.assertIn("bridge receipt is not verified", result["reason"])
+            paths = tmux_manager.manager_paths(str(workspace))
+            self.assertFalse(tmux_manager.manager_command_request_path(paths, "manager-one", "job-one").exists())
+
     def test_manager_ack_dispatches_to_tmux_manager(self) -> None:
         parser = tmux_control.build_parser()
         args = parser.parse_args(
@@ -328,6 +369,33 @@ class TmuxControlTests(unittest.TestCase):
             state_dir=None,
             turn_id="turn-main",
             note="received",
+        )
+
+    def test_manager_bridge_check_dispatches_to_tmux_manager(self) -> None:
+        parser = tmux_control.build_parser()
+        args = parser.parse_args(
+            [
+                "manager",
+                "bridge-check",
+                "--manager-id",
+                "manager-one",
+                "--ack-timeout-seconds",
+                "0.5",
+                "--workspace",
+                "/tmp/workspace",
+            ]
+        )
+        result = {"manager_id": "manager-one", "event_id": "evt-one", "verified": True}
+
+        with mock.patch.object(tmux_manager, "bridge_check_manager", return_value=result) as bridge_check:
+            actual = tmux_control.manager(args)
+
+        self.assertEqual(actual, result)
+        bridge_check.assert_called_once_with(
+            manager_id="manager-one",
+            workspace="/tmp/workspace",
+            state_dir=None,
+            ack_timeout_seconds=0.5,
         )
 
     def test_manager_cleanup_refuses_live_manager_without_force(self) -> None:

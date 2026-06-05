@@ -1297,6 +1297,17 @@ def manager_start(args: argparse.Namespace) -> dict[str, Any]:
         return {"manager_id": manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": "manager already has a pending job"}
     if existing_record and existing_record.get("status") == "running" and has_command:
         return {"manager_id": manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": "manager is already running a job"}
+    if has_command:
+        if existing_record:
+            gate_record = dict(existing_record)
+            gate_record.update({"notify": notify, "workspace": str(paths["workspace"]), "state_dir": str(paths["root"])})
+            gate_record = tmux_manager.normalize_manager_record(gate_record, paths)
+            allowed, gate_reason = tmux_manager.manager_queue_gate(gate_record)
+        else:
+            allowed = notify.get("mode") != "bridge"
+            gate_reason = "bridge receipt is not verified: unverified" if not allowed else None
+        if not allowed:
+            return {"manager_id": manager_id, "job_id": job_id, "started": False, "status": "failed", "reason": gate_reason}
     existing_manager_alive = False
     if existing_record and existing_record.get("status") in {"starting", "idle", "queued", "running", "waiting_for_codex"}:
         existing_manager_alive = pid_is_running(parse_int(str(existing_record.get("manager_pid") or "")))
@@ -1379,6 +1390,14 @@ def manager(args: argparse.Namespace) -> dict[str, Any]:
     if args.manager_action == "status":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
         return tmux_manager.manager_status(manager_id, args.workspace, args.state_dir)
+    if args.manager_action == "bridge-check":
+        manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
+        return tmux_manager.bridge_check_manager(
+            manager_id=manager_id,
+            workspace=args.workspace,
+            state_dir=args.state_dir,
+            ack_timeout_seconds=args.ack_timeout_seconds,
+        )
     if args.manager_action == "ack":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
         return tmux_manager.ack_manager_event(
@@ -3778,6 +3797,12 @@ def build_parser() -> argparse.ArgumentParser:
     manager_status_parser.add_argument("--workspace")
     manager_status_parser.add_argument("--state-dir")
 
+    manager_bridge_check_parser = manager_subparsers.add_parser("bridge-check", help="Verify that bridge prompts reach target Codex")
+    manager_bridge_check_parser.add_argument("--manager-id")
+    manager_bridge_check_parser.add_argument("--ack-timeout-seconds", type=positive_float, default=30.0)
+    manager_bridge_check_parser.add_argument("--workspace")
+    manager_bridge_check_parser.add_argument("--state-dir")
+
     manager_ack_parser = manager_subparsers.add_parser("ack", help="Acknowledge that Codex received a manager terminal event")
     manager_ack_parser.add_argument("--manager-id")
     manager_ack_parser.add_argument("--event-id", required=True)
@@ -4101,6 +4126,8 @@ def main() -> None:
         else:
             print_json(result)
         if args.manager_action == "start" and not result.get("started"):
+            raise SystemExit(2)
+        if args.manager_action == "bridge-check" and not result.get("verified"):
             raise SystemExit(2)
         if args.manager_action == "ack" and not result.get("acked"):
             raise SystemExit(2)

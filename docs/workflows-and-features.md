@@ -108,6 +108,8 @@ python scripts/tmux_control.py manager start \
   --thread-id THREAD \
   --endpoint unix://"$PWD/.codex/tmux-skills/bridge/sockets/codex-bridge.sock"
 
+python scripts/tmux_control.py manager bridge-check
+
 python scripts/tmux_control.py manager run-next \
   --job-id train-1 \
   --command 'python train.py'
@@ -138,7 +140,7 @@ Expected state:
 - Required fields include `manager_id`, `status`, `manager_pane_id`, `worker_pane_id`, `current_job_id`, `job_ids`, `notify`, `heartbeat_at`, `last_terminal_event_id`, `workspace`, and `state_dir`.
 - The default manager id is one stable id per workspace/session/window; `--manager-id` is kept for explicit compatibility, but the default workflow uses one manager to own multiple jobs.
 - The Codex-owned manager starts jobs through `tmux_control.py run`, so normal command, log, status, acknowledgement, and optional task files still use the existing `.codex/tmux-skills` directories.
-- Manager-owned logs are bounded by `log_max_bytes` and are trimmed to a tail while the manager is alive, so log files do not grow without limit. When Codex receives a bridge turn, it should first acknowledge the event with `manager ack --event-id <last_terminal_event_id>`, then use `tmux_control.py capture --pane <worker_pane_id>` for live or recent terminal output, and read bounded status/log files only when that is sufficient.
+- Manager-owned logs are bounded by `log_max_bytes` and are trimmed to a tail while the manager is alive, so log files do not grow without limit. When Codex receives a bridge turn, it should first read the manager path from the prompt, acknowledge the current target event, then use `tmux_control.py capture --pane <worker_pane_id>` for live or recent terminal output, and read bounded status/log files only when that is sufficient. For bridge preflight prompts, acknowledge `bridge_verification.event_id`; for terminal prompts, acknowledge `last_terminal_event_id`.
 
 Terminal behavior:
 
@@ -146,8 +148,11 @@ Terminal behavior:
 - With bridge notification enabled, the manager submits a path-only prompt for the terminal event, then waits. The prompt includes workspace, manager path, job/status/log/task paths, and no summaries, task instruction bodies, diagnosis, retry commands, or model/delegation instructions.
 - Normal operation must not rely on Codex polling `manager status`. Main Codex should learn about terminal work from the manager's bridge turn, then inspect only the paths listed in that prompt.
 - Successful app-server submission is recorded once per terminal event in `submitted_event_ids` and `last_notification.submitted_to_app_server`; it does not prove Codex received or acted on the turn. Codex receipt is recorded only after main Codex runs `manager ack --event-id <last_terminal_event_id>`.
+- Bridge mode is supported only when the target Codex is attached to the same local app-server endpoint with `codex --remote unix://PATH` and `--thread-id` names that target session. An ordinary standalone `codex` or `codex --yolo` pane is not a verified bridge target, and `CODEX_THREAD_ID` alone is not enough.
+- `manager bridge-check` creates a path-only preflight event, submits it through the configured app-server endpoint, and waits for target Codex to run `manager ack`. Verified bridge receipt is bound to `manager_id`, `workspace`, `endpoint`, `thread_id`, and the preflight event/prompt hash; changing any value invalidates the verification.
+- In bridge mode, `manager run-next` and `manager start` with an initial command refuse to queue worker commands until bridge receipt is verified. After a terminal event, `run-next` is blocked until that event is acknowledged, then the previous event is marked `handled`.
 - If bridge submission fails, the manager keeps retrying while it remains alive and does not mark the event as submitted until submission succeeds. `last_notification.error` records the latest retryable submission failure.
-- Use `manager status` only for manual diagnostics or tests: `heartbeat_at` should advance while the manager loop is alive, `last_terminal_event_id` should match the terminal job event, and `notifications` should show lifecycle states such as `awaiting_ack`, `acknowledged`, and `handled`.
+- Use `manager status` only for manual diagnostics or tests: `heartbeat_at` should advance while the manager loop is alive, `last_terminal_event_id` should match the terminal job event, and `notifications` should show lifecycle states such as `awaiting_ack`, `acknowledged`, and `handled`. A demo is not successful until target Codex receives the bridge turn and records `manager ack`; polling status manually only proves diagnostics.
 - `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH` before work starts. Use `--notify none` only for manual visible-dashboard debugging; it intentionally records no Codex ack.
 - The manager never uses `tmux send-keys` to inject text into a Codex pane.
 
@@ -155,6 +160,7 @@ Follow-up and cancellation:
 
 ```bash
 python scripts/tmux_control.py manager status
+python scripts/tmux_control.py manager bridge-check
 python scripts/tmux_control.py manager ack --event-id EVENT_ID
 python scripts/tmux_control.py manager run-next --job-id train-2 --command 'python eval.py'
 python scripts/tmux_control.py manager cancel
