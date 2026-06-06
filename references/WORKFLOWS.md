@@ -18,14 +18,23 @@ For `queue-after-status`, the status file path and row specs must be nonblank; b
 ```bash
 python scripts/tmux_control.py manager start --notify bridge --thread-id THREAD --endpoint unix://"$PWD/.codex/tmux-skills/bridge/sockets/codex-bridge.sock"
 python scripts/tmux_control.py manager bridge-check
-python scripts/tmux_control.py manager run-next --job-id train-1 --command "python train.py"
+python scripts/tmux_control.py manager submit --job-id train-1 --command "python train.py"
 ```
 
-Use the current `foreground-debug` manager workflow when worker output should stay readable in a long side pane and one reusable compact manager pane should remain visible below Codex in tmux. This mode is for debug/demo use because the manager command keeps main Codex working while it runs. The intended `background-operating` workflow must not become the default until `manager ps-poc` proves that the same launcher can return quickly, leave Codex idle, show the manager in Codex `/ps`, stop the manager when Codex exits, and leave an already submitted tmux worker running.
+If the target is an already-open Codex TUI in tmux instead of a `codex --remote` app-server thread, bind the manager to exactly one verified Codex pane:
 
-`manager start --process-mode foreground` is the supported mode. `manager start --process-mode background` fails with `unsupported_by_current_codex_surface` until the PoC evidence exists; do not replace it with a detached daemon, tmux-resident manager loop, OS `ps` check, or bridge-only daemon because those do not satisfy Codex `/ps` visibility while Codex is idle. In foreground-debug, if Codex exits or stops the command, this manager loop exits too; worker jobs already submitted to the tmux worker pane continue independently.
+```bash
+python scripts/tmux_control.py manager start --notify tmux-inject --codex-pane %1
+python scripts/tmux_control.py manager submit --job-id train-1 --command "python train.py"
+```
 
-The manager writes `.codex/tmux-skills/managers/<manager_id>.json`, starts the worker through `tmux_control.py run`, and updates the reusable manager pane with heartbeat, status path, log path, task path, and worker pane details. The manager pane must not run a persistent renderer loop. Manager-owned logs are trimmed to a bounded tail while the manager is alive. When Codex receives a bridge turn, it should read the manager path from the prompt, acknowledge the current target event, then use `capture` on the worker pane for live terminal output when responding. For bridge preflight prompts, acknowledge `bridge_verification.event_id`; for terminal prompts, acknowledge `last_terminal_event_id`. On success, failure, stop, timeout, cancellation, stale status, or missing worker pane, the Codex-owned process stays alive as `waiting_for_codex`.
+`--codex-pane current` is accepted only when the current tmux pane resolves to one live Codex process. The manager records the bound pane and never switches targets implicitly.
+
+Use the default `background-operating` manager workflow when worker output should stay readable in visible worker panes and one reusable compact manager pane should remain visible below Codex in tmux. In this workflow Codex runs `manager start --process-mode background` as a Codex-owned background terminal, so the same manager loop stays visible in `/ps` while the main turn returns to idle. Use `foreground-debug` only when it is acceptable for the manager command to keep Codex working while it runs.
+
+`manager start --process-mode foreground` and `manager start --process-mode background` both run the same manager loop. Background mode must be launched by Codex as a background terminal; do not replace it with a detached daemon, tmux-resident manager loop, OS `ps` check, bridge-only daemon, or repeated `tmux send-keys clear; cat` renderer because those do not satisfy Codex `/ps` visibility while Codex is idle and they pollute pane history. In foreground-debug, if Codex exits or stops the command, this manager loop exits too; worker jobs already submitted to the tmux worker pane continue independently. The manager writes dashboard snapshots and `--dashboard-renderer pane` starts or reuses one curses viewer; `--dashboard-renderer none` keeps only file-backed status.
+
+The manager writes `.codex/tmux-skills/managers/<manager_id>.json`, starts workers through `tmux_control.py run`, and writes dashboard snapshots that one curses viewer renders in the reusable manager pane. The compact pane shows only summary/job/event IDs, pane labels as `index:%id` when the tmux pane index is known, status, notify state, and ack state; full paths and log/error bodies remain in `manager status`, status JSON, log files, and capture output. Manager-owned logs are trimmed to a bounded tail while the manager is alive. When Codex receives a bridge turn, it should read the manager path from the prompt, acknowledge the target event, then use `capture` on the event/job pane for live terminal output when responding. For tmux-inject, the prompt only wakes Codex and contains the manager id and event id; after waking, Codex inspects manager state for the workspace and runs `manager ack`. For bridge preflight prompts, acknowledge `bridge_verification.event_id`; for terminal prompts, acknowledge the event id in `last_terminal_event_id` or `events`. On success, failure, stop, timeout, cancellation, stale status, or missing worker pane, the Codex-owned process records a job event, stays alive as `waiting_for_codex` while unacknowledged events exist, and keeps monitoring other active jobs.
 
 Proof gate:
 
@@ -35,16 +44,29 @@ python scripts/tmux_control.py manager start --process-mode foreground --notify 
 python scripts/tmux_control.py manager start --process-mode background --notify none
 ```
 
-The background command refuses until PoC evidence proves the Codex-owned background terminal launch surface.
+The background command prints its start record and continues running in the Codex-owned background terminal. `manager ps-poc` records whether a live background manager record is present and whether the `/ps` proof fields are available; an OS process listing alone is not equivalent proof.
 
-When no worker pane is assigned, `manager start` splits Codex vertically first so the worker gets a tall right-side pane. Only the compact manager pane is placed below Codex. Repeated starts reuse the idle manager pane directly below Codex and reuse an existing idle tall worker pane when possible. A single manager record owns multiple job ids instead of creating a new manager for each job.
+When no worker pane is assigned, `manager start` splits Codex vertically first so the default worker gets a tall right-side pane. Only the compact manager pane is placed below Codex. Repeated starts reuse the idle manager pane directly below Codex and reuse an existing idle tall worker pane when possible. A single manager record owns multiple job ids and can monitor multiple worker panes instead of creating a new manager for each job.
 By default the manager id is stable per workspace/session/window. Pass `--manager-id` only when you need an explicit compatibility id.
-If that manager process is already alive, another `manager start` exits instead of creating a second manager loop. Submit work with `manager run-next`; the same manager monitors the first and subsequent jobs.
+If that manager process is already alive, another `manager start` exits instead of creating a second manager loop. Submit work with `manager submit`; use `manager submit --new-worker` for parallel visible work and compatibility `manager run-next` for sequential work in the default worker pane. `manager run-next` never creates a pane, refuses while any manager job is active, and marks the previous terminal event as handled by the queued follow-up job.
 
-Bridge notifications are path-only and are submitted by the manager, not by Codex polling status files. They include workspace, manager path, job/status/log/task paths, and no status summaries, log excerpts, task instruction bodies, diagnosis, retry commands, or model/delegation text. `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH`; use `--notify none` only for manual visible-dashboard debugging. Bridge mode is supported only when target Codex is attached to that app-server endpoint with `codex --remote unix://PATH`; an ordinary standalone `codex` or `codex --yolo` pane is not a verified target, and `CODEX_THREAD_ID` alone is not enough.
+Bridge notifications are path-only and are submitted by the manager, not by Codex polling status files. They include event id, workspace, manager path, job/status/log/task paths, and no status summaries, log excerpts, task instruction bodies, diagnosis, retry commands, or model/delegation text. `--notify bridge` requires `--thread-id` and `--endpoint unix://PATH`; use `--notify none` only for manual visible-dashboard debugging. Bridge mode is supported only when target Codex is attached to that app-server endpoint with `codex --remote unix://PATH`; an ordinary standalone `codex` or `codex --yolo` pane is not a verified target, and `CODEX_THREAD_ID` alone is not enough.
 Successful app-server submission is recorded once per terminal event in `submitted_event_ids` and `last_notification.submitted_to_app_server`; it does not prove Codex received or acted on the turn. Codex receipt is recorded only after main Codex runs `manager ack --event-id <last_terminal_event_id>`.
-Run `manager bridge-check` before queueing work. It creates a path-only preflight event, submits it through the configured endpoint, and waits for target Codex to run `manager ack`. Verified bridge receipt is bound to `manager_id`, `workspace`, `endpoint`, `thread_id`, and the preflight event/prompt hash; changing any value invalidates it. In bridge mode, `manager run-next` and `manager start` with an initial command refuse to queue worker commands until bridge receipt is verified. After a terminal event, `run-next` is blocked until that event is acknowledged, then the previous event is marked `handled`.
+Run `manager bridge-check` before queueing work. It creates a path-only preflight event, submits it through the configured endpoint, and waits for target Codex to run `manager ack`. Verified bridge receipt is bound to `manager_id`, `workspace`, `endpoint`, `thread_id`, and the preflight event/prompt hash; changing any value invalidates it. In bridge mode, `manager submit`, `manager run-next`, and `manager start` with an initial command refuse to queue worker commands until bridge receipt is verified. After a terminal event, sequential `run-next` is blocked until that event is acknowledged, then the previous event is marked `handled`.
 If bridge submission fails, the live manager retries while it remains in `waiting_for_codex` and does not mark the event submitted until submission succeeds. Use `manager status` only for manual diagnostics or tests: `heartbeat_at` advances while alive, `last_terminal_event_id` records the observed terminal event, and `notifications` shows lifecycle states such as `awaiting_ack`, `acknowledged`, and `handled`. A demo is not successful until target Codex receives the bridge turn and records `manager ack`; polling status manually only proves diagnostics.
+
+tmux-inject notifications paste exactly this wake prompt to the bound Codex pane, attempt the Codex composer submit action, and then observe the bound pane to decide whether a bounded follow-up submit key is needed:
+
+```text
+tmux-skills manager event is ready.
+
+Manager ID: <manager_id>
+Event ID: <event_id>
+
+Inspect the manager state for this workspace, decide the next action, and acknowledge the event after inspection.
+```
+
+The manager handles an event as unacknowledged until `manager ack` is recorded. A successful paste or key return code is not Codex receipt; it only records a tmux delivery attempt. If the bound pane is unsafe, ambiguous, missing, dead, or no live Codex process is found, the notification stays `inject_pending` or `inject_refused`; it never downgrades to `none`. The optional Codex SDK checker uses the bound tmux pane capture as orchestration input: before injection it may return `inject`, `defer`, or `refuse`, and after injection it may request a bounded submit-key follow-up when the wake prompt remains staged in the composer. The SDK must use the configured default Codex model with reasoning effort `low`, must not choose a different pane, and deterministic guardrails override it. If no ack arrives after a tmux delivery attempt, the manager keeps the event pending and periodically rechecks the same event instead of treating pane capture as receipt.
 
 Follow-up and cancellation:
 
@@ -52,13 +74,17 @@ Follow-up and cancellation:
 python scripts/tmux_control.py manager status
 python scripts/tmux_control.py manager bridge-check
 python scripts/tmux_control.py manager ack --event-id EVENT_ID
-python scripts/tmux_control.py manager run-next --job-id train-2 --command "python eval.py"
+python scripts/tmux_control.py manager submit --job-id train-2 --command "python eval.py"
+python scripts/tmux_control.py manager submit --new-worker --job-id eval-1 --command "python eval.py"
+python scripts/tmux_control.py manager run-next --job-id report-1 --command "python report.py"
 python scripts/tmux_control.py manager cancel
 python scripts/tmux_control.py manager cancel --stop-worker
+python scripts/tmux_control.py manager cancel --job-id train-2
+python scripts/tmux_control.py manager cancel --all-workers
 python scripts/tmux_control.py manager cleanup --jobs
 ```
 
-`manager cancel` leaves panes/windows and evidence intact by default. `--stop-worker` is required before cancellation attempts to stop the active worker job. Cancellation is sticky: after `cancel_requested` or `cancelled` is recorded, delayed bridge acknowledgements, terminal notifications, or bridge-check updates must not revive the manager as `waiting_for_codex`, `idle`, or `running`. Use `manager cleanup --jobs` after demos or throwaway work to remove the cancelled manager record, dashboard, and manager-owned command/status/log files. Cleanup never closes panes or windows, and refuses a live manager unless `--force` is passed.
+`manager cancel` leaves panes/windows and evidence intact by default. `--stop-worker` is required before cancellation attempts to stop the active worker job. Cancellation is sticky: after `cancel_requested` or `cancelled` is recorded, delayed bridge acknowledgements, terminal notifications, or bridge-check updates must not revive the manager as `waiting_for_codex`, `idle`, or `running`. Use `manager cleanup --jobs` after demos or throwaway work to remove the cancelled manager record, dashboard snapshot, viewer state, and manager-owned command/status/log files. Cleanup never closes panes or windows, and refuses a live manager unless `--force` is passed.
 
 ## Resume or load prior work
 

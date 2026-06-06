@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -12,6 +14,7 @@ SCRIPT_DIR = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import tmux_manager  # noqa: E402
+import tmux_manager_viewer  # noqa: E402
 import tmux_state  # noqa: E402
 
 
@@ -22,7 +25,9 @@ class TmuxManagerTests(unittest.TestCase):
             manager_id="manager-one",
             manager_pane_id="%3",
             worker_pane_id="%2",
-            pending_job=tmux_manager.build_pending_job("job-one", request_path, str(paths["workspace"])),
+            manager_pane_index="0",
+            worker_pane_index="1",
+            pending_job=tmux_manager.build_pending_job("job-one", request_path, str(paths["workspace"]), "%2", "1"),
             notify=notify or {"mode": "none"},
             workspace=str(paths["workspace"]),
             state_dir=str(paths["root"]),
@@ -44,6 +49,14 @@ class TmuxManagerTests(unittest.TestCase):
             exit_code=0,
             last_output="SECRET OUTPUT SHOULD NOT APPEAR",
         )
+
+    def build_tmux_inject_record(self, paths: dict[str, Path]) -> dict[str, object]:
+        record = self.build_record(paths, {"mode": "tmux-inject", "codex_pane_id": "%9"})
+        record["notify"] = {"mode": "tmux-inject", "codex_pane_id": "%9"}
+        record["codex_pane_id"] = "%9"
+        record["pending_job"] = None
+        record["current_job_id"] = "job-one"
+        return record
 
     def mark_bridge_verified(self, paths: dict[str, Path], record: dict[str, object]) -> dict[str, object]:
         record["bridge_verification"] = tmux_manager.bridge_notify_identity(record) | {
@@ -76,13 +89,21 @@ class TmuxManagerTests(unittest.TestCase):
                 "status",
                 "manager_pane_id",
                 "worker_pane_id",
+                "worker_pane_ids",
                 "current_job_id",
+                "active_job_ids",
                 "job_ids",
+                "jobs",
+                "events",
                 "notify",
                 "heartbeat_at",
                 "last_terminal_event_id",
                 "workspace",
                 "state_dir",
+                "dashboard_renderer",
+                "dashboard_viewer_pid",
+                "dashboard_viewer_state_path",
+                "dashboard_viewer_heartbeat_at",
             ):
                 self.assertIn(key, loaded)
             self.assertEqual(record["manager_path"], str(paths["managers"] / "manager-one.json"))
@@ -107,6 +128,36 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(proof["status"], tmux_manager.MANAGER_PS_POC_STATUS_UNSUPPORTED)
             self.assertIn("codex_ps_visibility", {item["name"] for item in proof["checks"]})
             self.assertIn("operator_confirmation: pending", manual_path.read_text(encoding="utf-8"))
+
+    def test_manager_ps_poc_verifies_live_background_manager_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = tmux_manager.build_manager_record(
+                manager_id="manager-one",
+                manager_pane_id="%3",
+                worker_pane_id="%2",
+                manager_pane_index="0",
+                worker_pane_index="1",
+                pending_job=None,
+                notify={"mode": "none"},
+                workspace=str(paths["workspace"]),
+                state_dir=str(paths["root"]),
+                process_mode="background",
+            )
+            record["heartbeat_at"] = tmux_state.utc_now()
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.manager_ps_poc(str(workspace))
+
+            self.assertTrue(result["supported"])
+            self.assertEqual(result["status"], tmux_manager.MANAGER_PS_POC_STATUS_VERIFIED)
+            self.assertEqual(result["background_managers"][0]["manager_launcher"], "codex-background-terminal")
+            proof_path = Path(result["proof_path"])
+            manual_path = Path(result["manual_note_path"])
+            self.assertTrue(proof_path.exists())
+            self.assertIn("operator_confirmation: recorded", manual_path.read_text(encoding="utf-8"))
 
     def test_idle_manager_record_waits_for_run_next(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -151,6 +202,435 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertFalse(updated["last_notification"]["submitted_to_app_server"])
             self.assertEqual(updated["submitted_event_ids"], [])
 
+    def test_tmux_inject_prompt_is_short_wake_only(self) -> None:
+        record = {"manager_id": "manager-one", "workspace": "/tmp/workspace"}
+        candidate = {
+            "event_id": "event-one",
+            "job_id": "job-one",
+            "status_path": "/tmp/workspace/.codex/tmux-skills/status/job-one.json",
+            "log_path": "/tmp/workspace/.codex/tmux-skills/logs/job-one.log",
+        }
+
+        prompt = tmux_manager.build_tmux_inject_wake_prompt(record, candidate)
+
+        self.assertEqual(
+            prompt,
+            "\n".join(
+                [
+                    "tmux-skills manager event is ready.",
+                    "",
+                    "Manager ID: manager-one",
+                    "Event ID: event-one",
+                    "",
+                    "Inspect the manager state for this workspace, decide the next action, and acknowledge the event after inspection.",
+                ]
+            ),
+        )
+        for forbidden in ("Ack command", "python", "manager ack", "/tmp/workspace", "Status path", "Log path", "retry"):
+            self.assertNotIn(forbidden, prompt)
+
+    def test_tmux_inject_validates_pane_uses_sdk_and_injects_once_before_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+
+            with (
+                mock.patch.object(
+                    tmux_manager,
+                    "pane_codex_validation",
+                    return_value={"safe": True, "status": "live_codex", "reason": "ok"},
+                ) as validate,
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_inject_decision",
+                    return_value={"decision": "inject", "target_pane": "%9", "confidence": 0.9, "reason": "ok"},
+                ) as planner,
+                mock.patch.object(
+                    tmux_manager,
+                    "inject_tmux_wake_prompt",
+                    return_value={"injected": True, "pasted": True, "entered": True},
+                ) as inject,
+                mock.patch.object(
+                    tmux_manager,
+                    "verify_tmux_inject_delivery",
+                    return_value={
+                        "checked": True,
+                        "decision": {"action": "confirmed", "source": "heuristic"},
+                        "prompt_still_staged": False,
+                    },
+                ) as delivery,
+            ):
+                first = tmux_manager.transition_terminal(record, paths=paths, status=status)
+                second = tmux_manager.transition_terminal(first, paths=paths, status=status)
+
+            self.assertEqual(validate.call_count, 1)
+            self.assertEqual(planner.call_count, 1)
+            self.assertEqual(inject.call_count, 1)
+            self.assertEqual(delivery.call_count, 1)
+            self.assertEqual(inject.call_args.args[0], "%9")
+            self.assertIn("Manager ID: manager-one", inject.call_args.args[1])
+            self.assertEqual(first["last_notification"]["mode"], "tmux-inject")
+            self.assertEqual(first["last_notification"]["status"], "injected")
+            self.assertEqual(first["last_notification"]["delivery_check"]["decision"]["action"], "confirmed")
+            self.assertTrue(first["last_notification"]["submitted_to_tmux"])
+            self.assertFalse(first["last_notification"]["submitted_to_app_server"])
+            self.assertEqual(first["submitted_event_ids"], [status["event_id"]])
+            self.assertEqual(second["submitted_event_ids"], [status["event_id"]])
+
+    def test_tmux_inject_refuses_unsafe_pane_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+
+            with (
+                mock.patch.object(
+                    tmux_manager,
+                    "pane_codex_validation",
+                    return_value={"safe": False, "status": "no_live_codex_process", "reason": "not Codex"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_inject_decision",
+                    return_value={"decision": "inject", "target_pane": "%9", "confidence": 1.0, "reason": "ok"},
+                ),
+                mock.patch.object(tmux_manager, "inject_tmux_wake_prompt") as inject,
+            ):
+                updated = tmux_manager.transition_terminal(record, paths=paths, status=status)
+
+            inject.assert_not_called()
+            self.assertEqual(updated["last_notification"]["mode"], "tmux-inject")
+            self.assertEqual(updated["last_notification"]["status"], "inject_refused")
+            self.assertEqual(updated["last_notification"]["reason"], "not Codex")
+            self.assertFalse(updated["last_notification"]["submitted_to_tmux"])
+            self.assertEqual(updated["submitted_event_ids"], [])
+
+    def test_tmux_inject_sdk_defer_records_pending_without_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+
+            with (
+                mock.patch.object(
+                    tmux_manager,
+                    "pane_codex_validation",
+                    return_value={"safe": True, "status": "live_codex", "reason": "ok"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_inject_decision",
+                    return_value={"decision": "defer", "target_pane": "%9", "confidence": 0.0, "reason": "SDK unavailable"},
+                ),
+                mock.patch.object(tmux_manager, "inject_tmux_wake_prompt") as inject,
+            ):
+                updated = tmux_manager.transition_terminal(record, paths=paths, status=status)
+
+            inject.assert_not_called()
+            self.assertEqual(updated["last_notification"]["status"], "inject_pending")
+            self.assertEqual(updated["last_notification"]["reason"], "SDK unavailable")
+            self.assertEqual(updated["submitted_event_ids"], [])
+
+    def test_tmux_inject_guardrail_overrides_sdk_wrong_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+
+            with (
+                mock.patch.object(
+                    tmux_manager,
+                    "pane_codex_validation",
+                    return_value={"safe": True, "status": "live_codex", "reason": "ok"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_inject_decision",
+                    return_value={"decision": "inject", "target_pane": "%10", "confidence": 0.9, "reason": "wrong"},
+                ),
+                mock.patch.object(tmux_manager, "inject_tmux_wake_prompt") as inject,
+            ):
+                updated = tmux_manager.transition_terminal(record, paths=paths, status=status)
+
+            inject.assert_not_called()
+            self.assertEqual(updated["last_notification"]["status"], "inject_refused")
+            self.assertIn("different from the bound Codex pane", updated["last_notification"]["reason"])
+            self.assertEqual(updated["submitted_event_ids"], [])
+
+    def test_tmux_inject_ack_marks_notification_acknowledged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+
+            with (
+                mock.patch.object(tmux_manager, "pane_codex_validation", return_value={"safe": True, "status": "live_codex"}),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_inject_decision",
+                    return_value={"decision": "inject", "target_pane": "%9", "confidence": 1.0, "reason": "ok"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "inject_tmux_wake_prompt",
+                    return_value={"injected": True, "pasted": True, "entered": True},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "verify_tmux_inject_delivery",
+                    return_value={"checked": True, "decision": {"action": "confirmed"}, "prompt_still_staged": False},
+                ),
+            ):
+                updated = tmux_manager.transition_terminal(record, paths=paths, status=status)
+            tmux_manager.write_manager_record(paths, updated)
+
+            ack = tmux_manager.ack_manager_event(
+                manager_id="manager-one",
+                event_id=str(status["event_id"]),
+                workspace=str(workspace),
+            )
+
+            self.assertTrue(ack["acked"])
+            notification = tmux_manager.notification_for_event(ack["record"], str(status["event_id"]))
+            self.assertEqual(notification["mode"], "tmux-inject")
+            self.assertEqual(notification["status"], "acknowledged")
+            self.assertTrue(notification["acknowledged_by_codex"])
+            self.assertEqual(ack["record"]["last_ack"]["event_id"], status["event_id"])
+
+    def test_tmux_inject_sdk_uses_default_codex_model_with_low_effort(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class FakeResponses:
+            def create(self, **kwargs: object) -> object:
+                calls.append(kwargs)
+                return type(
+                    "FakeResponse",
+                    (),
+                    {
+                        "output_text": json.dumps(
+                            {
+                                "decision": "inject",
+                                "target_pane": "%9",
+                                "confidence": 0.8,
+                                "reason": "safe",
+                            }
+                        )
+                    },
+                )()
+
+        class FakeOpenAI:
+            def __init__(self, *, timeout: float) -> None:
+                self.timeout = timeout
+                self.responses = FakeResponses()
+
+        with tempfile.TemporaryDirectory() as tmp_name:
+            codex_home = Path(tmp_name) / "codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text('model = "codex-default-test"\n', encoding="utf-8")
+            fake_module = type("FakeOpenAIModule", (), {"OpenAI": FakeOpenAI})
+            with (
+                mock.patch.dict(sys.modules, {"openai": fake_module}),
+                mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "CODEX_HOME": str(codex_home)}, clear=False),
+            ):
+                for name in ("TMUX_SKILLS_CODEX_SDK_MODEL", "CODEX_MODEL", "OPENAI_MODEL"):
+                    os.environ.pop(name, None)
+                result = tmux_manager.codex_sdk_inject_decision(
+                    {"manager_id": "manager-one", "codex_pane_id": "%9"},
+                    {"event_id": "event-one"},
+                    {"safe": True},
+                )
+
+        self.assertEqual(result["decision"], "inject")
+        self.assertEqual(calls[0]["model"], "codex-default-test")
+        self.assertEqual(calls[0]["reasoning"], {"effort": "low"})
+
+    def test_tmux_inject_delivery_check_sends_followup_when_prompt_staged(self) -> None:
+        record = {"manager_id": "manager-one", "codex_pane_id": "%9"}
+        candidate = {"event_id": "event-one", "job_id": "job-one"}
+        validation = {"safe": True}
+        injection = {"injected": True, "pasted": True, "entered": True}
+        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        staged_capture = "\n".join(
+            [
+                "› tmux-skills manager event is ready.",
+                "",
+                "  Manager ID: manager-one",
+                "  Event ID: event-one",
+                "",
+                "  tab to queue message",
+            ]
+        )
+        submitted_capture = "\n".join(
+            [
+                "› tmux-skills manager event is ready.",
+                "",
+                "• Working (0s • esc to interrupt)",
+            ]
+        )
+
+        with (
+            mock.patch.object(tmux_manager.time, "sleep"),
+            mock.patch.object(
+                tmux_manager,
+                "capture_tmux_pane_text",
+                side_effect=[
+                    {"captured": True, "returncode": 0, "output": staged_capture, "omitted_chars": 0},
+                    {"captured": True, "returncode": 0, "output": submitted_capture, "omitted_chars": 0},
+                ],
+            ),
+            mock.patch.object(
+                tmux_manager,
+                "codex_sdk_inject_followup_decision",
+                return_value={
+                    "action": "submit",
+                    "submit_key": "C-m",
+                    "confidence": 0.9,
+                    "reason": "wake prompt remains staged",
+                    "source": "sdk",
+                },
+            ),
+            mock.patch.object(tmux_manager, "send_tmux_submit_key", return_value={"sent": True, "submit_key": "C-m"}) as send,
+        ):
+            result = tmux_manager.verify_tmux_inject_delivery(record, candidate, validation, injection, prompt)
+
+        send.assert_called_once_with("%9", "C-m")
+        self.assertTrue(result["checked"])
+        self.assertEqual(result["decision"]["action"], "submit")
+        self.assertTrue(result["capture_before"]["prompt_still_staged"])
+        self.assertFalse(result["capture_after"]["prompt_still_staged"])
+        self.assertFalse(result["prompt_still_staged"])
+
+    def test_tmux_inject_stays_pending_when_prompt_remains_staged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+
+            with (
+                mock.patch.object(tmux_manager, "pane_codex_validation", return_value={"safe": True, "status": "live_codex"}),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_inject_decision",
+                    return_value={"decision": "inject", "target_pane": "%9", "confidence": 1.0, "reason": "ok"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "inject_tmux_wake_prompt",
+                    return_value={"injected": True, "pasted": True, "entered": True},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "verify_tmux_inject_delivery",
+                    return_value={
+                        "checked": True,
+                        "decision": {"action": "submit"},
+                        "prompt_still_staged": True,
+                    },
+                ),
+            ):
+                updated = tmux_manager.transition_terminal(record, paths=paths, status=status)
+
+            self.assertEqual(updated["last_notification"]["status"], "inject_pending")
+            self.assertIn("still staged", updated["last_notification"]["reason"])
+
+    def test_tmux_inject_pending_recheck_does_not_paste_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+            record["submitted_event_ids"] = []
+            record["last_notification"] = {
+                "mode": "tmux-inject",
+                "event_id": status["event_id"],
+                "status": "inject_pending",
+                "submitted_to_tmux": True,
+                "injected_to_tmux": True,
+                "injection": {"injected": True, "pasted": True, "entered": True},
+                "prompt_sha256": "old-sha",
+            }
+            record["notifications"] = [record["last_notification"]]
+
+            with (
+                mock.patch.object(tmux_manager, "pane_codex_validation", return_value={"safe": True, "status": "live_codex"}),
+                mock.patch.object(tmux_manager, "codex_sdk_inject_decision") as planner,
+                mock.patch.object(tmux_manager, "inject_tmux_wake_prompt") as inject,
+                mock.patch.object(
+                    tmux_manager,
+                    "verify_tmux_inject_delivery",
+                    return_value={"checked": True, "decision": {"action": "submit"}, "prompt_still_staged": False},
+                ) as delivery,
+            ):
+                updated = tmux_manager.notify_terminal_event(record, status)
+
+            planner.assert_not_called()
+            inject.assert_not_called()
+            delivery.assert_called_once()
+            self.assertEqual(updated["last_notification"]["status"], "injected")
+            self.assertEqual(updated["submitted_event_ids"], [status["event_id"]])
+
+    def test_tmux_inject_rechecks_unacked_injected_event_after_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+
+            with (
+                mock.patch.object(tmux_manager, "pane_codex_validation", return_value={"safe": True, "status": "live_codex"}),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_inject_decision",
+                    return_value={"decision": "inject", "target_pane": "%9", "confidence": 1.0, "reason": "ok"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "inject_tmux_wake_prompt",
+                    return_value={"injected": True, "pasted": True, "entered": True},
+                ) as inject,
+                mock.patch.object(
+                    tmux_manager,
+                    "verify_tmux_inject_delivery",
+                    side_effect=[
+                        {
+                            "checked": True,
+                            "checked_at": "2000-01-01T00:00:00Z",
+                            "decision": {"action": "confirmed"},
+                            "prompt_still_staged": False,
+                        },
+                        {
+                            "checked": True,
+                            "checked_at": "2000-01-01T00:00:10Z",
+                            "decision": {"action": "defer", "reason": "ack not observed"},
+                            "prompt_still_staged": False,
+                        },
+                    ],
+                ) as delivery,
+            ):
+                first = tmux_manager.transition_terminal(record, paths=paths, status=status)
+                updated = tmux_manager.manager_cycle(first, paths=paths)
+
+            self.assertEqual(inject.call_count, 1)
+            self.assertEqual(delivery.call_count, 2)
+            self.assertEqual(updated["last_notification"]["status"], "inject_pending")
+            self.assertEqual(updated["last_notification"]["reason"], "ack not observed")
+            self.assertEqual(updated["submitted_event_ids"], [status["event_id"]])
+
     def test_bridge_prompt_is_path_only_and_sent_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             workspace = Path(tmp_name) / "workspace"
@@ -183,11 +663,13 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertFalse(first["last_notification"]["acknowledged_by_codex"])
             self.assertEqual(first["submitted_event_ids"], [status["event_id"]])
             prompt = deliver.call_args.args[2]
+            self.assertIn(f"Event ID: {status['event_id']}", prompt)
+            self.assertIn("Job ID: job-one", prompt)
             self.assertIn(f"Workspace: {paths['workspace']}", prompt)
             self.assertIn(f"Manager path: {paths['managers'] / 'manager-one.json'}", prompt)
             self.assertIn(f"Status path: {tmux_state.status_path(paths, 'job-one')}", prompt)
             self.assertIn(f"Log path: {tmux_state.log_path(paths, 'job-one')}", prompt)
-            for forbidden in ("SECRET OUTPUT", "last_output", "traceback", "retry", "command was", "Job ID", "Please inspect"):
+            for forbidden in ("SECRET OUTPUT", "last_output", "traceback", "retry", "command was", "Please inspect"):
                 self.assertNotIn(forbidden, prompt)
             self.assertEqual(second["status"], "waiting_for_codex")
 
@@ -267,12 +749,14 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(verification["status"], "awaiting_ack")
             self.assertEqual(verification["event_id"], result["event_id"])
             prompt = deliver.call_args.args[2]
+            self.assertIn(f"Event ID: {result['event_id']}", prompt)
+            self.assertIn("Job ID: none", prompt)
             self.assertIn(f"Workspace: {paths['workspace']}", prompt)
             self.assertIn(f"Manager path: {paths['managers'] / 'manager-one.json'}", prompt)
             self.assertIn("Status path: none", prompt)
             self.assertIn("Task path: none", prompt)
             self.assertIn("Log path: none", prompt)
-            for forbidden in ("event_id", "preflight", "retry", "Please inspect", "Job ID", "last_output"):
+            for forbidden in ("preflight", "retry", "Please inspect", "last_output"):
                 self.assertNotIn(forbidden, prompt)
 
     def test_ack_marks_bridge_preflight_verified(self) -> None:
@@ -313,6 +797,7 @@ class TmuxManagerTests(unittest.TestCase):
                     "submitted_to_app_server": True,
                     "acknowledged_by_codex": False,
                     "prompt_sha256": "preflight-sha",
+                    "delivery": {"turn_id": "turn-delivery"},
                 },
             )
             tmux_manager.write_manager_record(paths, record)
@@ -321,7 +806,6 @@ class TmuxManagerTests(unittest.TestCase):
                 manager_id="manager-one",
                 event_id=event_id,
                 workspace=str(workspace),
-                turn_id="turn-main",
                 note="received",
             )
 
@@ -329,7 +813,7 @@ class TmuxManagerTests(unittest.TestCase):
             verification = result["record"]["bridge_verification"]
             self.assertEqual(verification["status"], "verified")
             self.assertTrue(verification["acknowledged_by_codex"])
-            self.assertEqual(verification["ack_turn_id"], "turn-main")
+            self.assertEqual(verification["ack_turn_id"], "turn-delivery")
             self.assertEqual(result["record"]["last_notification"]["source"], "manager_bridge_check")
 
     def test_bridge_verification_is_invalidated_when_endpoint_changes(self) -> None:
@@ -391,6 +875,40 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertIn("bridge receipt is not verified", result["reason"])
             self.assertFalse(tmux_manager.manager_command_request_path(paths, "manager-one", "job-two").exists())
 
+    def test_default_notify_route_starts_verifies_submits_or_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+
+            self.assertEqual(tmux_manager.default_notify_route(None)["action"], "start_bridge_check")
+
+            diagnostic = self.build_record(paths, notify={"mode": "none"})
+            diagnostic["pending_job"] = None
+            diagnostic = tmux_manager.write_manager_record(paths, diagnostic)
+            refused_diagnostic = tmux_manager.default_notify_route(diagnostic)
+            self.assertEqual(refused_diagnostic["action"], "refuse")
+            self.assertIn("diagnostics-only", refused_diagnostic["reason"])
+
+            bridge = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            bridge["pending_job"] = None
+            refused_unverified = tmux_manager.default_notify_route(bridge)
+            self.assertEqual(refused_unverified["action"], "refuse")
+            self.assertIn("bridge receipt is not verified", refused_unverified["reason"])
+
+            verified = self.mark_bridge_verified(paths, bridge)
+            routed = tmux_manager.default_notify_route(verified)
+            self.assertEqual(routed["action"], "submit")
+            self.assertTrue(routed["allowed"])
+
     def test_run_next_queues_after_bridge_preflight_verified(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             workspace = Path(tmp_name) / "workspace"
@@ -419,6 +937,8 @@ class TmuxManagerTests(unittest.TestCase):
 
             self.assertTrue(result["queued"])
             self.assertEqual(Path(result["command_request_path"]).read_text(encoding="utf-8"), "echo next")
+            self.assertEqual(result["record"]["pending_job"]["pane_id"], "%2")
+            self.assertEqual(result["record"]["pending_job"]["pane_index"], "1")
 
     def test_run_next_blocks_terminal_event_until_acknowledged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -696,6 +1216,186 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(updated["status"], "cancelled")
             self.assertIsNone(updated["last_terminal_event_id"])
 
+    def test_manager_cycle_records_one_terminal_event_and_keeps_other_active_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            status = self.build_terminal_status(paths, "job-one")
+            tmux_state.write_status(tmux_state.status_path(paths, "job-one"), status)
+            log_one = tmux_state.log_path(paths, "job-one")
+            log_two = tmux_state.log_path(paths, "job-two")
+            record["pending_job"] = None
+            record["current_job_id"] = "job-two"
+            record["worker_pane_id"] = "%2"
+            record["worker_pane_ids"] = ["%2", "%4"]
+            record["active_job_ids"] = ["job-one", "job-two"]
+            record["job_ids"] = ["job-one", "job-two"]
+            record["jobs"] = {
+                "job-one": {"job_id": "job-one", "pane_id": "%2", "status_path": str(tmux_state.status_path(paths, "job-one")), "log_path": str(log_one)},
+                "job-two": {"job_id": "job-two", "pane_id": "%4", "status_path": str(tmux_state.status_path(paths, "job-two")), "log_path": str(log_two)},
+            }
+            record["status"] = "running"
+
+            with mock.patch.object(tmux_manager, "pane_exists", return_value=True):
+                updated = tmux_manager.manager_cycle(record, paths=paths)
+
+            event_id = str(status["event_id"])
+            self.assertEqual(updated["status"], "waiting_for_codex")
+            self.assertEqual(updated["active_job_ids"], ["job-two"])
+            self.assertEqual(updated["jobs"]["job-one"]["terminal_event_id"], event_id)
+            self.assertEqual(updated["events"][event_id]["job_id"], "job-one")
+            self.assertEqual(updated["events"][event_id]["pane_id"], "%2")
+            self.assertEqual(updated["jobs"]["job-two"]["pane_id"], "%4")
+
+    def test_dashboard_text_lists_active_jobs_and_recent_events(self) -> None:
+        record = {
+            "manager_id": "manager-one",
+            "status": "waiting_for_codex",
+            "manager_pane_id": "%3",
+            "manager_pane_index": "0",
+            "worker_pane_id": "%2",
+            "worker_pane_index": "1",
+            "worker_pane_ids": ["%2", "%4"],
+            "current_job_id": "job-two",
+            "active_job_ids": ["job-two"],
+            "job_ids": ["job-one", "job-two"],
+            "heartbeat_at": "now",
+            "manager_path": "/tmp/manager.json",
+            "jobs": {
+                "job-one": {"job_id": "job-one", "pane_id": "%2", "pane_index": "1", "status": "failed", "terminal_event_id": "evt-one"},
+                "job-two": {"job_id": "job-two", "pane_id": "%4", "pane_index": "2", "status": "running"},
+            },
+            "events": {
+                "evt-one": {
+                    "event_id": "evt-one",
+                    "source": "manager_terminal",
+                    "job_id": "job-one",
+                    "pane_id": "%2",
+                    "pane_index": "1",
+                    "status": "failed",
+                    "acknowledged_by_codex": False,
+                }
+            },
+            "last_terminal_event_id": "evt-one",
+            "pending_job": {"job_id": "job-three", "pane_id": "%2", "command_file": "/tmp/job-three.sh"},
+            "last_notification": {
+                "event_id": "evt-one",
+                "mode": "none",
+                "status": "handled",
+                "handled_by_job_id": "job-three",
+                "handled_without_ack": False,
+            },
+        }
+
+        text = tmux_manager.dashboard_text(record)
+
+        self.assertIn("ACTIVE", text)
+        self.assertIn("LATEST EVENT", text)
+        self.assertIn("job-two", text)
+        self.assertIn("2:%4", text)
+        self.assertIn("evt-one", text)
+        self.assertIn("failed", text)
+        self.assertNotIn("job-three", text)
+        self.assertNotIn("/tmp/job-three.sh", text)
+        self.assertNotIn("/tmp/manager.json", text)
+
+        jobs_text = tmux_manager.dashboard_text(record, mode="jobs")
+        self.assertIn("job-one", jobs_text)
+        self.assertIn("job-two", jobs_text)
+        self.assertIn("1:%2", jobs_text)
+        self.assertIn("2:%4", jobs_text)
+        self.assertIn("evt-one", jobs_text)
+
+        events_text = tmux_manager.dashboard_text(record, mode="events")
+        self.assertIn("evt-one", events_text)
+        self.assertIn("job-one", events_text)
+        self.assertIn("failed", events_text)
+
+        clipped = tmux_manager.dashboard_text(record, width=20, height=4)
+        clipped_lines = clipped.splitlines()
+        self.assertLessEqual(len(clipped_lines), 4)
+        self.assertTrue(all(len(line) <= 20 for line in clipped_lines))
+
+    def test_delete_terminal_jobs_removes_evidence_and_preserves_active_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            done_command = tmux_state.command_path(paths, "done-job")
+            done_status = tmux_state.status_path(paths, "done-job")
+            done_log = tmux_state.log_path(paths, "done-job")
+            error_command = tmux_state.command_path(paths, "error-job")
+            error_status = tmux_state.status_path(paths, "error-job")
+            error_log = tmux_state.log_path(paths, "error-job")
+            active_command = tmux_state.command_path(paths, "active-job")
+            active_status = tmux_state.status_path(paths, "active-job")
+            active_log = tmux_state.log_path(paths, "active-job")
+            for path in (done_command, done_status, done_log, error_command, error_status, error_log, active_command, active_status, active_log):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("evidence", encoding="utf-8")
+            record = tmux_manager.build_manager_record(
+                manager_id="manager-one",
+                manager_pane_id="%3",
+                worker_pane_id="%2",
+                manager_pane_index="0",
+                worker_pane_index="1",
+                pending_job=None,
+                notify={"mode": "none"},
+                workspace=str(paths["workspace"]),
+                state_dir=str(paths["root"]),
+            )
+            record["status"] = "running"
+            record["current_job_id"] = "active-job"
+            record["active_job_ids"] = ["active-job"]
+            record["job_ids"] = ["done-job", "error-job", "active-job"]
+            record["jobs"] = {
+                "done-job": {
+                    "job_id": "done-job",
+                    "status": "succeeded",
+                    "command_request_path": str(done_command),
+                    "status_path": str(done_status),
+                    "log_path": str(done_log),
+                    "terminal_event_id": "evt-done",
+                },
+                "error-job": {
+                    "job_id": "error-job",
+                    "status": "error",
+                    "command_request_path": str(error_command),
+                    "status_path": str(error_status),
+                    "log_path": str(error_log),
+                    "terminal_event_id": "evt-error",
+                },
+                "active-job": {
+                    "job_id": "active-job",
+                    "status": "running",
+                    "command_request_path": str(active_command),
+                    "status_path": str(active_status),
+                    "log_path": str(active_log),
+                },
+            }
+            record["events"] = {
+                "evt-done": {"event_id": "evt-done", "job_id": "done-job", "status": "succeeded"},
+                "evt-error": {"event_id": "evt-error", "job_id": "error-job", "status": "error"},
+            }
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.delete_terminal_jobs("manager-one", workspace=str(workspace))
+
+            self.assertTrue(result["deleted"])
+            self.assertEqual(result["deleted_job_ids"], ["done-job", "error-job"])
+            loaded = result["record"]
+            self.assertEqual(loaded["active_job_ids"], ["active-job"])
+            self.assertEqual(loaded["current_job_id"], "active-job")
+            self.assertIn("active-job", loaded["jobs"])
+            self.assertNotIn("done-job", loaded["jobs"])
+            self.assertNotIn("error-job", loaded["jobs"])
+            for path in (done_command, done_status, done_log, error_command, error_status, error_log):
+                self.assertFalse(path.exists(), path)
+            for path in (active_command, active_status, active_log):
+                self.assertTrue(path.exists(), path)
+
     def test_cleanup_manager_removes_manager_and_job_evidence_only_in_state_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             workspace = Path(tmp_name) / "workspace"
@@ -774,6 +1474,62 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(loaded["pending_job"]["job_id"], "job-two")
             self.assertEqual(loaded["last_notification"]["status"], "handled")
             self.assertEqual(loaded["last_notification"]["handled_by_job_id"], "job-two")
+
+    def test_run_next_refuses_when_any_manager_job_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["status"] = "waiting_for_codex"
+            record["active_job_ids"] = ["job-active"]
+            record["worker_pane_id"] = "%2"
+            record["worker_pane_ids"] = ["%2", "%4"]
+            record["jobs"] = {"job-active": {"job_id": "job-active", "pane_id": "%4", "status": "running"}}
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.queue_manager_job(
+                manager_id="manager-one",
+                job_id="job-next",
+                command_text="echo next",
+                command_file=None,
+                workspace=str(workspace),
+            )
+
+            self.assertFalse(result["queued"])
+            self.assertIn("active jobs", result["reason"])
+            self.assertFalse(tmux_manager.manager_command_request_path(paths, "manager-one", "job-next").exists())
+
+    def test_submit_parallel_queue_allows_other_active_job_on_different_pane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["status"] = "running"
+            record["active_job_ids"] = ["job-active"]
+            record["worker_pane_id"] = "%2"
+            record["worker_pane_ids"] = ["%2", "%4"]
+            record["jobs"] = {"job-active": {"job_id": "job-active", "pane_id": "%4", "status": "running"}}
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.queue_manager_job(
+                manager_id="manager-one",
+                job_id="job-parallel",
+                command_text="echo parallel",
+                command_file=None,
+                workspace=str(workspace),
+                pane_id="%2",
+                allow_parallel=True,
+            )
+
+            self.assertTrue(result["queued"])
+            loaded, _error = tmux_manager.read_manager_record(paths, "manager-one")
+            assert loaded is not None
+            self.assertEqual(loaded["pending_job"]["job_id"], "job-parallel")
+            self.assertEqual(loaded["pending_job"]["pane_id"], "%2")
 
     def test_external_cancel_update_wins_over_stale_dashboard_record(self) -> None:
         stale = {
@@ -876,6 +1632,27 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertEqual(merged["pending_job"]["job_id"], "job-two")
         self.assertEqual(merged["heartbeat_at"], "old-heartbeat")
 
+    def test_external_pending_job_does_not_requeue_already_started_job(self) -> None:
+        processed = {
+            "manager_id": "manager-one",
+            "status": "waiting_for_codex",
+            "pending_job": None,
+            "heartbeat_at": "new-heartbeat",
+            "job_ids": ["job-two"],
+            "jobs": {"job-two": {"job_id": "job-two", "status": "failed"}},
+        }
+        stale_latest = {
+            "manager_id": "manager-one",
+            "status": "queued",
+            "pending_job": {"job_id": "job-two"},
+            "heartbeat_at": "old-heartbeat",
+        }
+
+        merged = tmux_manager.merge_external_manager_update(processed, stale_latest)
+
+        self.assertIsNone(merged["pending_job"])
+        self.assertEqual(merged["heartbeat_at"], "new-heartbeat")
+
     def test_cancel_does_not_stop_worker_without_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             workspace = Path(tmp_name) / "workspace"
@@ -919,31 +1696,139 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertTrue(result["record"]["stop_worker_requested"])
             self.assertEqual(result["record"]["worker_stop_result"]["sent"], True)
 
-    def test_render_dashboard_to_pane_uses_one_shot_command(self) -> None:
+    def test_cancel_job_id_interrupts_only_that_job_pane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
-            dashboard_file = Path(tmp_name) / "manager.dashboard.txt"
-            dashboard_file.write_text("manager status\n", encoding="utf-8")
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["status"] = "running"
+            record["active_job_ids"] = ["job-one", "job-two"]
+            record["worker_pane_ids"] = ["%2", "%4"]
+            record["jobs"] = {
+                "job-one": {"job_id": "job-one", "pane_id": "%2"},
+                "job-two": {"job_id": "job-two", "pane_id": "%4"},
+            }
+            tmux_manager.write_manager_record(paths, record)
+
+            with mock.patch.object(
+                tmux_manager,
+                "send_worker_interrupt",
+                return_value={"sent": True, "returncode": 0, "stderr": ""},
+            ) as interrupt:
+                result = tmux_manager.cancel_manager("manager-one", workspace=str(workspace), job_id="job-two")
+
+            self.assertTrue(result["cancelled"])
+            interrupt.assert_called_once_with("%4")
+            self.assertEqual(result["record"]["cancel_job_id"], "job-two")
+            self.assertEqual(result["record"]["worker_stop_results"][0]["pane_id"], "%4")
+
+    def test_ensure_dashboard_viewer_launches_once_and_reuses_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = tmux_manager.build_manager_record(
+                manager_id="manager-one",
+                manager_pane_id="%2",
+                worker_pane_id="%3",
+                pending_job=None,
+                notify={"mode": "none"},
+                workspace=str(paths["workspace"]),
+                state_dir=str(paths["root"]),
+            )
+            dashboard_file = Path(str(record["dashboard_path"]))
+            tmux_manager.write_dashboard_file(dashboard_file, tmux_manager.dashboard_text(record))
+            state_path = tmux_manager.manager_dashboard_viewer_state_path(paths, "manager-one")
+
+            def launch_viewer(*_args: object, **_kwargs: object) -> mock.Mock:
+                tmux_state.atomic_write_json(
+                    state_path,
+                    {
+                        "manager_id": "manager-one",
+                        "pid": 4242,
+                        "pane_id": "%2",
+                        "mode": "summary",
+                        "heartbeat_at": "now",
+                    },
+                )
+                return mock.Mock(returncode=0, stdout="", stderr="")
 
             with mock.patch.object(tmux_manager, "pane_exists", return_value=True):
-                with mock.patch.object(tmux_manager, "tmux_command_prefix", return_value=["tmux"]):
-                    with mock.patch.object(
-                        tmux_manager.subprocess,
-                        "run",
-                        return_value=mock.Mock(returncode=0, stdout="", stderr=""),
-                    ) as run:
-                        result = tmux_manager.render_dashboard_to_pane("%2", dashboard_file)
+                with mock.patch.object(tmux_manager, "pid_is_running", return_value=True):
+                    with mock.patch.object(tmux_manager, "tmux_command_prefix", return_value=["tmux"]):
+                        with mock.patch.object(tmux_manager.subprocess, "run", side_effect=launch_viewer) as run:
+                            updated, result = tmux_manager.ensure_dashboard_viewer(record, paths)
+                            reused_record, reused = tmux_manager.ensure_dashboard_viewer(updated, paths)
 
-            self.assertTrue(result["rendered"])
+            self.assertTrue(result["started"])
+            self.assertFalse(result["reused"])
+            self.assertTrue(reused["reused"])
+            self.assertEqual(reused_record["dashboard_viewer_pid"], 4242)
+            run.assert_called_once()
             argv = run.call_args.args[0]
             command = argv[-2]
             self.assertEqual(argv[:4], ["tmux", "send-keys", "-t", "%2"])
             self.assertEqual(argv[-1], "Enter")
+            self.assertIn("tmux_manager_viewer.py", command)
             self.assertIn(str(dashboard_file), command)
-            self.assertIn("cat", command)
+            self.assertNotIn("cat", command)
+            self.assertNotIn("clear", command)
             self.assertNotIn("while", command)
             self.assertNotIn("sleep", command)
 
-    def test_dashboard_text_exposes_bridge_submission_and_ack_ids(self) -> None:
+    def test_viewer_state_heartbeat_round_trips_to_manager_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = tmux_manager.build_manager_record(
+                manager_id="manager-one",
+                manager_pane_id="%2",
+                worker_pane_id="%3",
+                pending_job=None,
+                notify={"mode": "none"},
+                workspace=str(paths["workspace"]),
+                state_dir=str(paths["root"]),
+            )
+            args = argparse.Namespace(
+                manager_id="manager-one",
+                manager_file=tmux_manager.manager_record_path(paths, "manager-one"),
+                dashboard_file=tmux_manager.manager_dashboard_path(paths, "manager-one"),
+                state_file=tmux_manager.manager_dashboard_viewer_state_path(paths, "manager-one"),
+                pane_id="%2",
+            )
+
+            tmux_manager_viewer.write_viewer_state(args, "events", {"manager_pid": 1234})
+
+            state = json.loads(Path(args.state_file).read_text(encoding="utf-8"))
+            self.assertEqual(state["mode"], "events")
+            self.assertEqual(state["pane_id"], "%2")
+            with mock.patch.object(tmux_manager, "pid_is_running", return_value=True):
+                updated = tmux_manager.refresh_dashboard_viewer_fields(record, paths)
+
+            self.assertEqual(updated["dashboard_viewer_pid"], os.getpid())
+            self.assertEqual(updated["dashboard_viewer_heartbeat_at"], state["heartbeat_at"])
+
+    def test_viewer_exit_conditions_do_not_cancel_manager_or_workers(self) -> None:
+        self.assertTrue(tmux_manager_viewer.should_exit({"status": "cancelled", "manager_pid": os.getpid()}))
+        self.assertTrue(tmux_manager_viewer.should_exit(None))
+        with mock.patch.object(tmux_manager_viewer, "pid_is_running", return_value=False):
+            self.assertTrue(tmux_manager_viewer.should_exit({"status": "running", "manager_pid": 4242}))
+        with mock.patch.object(tmux_manager_viewer, "pid_is_running", return_value=True):
+            self.assertFalse(tmux_manager_viewer.should_exit({"status": "running", "manager_pid": 4242}))
+
+    def test_dashboard_text_hides_bridge_delivery_ids(self) -> None:
+        notification = {
+            "event_id": "evt-one",
+            "mode": "bridge",
+            "status": "acknowledged",
+            "submitted_to_app_server": True,
+            "acknowledged_by_codex": True,
+            "delivery": {"response_id": "resp-one", "turn_id": "turn-one"},
+            "ack_turn_id": "turn-main",
+        }
         record = {
             "manager_id": "manager-one",
             "status": "waiting_for_codex",
@@ -953,26 +1838,36 @@ class TmuxManagerTests(unittest.TestCase):
             "heartbeat_at": "now",
             "manager_path": "/tmp/manager.json",
             "last_terminal_event_id": "evt-one",
-            "last_notification": {
-                "mode": "bridge",
-                "status": "acknowledged",
-                "submitted_to_app_server": True,
-                "acknowledged_by_codex": True,
-                "delivery": {"response_id": "resp-one", "turn_id": "turn-one"},
-                "ack_turn_id": "turn-main",
+            "events": {
+                "evt-one": {
+                    "event_id": "evt-one",
+                    "job_id": "job-one",
+                    "status": "succeeded",
+                    "acknowledged_by_codex": True,
+                }
             },
+            "notifications": [notification],
+            "last_notification": notification,
             "last_ack": {"event_id": "evt-one", "acknowledged_at": "now", "turn_id": "turn-main"},
         }
 
         text = tmux_manager.dashboard_text(record)
 
-        self.assertIn("last_notification: bridge status=acknowledged submitted_to_app_server=True acknowledged_by_codex=True", text)
-        self.assertIn("last_submission_response_id: resp-one", text)
-        self.assertIn("last_submission_turn_id: turn-one", text)
-        self.assertIn("last_ack_turn_id: turn-main", text)
-        self.assertIn("last_ack_event_id: evt-one", text)
+        self.assertIn("notify=yes ack=yes", text)
+        self.assertNotIn("resp-one", text)
+        self.assertNotIn("turn-one", text)
+        self.assertNotIn("turn-main", text)
+        self.assertNotIn("last_ack_event_id", text)
 
-    def test_dashboard_text_exposes_bridge_submission_error(self) -> None:
+    def test_dashboard_text_hides_bridge_submission_error_body(self) -> None:
+        notification = {
+            "event_id": "evt-one",
+            "mode": "bridge",
+            "status": "submission_failed",
+            "submitted_to_app_server": False,
+            "acknowledged_by_codex": False,
+            "error": "connection refused",
+        }
         record = {
             "manager_id": "manager-one",
             "status": "waiting_for_codex",
@@ -982,19 +1877,22 @@ class TmuxManagerTests(unittest.TestCase):
             "heartbeat_at": "now",
             "manager_path": "/tmp/manager.json",
             "last_terminal_event_id": "evt-one",
-            "last_notification": {
-                "mode": "bridge",
-                "status": "submission_failed",
-                "submitted_to_app_server": False,
-                "acknowledged_by_codex": False,
-                "error": "connection refused",
+            "events": {
+                "evt-one": {
+                    "event_id": "evt-one",
+                    "job_id": "job-one",
+                    "status": "failed",
+                    "acknowledged_by_codex": False,
+                }
             },
+            "notifications": [notification],
+            "last_notification": notification,
         }
 
         text = tmux_manager.dashboard_text(record)
 
-        self.assertIn("last_notification: bridge status=submission_failed submitted_to_app_server=False acknowledged_by_codex=False", text)
-        self.assertIn("last_notification_error: connection refused", text)
+        self.assertIn("notify=submission_failed ack=no", text)
+        self.assertNotIn("connection refused", text)
 
 
 if __name__ == "__main__":

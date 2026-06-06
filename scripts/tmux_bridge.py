@@ -30,6 +30,8 @@ BRIDGE_OBSERVED_LIMIT = 500
 BRIDGE_STATUSES = {"registered", "starting", "active", "failed", "cancelled"}
 BRIDGE_TERMINAL_RANK = 1
 BRIDGE_READY_RANK = 0
+BRIDGE_TURN_COMPLETION_TIMEOUT_SECONDS = 20.0
+BRIDGE_TERMINAL_TURN_COMPLETION_TIMEOUT_SECONDS = 45.0
 
 
 def utc_timestamp() -> str:
@@ -465,6 +467,13 @@ def deliver_bridge_candidate(record: dict[str, Any], candidate: dict[str, Any], 
                 raise
             resume_error = str(exc)
         turn_response = client.start_turn(str(record["thread_id"]), prompt, str(record["workspace"]))
+        turn_id = codex_app_server_client.response_turn_id(turn_response)
+        wait_seconds = (
+            BRIDGE_TERMINAL_TURN_COMPLETION_TIMEOUT_SECONDS
+            if candidate.get("source") == "manager_terminal"
+            else BRIDGE_TURN_COMPLETION_TIMEOUT_SECONDS
+        )
+        turn_completion = client.wait_for_turn_completed(turn_id, wait_seconds)
     finally:
         client.close()
     turn_thread_id = codex_app_server_client.response_thread_id(turn_response, str(record["thread_id"]))
@@ -478,6 +487,7 @@ def deliver_bridge_candidate(record: dict[str, Any], candidate: dict[str, Any], 
         "prompt_sha256": prompt_sha256(prompt),
         "response_id": codex_app_server_client.response_id(turn_response),
         "turn_id": codex_app_server_client.response_turn_id(turn_response),
+        "turn_completion": turn_completion,
         "resume_thread_id": resume_thread_id,
         "resume_error": resume_error,
     }

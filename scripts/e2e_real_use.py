@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import select
 import shlex
 import shutil
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import tmux_state
+import codex_app_server_client
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +62,11 @@ FULL_ONLY_SCENARIOS = [
     "manager-visible-success",
     "manager-visible-failure",
     "manager-run-next",
+    "manager-multi-pane",
+    "manager-tui-delete-completed",
+    "manager-bridge-random-notify",
+    "manager-tmux-inject-wakes-current-codex",
+    "manager-random-repeat-until-zero-one",
     "manager-start-reuses-live-process",
     "manager-cancel",
     "manager-process-exit-keeps-worker",
@@ -222,10 +230,19 @@ class Harness:
         self.current_scenario = "setup"
         self.last_command: CommandResult | None = None
         self.manager_processes: list[tuple[subprocess.Popen[str], list[str]]] = []
+        self.app_server_processes: list[subprocess.Popen[str]] = []
+        self.app_server_sockets: list[Path] = []
         self.removed_repo_artifacts: list[str] = []
         self.remove_repo_runtime_artifacts()
 
-    def run(self, args: list[str], *, cwd: Path = ROOT, input_text: str | None = None) -> CommandResult:
+    def run(
+        self,
+        args: list[str],
+        *,
+        cwd: Path = ROOT,
+        input_text: str | None = None,
+        timeout_seconds: float = COMMAND_TIMEOUT_SECONDS,
+    ) -> CommandResult:
         try:
             result = subprocess.run(
                 args,
@@ -236,14 +253,14 @@ class Harness:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
-                timeout=COMMAND_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
             )
             stdout = result.stdout
             stderr = result.stderr
             returncode = result.returncode
         except subprocess.TimeoutExpired as exc:
             stdout = timeout_output_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
-            stderr = append_timeout_message(timeout_output_text(getattr(exc, "stderr", None)), COMMAND_TIMEOUT_SECONDS)
+            stderr = append_timeout_message(timeout_output_text(getattr(exc, "stderr", None)), timeout_seconds)
             returncode = COMMAND_TIMEOUT_EXIT_CODE
 
         parsed: Any = None
@@ -308,6 +325,165 @@ class Harness:
         if command.returncode == COMMAND_TIMEOUT_EXIT_CODE:
             raise ScenarioFailure(self.current_scenario, step, "manager process did not terminate", command)
         return command
+
+    def start_app_server(self, socket_path: Path) -> subprocess.Popen[str]:
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        socket_path.unlink(missing_ok=True)
+        self.app_server_sockets.append(socket_path)
+        stdout_path = self.base_dir / "app-server.out"
+        stderr_path = self.base_dir / "app-server.err"
+        with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
+            proc = subprocess.Popen(
+                ["codex", "app-server", "--listen", f"unix://{socket_path}"],
+                cwd=str(ROOT),
+                env=self.env,
+                text=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+        self.app_server_processes.append(proc)
+
+        def socket_ready() -> bool:
+            if proc.poll() is not None:
+                command = CommandResult(
+                    args=["codex", "app-server", "--listen", f"unix://{socket_path}"],
+                    returncode=proc.returncode or 0,
+                    stdout=stdout_path.read_text(encoding="utf-8") if stdout_path.exists() else "",
+                    stderr=stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else "",
+                    json_data=None,
+                )
+                raise ScenarioFailure(self.current_scenario, "app-server-start", "codex app-server exited before socket was ready", command)
+            return socket_path.exists()
+
+        self.poll_until("app-server-socket", 10.0, socket_ready)
+        return proc
+
+    def start_bridge_thread(self, socket_path: Path) -> str:
+        instructions = "\n".join(
+            [
+                "You are the tmux-skills manager bridge handler for this E2E run.",
+                "When a prompt starts with 'tmux-skills manager observed a bridge event.', read the listed manager/status paths as needed.",
+                "Run the exact 'Ack command:' shown in the prompt after inspecting the paths.",
+                "For terminal events that contain a single random digit, capture the listed pane if needed, extract the digit, and write exactly '숫자는 N이 나왔습니다.' to bridge-number-response.txt in the workspace, replacing N with the digit.",
+                "Do not edit repository files or close panes.",
+            ]
+        )
+        client = codex_app_server_client.AppServerClient(f"unix://{socket_path}", timeout_seconds=10)
+        try:
+            client.connect()
+            client.initialize("tmux-skills-e2e")
+            response = client.start_thread(
+                cwd=str(self.workspace),
+                developer_instructions=instructions,
+                sandbox="danger-full-access",
+                approval_policy="never",
+            )
+            thread_id = codex_app_server_client.response_thread_id(response)
+            if not thread_id:
+                raise ScenarioFailure(self.current_scenario, "bridge-thread-id", "thread/start did not return a thread id")
+            return thread_id
+        finally:
+            client.close()
+
+    def start_bridge_manager(self, manager_id: str) -> tuple[subprocess.Popen[str], CommandResult, list[str], str]:
+        socket_dir = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+        socket_path = socket_dir / f"ts-{os.getpid()}-{int(time.time() * 1000)}.sock"
+        self.start_app_server(socket_path)
+        thread_id = self.start_bridge_thread(socket_path)
+        args = [
+            "manager",
+            "start",
+            "--manager-id",
+            manager_id,
+            "--notify",
+            "bridge",
+            "--thread-id",
+            thread_id,
+            "--endpoint",
+            f"unix://{socket_path}",
+            "--workspace",
+            str(self.workspace),
+            "--poll-seconds",
+            "0.1",
+            "--process-mode",
+            "background",
+            "--dashboard-renderer",
+            "none",
+        ]
+        proc = self.popen_control(args)
+        self.manager_processes.append((proc, args))
+        start = self.read_process_json(proc, args)
+        if not isinstance(start.json_data, dict) or start.json_data.get("started") is not True:
+            raise ScenarioFailure(self.current_scenario, f"manager-start-{manager_id}", "bridge manager did not start", start)
+        bridge = self.control(
+            ["manager", "bridge-check", "--manager-id", manager_id, "--ack-timeout-seconds", "25", "--workspace", str(self.workspace)],
+            step="manager-bridge-check",
+            timeout_seconds=60.0,
+        )
+        bridge_data = bridge.json_data if isinstance(bridge.json_data, dict) else {}
+        if bridge_data.get("verified") is not True:
+            raise ScenarioFailure(self.current_scenario, "manager-bridge-check-verified", "bridge-check did not verify", bridge)
+        return proc, start, args, thread_id
+
+    def submit_bridge_random_job(self, manager_id: str, job_id: str, command: str | None = None) -> tuple[int, dict[str, Any]]:
+        response_path = self.workspace / "bridge-number-response.txt"
+        response_path.unlink(missing_ok=True)
+        command_text = command or 'python3 -c "import random,time; time.sleep(1); print(random.randint(0, 9))"'
+        submitted = self.control(
+            [
+                "manager",
+                "submit",
+                "--manager-id",
+                manager_id,
+                "--job-id",
+                job_id,
+                "--command",
+                command_text,
+                "--workspace",
+                str(self.workspace),
+            ],
+            step=f"manager-random-submit-{job_id}",
+        )
+        if not isinstance(submitted.json_data, dict) or submitted.json_data.get("queued") is not True:
+            raise ScenarioFailure(self.current_scenario, f"manager-random-submit-{job_id}", "manager submit did not queue random job", submitted)
+
+        def acknowledged() -> dict[str, Any] | None:
+            data = self.manager_status_data(manager_id)
+            record = data.get("record") if isinstance(data.get("record"), dict) else {}
+            last_event_id = str(record.get("last_terminal_event_id") or "")
+            last_ack = record.get("last_ack") if isinstance(record.get("last_ack"), dict) else {}
+            notification = record.get("last_notification") if isinstance(record.get("last_notification"), dict) else {}
+            if (
+                last_event_id
+                and last_ack.get("event_id") == last_event_id
+                and notification.get("mode") == "bridge"
+                and notification.get("submitted_to_app_server") is True
+                and notification.get("acknowledged_by_codex") is True
+                and response_path.exists()
+            ):
+                return data
+            return None
+
+        status = self.poll_until(f"manager-random-ack-{job_id}", 75.0, acknowledged)
+        text = response_path.read_text(encoding="utf-8").strip()
+        match = re.search(r"숫자는 ([0-9])이 나왔습니다\.", text)
+        if not match:
+            raise ScenarioFailure(self.current_scenario, f"manager-random-response-{job_id}", f"target Codex did not write the expected number response: {text!r}")
+        return int(match.group(1)), status
+
+    def terminate_app_servers(self) -> None:
+        for proc in list(self.app_server_processes):
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+        self.app_server_processes = []
+        for socket_path in self.app_server_sockets:
+            socket_path.unlink(missing_ok=True)
+        self.app_server_sockets = []
 
     def collect_process(self, proc: subprocess.Popen[str], args: list[str]) -> CommandResult:
         try:
@@ -378,8 +554,8 @@ class Harness:
             raise ScenarioFailure(self.current_scenario, step, f"command failed with exit {command.returncode}", command)
         return command
 
-    def control(self, args: list[str], *, step: str, check: bool = True) -> CommandResult:
-        command = self.run(self.control_args(args))
+    def control(self, args: list[str], *, step: str, check: bool = True, timeout_seconds: float = COMMAND_TIMEOUT_SECONDS) -> CommandResult:
+        command = self.run(self.control_args(args), timeout_seconds=timeout_seconds)
         if check:
             self.require_success(command, step=step)
         return command
@@ -569,6 +745,7 @@ class Harness:
 
     def after_scenario(self) -> None:
         self.terminate_manager_processes()
+        self.terminate_app_servers()
         self.cancel_active_jobs()
         self.interrupt_pane()
 
@@ -677,6 +854,7 @@ class Harness:
 
     def cleanup(self, *, remove_artifacts: bool = True) -> dict[str, Any]:
         self.terminate_manager_processes()
+        self.terminate_app_servers()
         self.cancel_active_jobs()
         self.run(["tmux", "kill-session", "-t", self.session])
         self.run(["tmux", "kill-server"])
@@ -1557,6 +1735,13 @@ class Harness:
         if record.get("last_notification", {}).get("mode") != "none":
             raise ScenarioFailure(self.current_scenario, "manager-notify-none", "manager did not record dashboard-only notification")
         layout = self.assert_manager_layout_geometry(str(start_data.get("manager_pane_id")), str(start_data.get("worker_pane_id")))
+        manager_pane = str(start_data.get("manager_pane_id") or "")
+        dashboard = self.control(["capture", "--pane", manager_pane, "--lines", "80", "--strip-ansi"], step="manager-success-dashboard")
+        dashboard_output = dashboard.json_data.get("output") if isinstance(dashboard.json_data, dict) else dashboard.stdout
+        if "manager" not in str(dashboard_output) or "LATEST EVENT" not in str(dashboard_output):
+            raise ScenarioFailure(self.current_scenario, "manager-success-compact-dashboard", "compact dashboard was not visible", dashboard)
+        if "clear; cat" in str(dashboard_output) or "printf '\\033[2J" in str(dashboard_output):
+            raise ScenarioFailure(self.current_scenario, "manager-success-dashboard-history", "dashboard accumulated clear/cat prompt history", dashboard)
         self.control(["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace)], step="manager-success-cancel")
         self.collect_manager_process(manager_proc, manager_args, step="manager-success-process-exit")
         return {
@@ -1582,6 +1767,12 @@ class Harness:
         log_path = Path(str(current_status.get("log_path") or ""))
         if not log_path.exists():
             raise ScenarioFailure(self.current_scenario, "manager-failure-log", "failed manager job did not write a log", start)
+        start_data = start.json_data if isinstance(start.json_data, dict) else {}
+        manager_pane = str(start_data.get("manager_pane_id") or "")
+        dashboard = self.control(["capture", "--pane", manager_pane, "--lines", "80", "--strip-ansi"], step="manager-failure-dashboard")
+        dashboard_output = dashboard.json_data.get("output") if isinstance(dashboard.json_data, dict) else dashboard.stdout
+        if "LATEST EVENT" not in str(dashboard_output) or "failed" not in str(dashboard_output):
+            raise ScenarioFailure(self.current_scenario, "manager-failure-compact-event", "compact dashboard did not show failed latest event", dashboard)
         self.control(["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace)], step="manager-failure-cancel")
         self.collect_manager_process(manager_proc, manager_args, step="manager-failure-process-exit")
         return {"manager_id": manager_id, "job_id": job_id, "log_path": str(log_path)}
@@ -1625,6 +1816,370 @@ class Harness:
         self.control(["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace)], step="manager-next-cancel")
         self.collect_manager_process(manager_proc, manager_args, step="manager-next-process-exit")
         return {"manager_id": manager_id, "first_job": first_job, "second_job": second_job}
+
+    def scenario_manager_multi_pane(self) -> dict[str, Any]:
+        self.current_scenario = "manager-multi-pane"
+        manager_id = "manager-multi"
+        slow_job = "manager-multi-slow"
+        fast_job = "manager-multi-fast"
+        slow_output = self.workspace / "manager-multi-slow.out"
+        fast_output = self.workspace / "manager-multi-fast.out"
+        manager_proc, start, manager_args = self.start_manager_process(
+            manager_id,
+            slow_job,
+            "sleep 1.5; printf slow-ok > manager-multi-slow.out",
+        )
+        start_data = start.json_data if isinstance(start.json_data, dict) else {}
+        self.wait_manager_status(manager_id, "running", timeout=10.0)
+        submitted = self.control(
+            [
+                "manager",
+                "submit",
+                "--manager-id",
+                manager_id,
+                "--new-worker",
+                "--job-id",
+                fast_job,
+                "--command",
+                "printf fast-ok > manager-multi-fast.out",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="manager-multi-submit",
+        )
+        submitted_data = submitted.json_data if isinstance(submitted.json_data, dict) else {}
+        if submitted_data.get("queued") is not True:
+            raise ScenarioFailure(self.current_scenario, "manager-multi-submit-queued", "manager submit did not queue", submitted)
+        fast_pane = str(submitted_data.get("pane_id") or "")
+        self.wait_file(fast_output, "fast-ok", timeout=10.0)
+
+        def fast_done_slow_active() -> dict[str, Any] | None:
+            data = self.manager_status_data(manager_id)
+            record = data.get("record") if isinstance(data.get("record"), dict) else {}
+            jobs = record.get("jobs") if isinstance(record.get("jobs"), dict) else {}
+            active = record.get("active_job_ids") if isinstance(record.get("active_job_ids"), list) else []
+            fast = jobs.get(fast_job) if isinstance(jobs.get(fast_job), dict) else {}
+            if fast.get("status") == "succeeded" and slow_job in active:
+                return data
+            return None
+
+        self.poll_until("manager-multi-fast-terminal", 10.0, fast_done_slow_active)
+        self.wait_file(slow_output, "slow-ok", timeout=10.0)
+
+        def both_done() -> dict[str, Any] | None:
+            data = self.manager_status_data(manager_id)
+            record = data.get("record") if isinstance(data.get("record"), dict) else {}
+            jobs = record.get("jobs") if isinstance(record.get("jobs"), dict) else {}
+            slow = jobs.get(slow_job) if isinstance(jobs.get(slow_job), dict) else {}
+            fast = jobs.get(fast_job) if isinstance(jobs.get(fast_job), dict) else {}
+            active = record.get("active_job_ids") if isinstance(record.get("active_job_ids"), list) else []
+            worker_panes = record.get("worker_pane_ids") if isinstance(record.get("worker_pane_ids"), list) else []
+            if slow.get("status") == "succeeded" and fast.get("status") == "succeeded" and not active and len(worker_panes) >= 2:
+                return data
+            return None
+
+        final_status = self.poll_until("manager-multi-both-terminal", 10.0, both_done)
+        record = final_status.get("record") if isinstance(final_status.get("record"), dict) else {}
+        manager_pane = str(record.get("manager_pane_id") or start_data.get("manager_pane_id") or "")
+        dashboard = self.control(["capture", "--pane", manager_pane, "--lines", "80", "--strip-ansi"], step="manager-multi-dashboard")
+        dashboard_output = dashboard.json_data.get("output") if isinstance(dashboard.json_data, dict) else dashboard.stdout
+        if "manager" not in str(dashboard_output) or "LATEST EVENT" not in str(dashboard_output):
+            raise ScenarioFailure(self.current_scenario, "manager-multi-dashboard-tui", "dashboard did not show compact TUI sections", dashboard)
+        if ".codex/tmux-skills" in str(dashboard_output) or "/commands/" in str(dashboard_output) or "/logs/" in str(dashboard_output):
+            raise ScenarioFailure(self.current_scenario, "manager-multi-dashboard-compact", "compact dashboard exposed detailed paths", dashboard)
+        self.control(["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace)], step="manager-multi-cancel")
+        self.collect_manager_process(manager_proc, manager_args, step="manager-multi-process-exit")
+        return {
+            "manager_id": manager_id,
+            "slow_job": slow_job,
+            "fast_job": fast_job,
+            "default_worker_pane_id": start_data.get("worker_pane_id"),
+            "fast_worker_pane_id": fast_pane,
+            "worker_pane_ids": record.get("worker_pane_ids"),
+        }
+
+    def scenario_manager_tui_delete_completed(self) -> dict[str, Any]:
+        self.current_scenario = "manager-tui-delete-completed"
+        manager_id = "manager-delete"
+        slow_job = "manager-delete-active"
+        fast_job = "manager-delete-done"
+        fast_output = self.workspace / "manager-delete-done.out"
+        manager_proc, start, manager_args = self.start_manager_process(
+            manager_id,
+            slow_job,
+            "sleep 8; printf active-ok > manager-delete-active.out",
+        )
+        start_data = start.json_data if isinstance(start.json_data, dict) else {}
+        self.wait_manager_status(manager_id, "running", timeout=10.0)
+        submitted = self.control(
+            [
+                "manager",
+                "submit",
+                "--manager-id",
+                manager_id,
+                "--new-worker",
+                "--job-id",
+                fast_job,
+                "--command",
+                "printf done-ok > manager-delete-done.out",
+                "--workspace",
+                str(self.workspace),
+            ],
+            step="manager-delete-submit",
+        )
+        if not isinstance(submitted.json_data, dict) or submitted.json_data.get("queued") is not True:
+            raise ScenarioFailure(self.current_scenario, "manager-delete-submit-queued", "manager submit did not queue terminal job", submitted)
+        self.wait_file(fast_output, "done-ok", timeout=10.0)
+
+        def fast_done_slow_active() -> dict[str, Any] | None:
+            data = self.manager_status_data(manager_id)
+            record = data.get("record") if isinstance(data.get("record"), dict) else {}
+            jobs = record.get("jobs") if isinstance(record.get("jobs"), dict) else {}
+            active = record.get("active_job_ids") if isinstance(record.get("active_job_ids"), list) else []
+            fast = jobs.get(fast_job) if isinstance(jobs.get(fast_job), dict) else {}
+            if fast.get("status") == "succeeded" and slow_job in active:
+                return data
+            return None
+
+        before_delete = self.poll_until("manager-delete-fast-terminal", 10.0, fast_done_slow_active)
+        before_record = before_delete.get("record") if isinstance(before_delete.get("record"), dict) else {}
+        before_jobs = before_record.get("jobs") if isinstance(before_record.get("jobs"), dict) else {}
+        fast_record = before_jobs.get(fast_job) if isinstance(before_jobs.get(fast_job), dict) else {}
+        evidence_paths = [Path(str(value)) for value in (fast_record.get("command_request_path"), fast_record.get("status_path"), fast_record.get("log_path")) if value]
+        panes_before = len(self.control(["list"], step="manager-delete-list-before").json_data.get("panes", []))
+        manager_pane = str(before_record.get("manager_pane_id") or start_data.get("manager_pane_id") or "")
+        if not manager_pane:
+            raise ScenarioFailure(self.current_scenario, "manager-delete-pane", "manager pane id missing")
+
+        self.require_success(self.run(["tmux", "send-keys", "-t", manager_pane, "d"]), step="manager-delete-key")
+
+        def terminal_deleted_active_preserved() -> dict[str, Any] | None:
+            data = self.manager_status_data(manager_id)
+            record = data.get("record") if isinstance(data.get("record"), dict) else {}
+            jobs = record.get("jobs") if isinstance(record.get("jobs"), dict) else {}
+            active = record.get("active_job_ids") if isinstance(record.get("active_job_ids"), list) else []
+            if fast_job not in jobs and slow_job in jobs and slow_job in active:
+                return data
+            return None
+
+        after_delete = self.poll_until("manager-delete-row-removed", 10.0, terminal_deleted_active_preserved)
+        panes_after = len(self.control(["list"], step="manager-delete-list-after").json_data.get("panes", []))
+        if panes_after != panes_before:
+            raise ScenarioFailure(self.current_scenario, "manager-delete-pane-count", "TUI deletion changed pane/window layout")
+        remaining_paths = [str(path) for path in evidence_paths if path.exists()]
+        if remaining_paths:
+            raise ScenarioFailure(self.current_scenario, "manager-delete-evidence", f"terminal evidence still exists: {remaining_paths}")
+
+        self.control(["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace), "--all-workers"], step="manager-delete-cancel")
+        self.terminate_one_manager_process(manager_proc, manager_args, step="manager-delete-process-exit")
+        record = after_delete.get("record") if isinstance(after_delete.get("record"), dict) else {}
+        return {
+            "manager_id": manager_id,
+            "deleted_job": fast_job,
+            "active_job": slow_job,
+            "active_job_ids": record.get("active_job_ids"),
+            "panes_before": panes_before,
+            "panes_after": panes_after,
+        }
+
+    def scenario_manager_bridge_random_notify(self) -> dict[str, Any]:
+        self.current_scenario = "manager-bridge-random-notify"
+        manager_id = "manager-bridge-random"
+        manager_proc, _start, manager_args, thread_id = self.start_bridge_manager(manager_id)
+        try:
+            number, status = self.submit_bridge_random_job(manager_id, "manager-bridge-random-1")
+            record = status.get("record") if isinstance(status.get("record"), dict) else {}
+            return {
+                "manager_id": manager_id,
+                "thread_id": thread_id,
+                "number": number,
+                "last_terminal_event_id": record.get("last_terminal_event_id"),
+                "last_ack": record.get("last_ack"),
+            }
+        finally:
+            self.terminate_one_manager_process(manager_proc, manager_args, step="manager-bridge-random-process-exit")
+
+    def scenario_manager_tmux_inject_wakes_current_codex(self) -> dict[str, Any]:
+        self.current_scenario = "manager-tmux-inject-wakes-current-codex"
+        manager_id = "manager-tmux-inject"
+        job_id = "manager-tmux-inject-random"
+        response_path = self.workspace / "tmux-inject-number-response.txt"
+        codex_session = f"{self.session}-codex"
+        codex_pane_id: str | None = None
+        manager_proc: subprocess.Popen[str] | None = None
+        manager_args: list[str] | None = None
+        old_sdk_decision = self.env.get("TMUX_SKILLS_CODEX_SDK_DECISION")
+        self.env["TMUX_SKILLS_CODEX_SDK_DECISION"] = "inject"
+        instructions = "\n".join(
+            [
+                "You are the tmux-skills tmux-inject E2E target.",
+                "First, reply READY and then wait for a future user prompt.",
+                "When a future prompt starts with 'tmux-skills manager event is ready.', inspect the manager state for this workspace.",
+                f"Use this command shape if needed: python3 {CONTROL} manager status --manager-id {manager_id} --workspace {self.workspace}",
+                f"The manager id will be {manager_id}. Read the event id from the wake prompt.",
+                "Inspect the terminal job output from the manager record or log path, extract the single random digit, run manager ack for the event, and write exactly `숫자는 N이 나왔습니다.` to tmux-inject-number-response.txt in this workspace, replacing N with the digit.",
+                "Do not edit repository files, close panes, stop worker jobs, or run unrelated commands.",
+            ]
+        )
+        codex_command = shlex.join(
+            [
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                str(self.workspace),
+                instructions,
+            ]
+        )
+        try:
+            self.require_success(
+                self.run(["tmux", "new-session", "-d", "-s", codex_session, "-c", str(self.workspace), codex_command]),
+                step="tmux-inject-codex-session",
+            )
+            time.sleep(3.0)
+            self.require_success(self.run(["tmux", "send-keys", "-t", codex_session, "Enter"]), step="tmux-inject-codex-trust")
+
+            def codex_pane_ready() -> str | None:
+                panes = self.control(["list"], step="tmux-inject-list-codex-pane").json_data.get("panes", [])
+                for pane in panes:
+                    if pane.get("session_name") == codex_session and "codex" in str(pane.get("current_command") or "").lower():
+                        return str(pane.get("pane_id") or "")
+                return None
+
+            codex_pane_id = self.poll_until("tmux-inject-codex-pane-ready", 45.0, codex_pane_ready)
+            if not codex_pane_id:
+                raise ScenarioFailure(self.current_scenario, "tmux-inject-codex-pane-ready", "actual Codex TUI pane did not become ready")
+            time.sleep(20.0)
+
+            manager_args = [
+                "manager",
+                "start",
+                "--manager-id",
+                manager_id,
+                "--notify",
+                "tmux-inject",
+                "--codex-pane",
+                codex_pane_id,
+                "--workspace",
+                str(self.workspace),
+                "--poll-seconds",
+                "0.1",
+                "--dashboard-renderer",
+                "none",
+            ]
+            manager_proc = self.popen_control(manager_args)
+            self.manager_processes.append((manager_proc, manager_args))
+            start = self.read_process_json(manager_proc, manager_args)
+            start_data = start.json_data if isinstance(start.json_data, dict) else {}
+            if start_data.get("started") is not True:
+                raise ScenarioFailure(self.current_scenario, "tmux-inject-manager-started", "tmux-inject manager did not start", start)
+
+            command_text = 'python3 -c "import random,time; time.sleep(15); print(random.randint(0, 9))"'
+            submitted = self.control(
+                [
+                    "manager",
+                    "submit",
+                    "--manager-id",
+                    manager_id,
+                    "--job-id",
+                    job_id,
+                    "--command",
+                    command_text,
+                    "--workspace",
+                    str(self.workspace),
+                ],
+                step="tmux-inject-submit-random",
+            )
+            if not isinstance(submitted.json_data, dict) or submitted.json_data.get("queued") is not True:
+                raise ScenarioFailure(self.current_scenario, "tmux-inject-submit-random", "manager submit did not queue random job", submitted)
+
+            def response_ready() -> dict[str, Any] | None:
+                if not response_path.exists():
+                    return None
+                text = response_path.read_text(encoding="utf-8").strip()
+                match = re.search(r"숫자는 ([0-9])이 나왔습니다\.", text)
+                if not match:
+                    raise ScenarioFailure(self.current_scenario, "tmux-inject-response", f"unexpected Codex response: {text!r}")
+                data = self.manager_status_data(manager_id)
+                record = data.get("record") if isinstance(data.get("record"), dict) else {}
+                last_event_id = str(record.get("last_terminal_event_id") or "")
+                notification = record.get("last_notification") if isinstance(record.get("last_notification"), dict) else {}
+                last_ack = record.get("last_ack") if isinstance(record.get("last_ack"), dict) else {}
+                if (
+                    last_event_id
+                    and notification.get("mode") == "tmux-inject"
+                    and notification.get("submitted_to_tmux") is True
+                    and notification.get("injected_to_tmux") is True
+                    and last_ack.get("event_id") == last_event_id
+                ):
+                    return {"number": int(match.group(1)), "manager_status": data, "response": text}
+                return None
+
+            result = self.poll_until("tmux-inject-response-ready", 180.0, response_ready)
+            status_record = result["manager_status"].get("record") if isinstance(result.get("manager_status"), dict) else {}
+            event_id = str(status_record.get("last_terminal_event_id") or "")
+            expected_prompt = "\n".join(
+                [
+                    "tmux-skills manager event is ready.",
+                    "",
+                    f"Manager ID: {manager_id}",
+                    f"Event ID: {event_id}",
+                    "",
+                    "Inspect the manager state for this workspace, decide the next action, and acknowledge the event after inspection.",
+                ]
+            )
+            notification = status_record.get("last_notification") if isinstance(status_record.get("last_notification"), dict) else {}
+            if notification.get("prompt_sha256") != hashlib.sha256(expected_prompt.encode("utf-8")).hexdigest():
+                raise ScenarioFailure(self.current_scenario, "tmux-inject-prompt-hash", "wake prompt hash did not match the short prompt")
+            return {
+                "manager_id": manager_id,
+                "job_id": job_id,
+                "codex_pane_id": codex_pane_id,
+                "number": result["number"],
+                "response": result["response"],
+                "last_terminal_event_id": event_id,
+                "last_ack": status_record.get("last_ack"),
+            }
+        finally:
+            self.control(["manager", "cancel", "--manager-id", manager_id, "--workspace", str(self.workspace)], step="tmux-inject-manager-cancel", check=False)
+            if manager_proc is not None and manager_args is not None and manager_proc.poll() is None:
+                self.terminate_one_manager_process(manager_proc, manager_args, step="tmux-inject-manager-process-exit")
+            self.run(["tmux", "kill-session", "-t", codex_session])
+            if old_sdk_decision is None:
+                self.env.pop("TMUX_SKILLS_CODEX_SDK_DECISION", None)
+            else:
+                self.env["TMUX_SKILLS_CODEX_SDK_DECISION"] = old_sdk_decision
+
+    def scenario_manager_random_repeat_until_zero_one(self) -> dict[str, Any]:
+        self.current_scenario = "manager-random-repeat-until-zero-one"
+        manager_id = "manager-random-repeat"
+        manager_proc, _start, manager_args, thread_id = self.start_bridge_manager(manager_id)
+        attempts: list[dict[str, Any]] = []
+        final_number: int | None = None
+        final_status: dict[str, Any] | None = None
+        try:
+            for index in range(1, 11):
+                seed = 0 if index == 1 else 2
+                command = f'python3 -c "import random,time; time.sleep(1); random.seed({seed}); print(random.randint(0, 9))"'
+                number, status = self.submit_bridge_random_job(manager_id, f"manager-random-repeat-{index}", command)
+                attempts.append({"attempt": index, "number": number})
+                final_number = number
+                final_status = status
+                if index >= 2 and number in {0, 1}:
+                    break
+            if final_number not in {0, 1} or len(attempts) < 2:
+                raise ScenarioFailure(self.current_scenario, "manager-random-repeat-result", f"did not reach 0 or 1 after {len(attempts)} attempts: {attempts}")
+            record = final_status.get("record") if isinstance(final_status, dict) and isinstance(final_status.get("record"), dict) else {}
+            return {
+                "manager_id": manager_id,
+                "thread_id": thread_id,
+                "attempts": attempts,
+                "final_number": final_number,
+                "manager_status": record.get("status"),
+                "last_terminal_event_id": record.get("last_terminal_event_id"),
+                "last_ack": record.get("last_ack"),
+            }
+        finally:
+            self.terminate_one_manager_process(manager_proc, manager_args, step="manager-random-repeat-process-exit")
 
     def scenario_manager_start_reuses_live_process(self) -> dict[str, Any]:
         self.current_scenario = "manager-start-reuses-live-process"
@@ -1931,6 +2486,11 @@ SCENARIO_METHODS = {
     "manager-visible-success": Harness.scenario_manager_visible_success,
     "manager-visible-failure": Harness.scenario_manager_visible_failure,
     "manager-run-next": Harness.scenario_manager_run_next,
+    "manager-multi-pane": Harness.scenario_manager_multi_pane,
+    "manager-tui-delete-completed": Harness.scenario_manager_tui_delete_completed,
+    "manager-bridge-random-notify": Harness.scenario_manager_bridge_random_notify,
+    "manager-tmux-inject-wakes-current-codex": Harness.scenario_manager_tmux_inject_wakes_current_codex,
+    "manager-random-repeat-until-zero-one": Harness.scenario_manager_random_repeat_until_zero_one,
     "manager-start-reuses-live-process": Harness.scenario_manager_start_reuses_live_process,
     "manager-cancel": Harness.scenario_manager_cancel,
     "manager-process-exit-keeps-worker": Harness.scenario_manager_process_exit_keeps_worker,

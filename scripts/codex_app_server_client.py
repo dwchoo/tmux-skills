@@ -347,6 +347,31 @@ class AppServerClient:
             )
         return response
 
+    def start_thread(
+        self,
+        *,
+        cwd: str | None = None,
+        base_instructions: str | None = None,
+        developer_instructions: str | None = None,
+        sandbox: str | None = None,
+        approval_policy: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if cwd is not None:
+            params["cwd"] = cwd
+        if base_instructions is not None:
+            params["baseInstructions"] = base_instructions
+        if developer_instructions is not None:
+            params["developerInstructions"] = developer_instructions
+        if sandbox is not None:
+            params["sandbox"] = sandbox
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
+        if model is not None:
+            params["model"] = model
+        return self._request("thread/start", params)
+
     def start_turn(self, thread_id: str, prompt: str, cwd: str | None) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": thread_id,
@@ -355,6 +380,32 @@ class AppServerClient:
         if cwd is not None:
             params["cwd"] = cwd
         return self._request("turn/start", params)
+
+    def wait_for_turn_completed(self, turn_id: str | None, timeout_seconds: float) -> dict[str, Any]:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"completed": False, "reason": "turn completion wait timed out"}
+            transport = self._require_transport()
+            original_timeout = transport.timeout_seconds
+            transport.timeout_seconds = min(original_timeout, max(0.1, remaining))
+            try:
+                message = transport.recv_json()
+            except RetryableAppServerError as exc:
+                return {"completed": False, "reason": str(exc)}
+            finally:
+                transport.timeout_seconds = original_timeout
+            if "method" in message and "id" not in message:
+                self.transcript["notifications"].append(message)
+                if message.get("method") == "turn/completed":
+                    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+                    observed_turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                    observed_id = observed_turn.get("id") or params.get("turnId")
+                    if not turn_id or observed_id == turn_id:
+                        return {"completed": True, "turn_id": observed_id}
+                continue
+            self.transcript["responses"].append(message)
 
     def close(self) -> None:
         transport = self.transport

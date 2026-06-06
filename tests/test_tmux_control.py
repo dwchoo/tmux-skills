@@ -232,6 +232,11 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(background_start_args.manager_action, "start")
         self.assertEqual(background_start_args.process_mode, "background")
 
+        inject_start_args = parser.parse_args(["manager", "start", "--notify", "tmux-inject", "--codex-pane", "%9"])
+        self.assertEqual(inject_start_args.manager_action, "start")
+        self.assertEqual(inject_start_args.notify, "tmux-inject")
+        self.assertEqual(inject_start_args.codex_pane, "%9")
+
         ps_poc_args = parser.parse_args(["manager", "ps-poc", "--workspace", "/tmp/workspace"])
         self.assertEqual(ps_poc_args.manager_action, "ps-poc")
 
@@ -268,9 +273,26 @@ class TmuxControlTests(unittest.TestCase):
         )
         self.assertEqual(next_args.manager_action, "run-next")
 
-        cancel_args = parser.parse_args(["manager", "cancel", "--manager-id", "manager-one", "--stop-worker"])
+        submit_args = parser.parse_args(
+            [
+                "manager",
+                "submit",
+                "--manager-id",
+                "manager-one",
+                "--new-worker",
+                "--job-id",
+                "job-three",
+                "--command",
+                "echo parallel",
+            ]
+        )
+        self.assertEqual(submit_args.manager_action, "submit")
+        self.assertTrue(submit_args.new_worker)
+
+        cancel_args = parser.parse_args(["manager", "cancel", "--manager-id", "manager-one", "--stop-worker", "--all-workers"])
         self.assertEqual(cancel_args.manager_action, "cancel")
         self.assertTrue(cancel_args.stop_worker)
+        self.assertTrue(cancel_args.all_workers)
 
         cleanup_args = parser.parse_args(["manager", "cleanup", "--manager-id", "manager-one", "--jobs"])
         self.assertEqual(cleanup_args.manager_action, "cleanup")
@@ -299,6 +321,97 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("--thread-id", result["reason"])
 
+    def test_manager_start_tmux_inject_requires_codex_pane_before_tmux(self) -> None:
+        parser = tmux_control.build_parser()
+        args = parser.parse_args(
+            [
+                "manager",
+                "start",
+                "--manager-id",
+                "manager-one",
+                "--notify",
+                "tmux-inject",
+            ]
+        )
+
+        with mock.patch.object(tmux_control, "manager_layout") as layout:
+            result = tmux_control.manager(args)
+
+        layout.assert_not_called()
+        self.assertFalse(result["started"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("--codex-pane", result["reason"])
+
+    def test_manager_start_tmux_inject_current_binds_safe_codex_pane(self) -> None:
+        parser = tmux_control.build_parser()
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            args = parser.parse_args(
+                [
+                    "manager",
+                    "start",
+                    "--manager-id",
+                    "manager-one",
+                    "--notify",
+                    "tmux-inject",
+                    "--codex-pane",
+                    "current",
+                    "--workspace",
+                    str(workspace),
+                    "--dashboard-renderer",
+                    "none",
+                ]
+            )
+            current = {"pane_id": "%9", "pane_dead": False, "pane_index": "0", "session_name": "s", "window_id": "@1"}
+            layout_result = {
+                "manager_pane_id": "%3",
+                "manager_pane_index": "1",
+                "worker_pane_id": "%2",
+                "worker_pane_index": "2",
+            }
+
+            with (
+                mock.patch.object(tmux_control, "inside_tmux", return_value=True),
+                mock.patch.object(tmux_control, "current_info", return_value=current),
+                mock.patch.object(tmux_manager, "pane_codex_validation", return_value={"safe": True, "status": "live_codex"}),
+                mock.patch.object(tmux_control, "manager_layout", return_value=layout_result),
+                mock.patch.object(
+                    tmux_manager,
+                    "ensure_dashboard_viewer",
+                    side_effect=lambda record, paths: (record, {"started": False, "renderer": "none"}),
+                ),
+            ):
+                result = tmux_control.manager(args)
+
+        self.assertTrue(result["started"])
+        self.assertEqual(result["codex_pane_id"], "%9")
+        self.assertEqual(result["record"]["notify"]["mode"], "tmux-inject")
+        self.assertEqual(result["record"]["notify"]["codex_pane_id"], "%9")
+
+    def test_manager_start_tmux_inject_refuses_unsafe_current_pane(self) -> None:
+        parser = tmux_control.build_parser()
+        args = parser.parse_args(["manager", "start", "--notify", "tmux-inject", "--codex-pane", "current"])
+        current = {"pane_id": "%9", "pane_dead": False}
+
+        with (
+            mock.patch.object(tmux_control, "inside_tmux", return_value=True),
+            mock.patch.object(tmux_control, "current_info", return_value=current),
+            mock.patch.object(
+                tmux_manager,
+                "pane_codex_validation",
+                return_value={"safe": False, "status": "no_live_codex_process", "reason": "not Codex"},
+            ),
+            mock.patch.object(tmux_control, "manager_layout") as layout,
+        ):
+            result = tmux_control.manager(args)
+
+        layout.assert_not_called()
+        self.assertFalse(result["started"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "not Codex")
+        self.assertEqual(result["codex_pane_id"], "%9")
+
     def test_manager_start_rejects_command_without_job_before_tmux(self) -> None:
         parser = tmux_control.build_parser()
         args = parser.parse_args(["manager", "start", "--command", "echo ok", "--notify", "none"])
@@ -311,7 +424,92 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("--job-id", result["reason"])
 
-    def test_manager_start_background_refuses_before_layout_and_command_request(self) -> None:
+    def test_manager_submit_with_pane_queues_parallel_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = tmux_manager.build_manager_record(
+                manager_id="manager-one",
+                manager_pane_id="%2",
+                worker_pane_id="%3",
+                pending_job=None,
+                notify={"mode": "none"},
+                workspace=str(workspace),
+                state_dir=str(paths["root"]),
+            )
+            tmux_manager.write_manager_record(paths, record)
+            parser = tmux_control.build_parser()
+            args = parser.parse_args(
+                [
+                    "manager",
+                    "submit",
+                    "--manager-id",
+                    "manager-one",
+                    "--pane",
+                    "%4",
+                    "--job-id",
+                    "job-two",
+                    "--command",
+                    "echo parallel",
+                    "--workspace",
+                    str(workspace),
+                ]
+            )
+
+            with mock.patch.object(tmux_control, "current_info", return_value={"pane_id": "%4", "pane_index": "3", "pane_dead": False}):
+                result = tmux_control.manager(args)
+
+            self.assertTrue(result["queued"])
+            self.assertEqual(result["pane_id"], "%4")
+            self.assertEqual(result["pane_index"], "3")
+            loaded, error = tmux_manager.read_manager_record(paths, "manager-one")
+            self.assertIsNone(error)
+            assert loaded is not None
+            self.assertEqual(loaded["pending_job"]["pane_id"], "%4")
+            self.assertEqual(loaded["pending_job"]["pane_index"], "3")
+
+    def test_manager_submit_new_worker_does_not_split_when_queue_preflight_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            request_path = tmux_manager.write_command_request(paths, "manager-one", "job-one", "echo old")
+            record = tmux_manager.build_manager_record(
+                manager_id="manager-one",
+                manager_pane_id="%2",
+                worker_pane_id="%3",
+                pending_job=tmux_manager.build_pending_job("job-one", request_path, str(workspace), "%3"),
+                notify={"mode": "none"},
+                workspace=str(workspace),
+                state_dir=str(paths["root"]),
+            )
+            tmux_manager.write_manager_record(paths, record)
+            parser = tmux_control.build_parser()
+            args = parser.parse_args(
+                [
+                    "manager",
+                    "submit",
+                    "--manager-id",
+                    "manager-one",
+                    "--new-worker",
+                    "--job-id",
+                    "job-two",
+                    "--command",
+                    "echo should-not-split",
+                    "--workspace",
+                    str(workspace),
+                ]
+            )
+
+            with mock.patch.object(tmux_control, "split_pane") as split:
+                result = tmux_control.manager(args)
+
+            self.assertFalse(result["queued"])
+            self.assertIn("pending job", result["reason"])
+            split.assert_not_called()
+
+    def test_manager_start_background_records_codex_background_terminal_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             workspace = Path(tmp_name) / "workspace"
             workspace.mkdir()
@@ -335,17 +533,28 @@ class TmuxControlTests(unittest.TestCase):
                 ]
             )
 
-            with mock.patch.object(tmux_control, "manager_layout") as layout:
+            layout_result = {
+                "manager_pane_id": "%3",
+                "worker_pane_id": "%2",
+                "manager_pane_index": "0",
+                "worker_pane_index": "1",
+                "attach_command": None,
+            }
+            with (
+                mock.patch.object(tmux_control, "manager_layout", return_value=layout_result) as layout,
+                mock.patch.object(tmux_control.tmux_manager, "ensure_dashboard_viewer", side_effect=lambda record, paths: (record, {"started": False})),
+            ):
                 result = tmux_control.manager(args)
 
-            layout.assert_not_called()
-            self.assertFalse(result["started"])
-            self.assertEqual(result["status"], tmux_manager.MANAGER_PS_POC_STATUS_UNSUPPORTED)
+            layout.assert_called_once()
+            self.assertTrue(result["started"])
+            self.assertEqual(result["status"], "queued")
             self.assertEqual(result["manager_process_mode"], "background")
-            self.assertTrue(Path(result["proof_path"]).exists())
+            self.assertEqual(result["record"]["manager_launcher"], "codex-background-terminal")
+            self.assertEqual(result["record"]["manager_exit_watch"], "codex-background-terminal-lifetime")
             paths = tmux_manager.manager_paths(str(workspace))
-            self.assertFalse(tmux_manager.manager_command_request_path(paths, "manager-one", "job-one").exists())
-            self.assertFalse(tmux_manager.manager_record_path(paths, "manager-one").exists())
+            self.assertTrue(tmux_manager.manager_command_request_path(paths, "manager-one", "job-one").exists())
+            self.assertTrue(tmux_manager.manager_record_path(paths, "manager-one").exists())
 
     def test_manager_start_with_bridge_command_requires_verified_receipt_before_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -480,6 +689,7 @@ class TmuxControlTests(unittest.TestCase):
             "window_index": "0",
             "window_id": "@1",
             "pane_id": "%1",
+            "pane_index": "0",
             "pane_dead": False,
             "pane_left": 0,
             "pane_top": 0,
@@ -489,6 +699,7 @@ class TmuxControlTests(unittest.TestCase):
         manager_pane = {
             **codex_pane,
             "pane_id": "%2",
+            "pane_index": "1",
             "pane_top": 31,
             "pane_width": 100,
             "pane_height": 10,
@@ -496,6 +707,7 @@ class TmuxControlTests(unittest.TestCase):
         worker_pane = {
             **codex_pane,
             "pane_id": "%3",
+            "pane_index": "2",
             "pane_left": 101,
             "pane_top": 0,
             "pane_width": 80,
@@ -520,7 +732,9 @@ class TmuxControlTests(unittest.TestCase):
         split_calls = [call for call in run_tmux.call_args_list if call.args[0][0] == "split-window"]
         self.assertEqual(split_calls, [])
         self.assertEqual(result["manager_pane_id"], "%2")
+        self.assertEqual(result["manager_pane_index"], "1")
         self.assertEqual(result["worker_pane_id"], "%3")
+        self.assertEqual(result["worker_pane_index"], "2")
         self.assertTrue(result["manager_reused"])
         self.assertTrue(result["worker_reused"])
 
@@ -647,7 +861,9 @@ class TmuxControlTests(unittest.TestCase):
                 "window_id": "@1",
                 "manager_window_id": "@1",
                 "worker_pane_id": "%3",
+                "worker_pane_index": "2",
                 "manager_pane_id": "%2",
+                "manager_pane_index": "1",
                 "manager_reused": True,
                 "worker_reused": True,
                 "target": "session:0",
@@ -667,6 +883,64 @@ class TmuxControlTests(unittest.TestCase):
             assert loaded is not None
             self.assertEqual(loaded["job_ids"], ["job-one"])
             self.assertEqual(loaded["pending_job"]["job_id"], "job-two")
+
+    def test_manager_start_ensures_dashboard_viewer_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            args = argparse.Namespace(
+                manager_id="manager-one",
+                job_id=None,
+                command_text=None,
+                command_file=None,
+                notify="none",
+                thread_id=None,
+                endpoint=None,
+                cwd=None,
+                workspace=str(workspace),
+                state_dir=None,
+                poll_seconds=0.5,
+                dashboard_renderer="pane",
+            )
+            layout = {
+                "session_name": "session",
+                "window_id": "@1",
+                "manager_window_id": "@1",
+                "worker_pane_id": "%3",
+                "worker_pane_index": "2",
+                "manager_pane_id": "%2",
+                "manager_pane_index": "1",
+                "manager_reused": False,
+                "worker_reused": False,
+                "target": "session:0",
+                "cwd": str(workspace),
+                "attach_command": None,
+                "tmux_tmpdir": None,
+            }
+
+            def fake_ensure(record: dict[str, object], _paths: dict[str, Path]) -> tuple[dict[str, object], dict[str, object]]:
+                updated = dict(record)
+                updated["dashboard_viewer_pid"] = 4242
+                updated["dashboard_viewer_state_path"] = str(tmux_manager.manager_dashboard_viewer_state_path(paths, "manager-one"))
+                updated["dashboard_viewer_heartbeat_at"] = "now"
+                return updated, {"started": True, "reused": False, "pid": 4242}
+
+            with mock.patch.object(tmux_control, "manager_layout", return_value=layout):
+                with mock.patch.object(tmux_control.tmux_manager, "ensure_dashboard_viewer", side_effect=fake_ensure) as ensure:
+                    result = tmux_control.manager_start(args)
+
+            ensure.assert_called_once()
+            self.assertTrue(result["started"])
+            self.assertEqual(result["dashboard_renderer"], "pane")
+            self.assertEqual(result["dashboard_viewer_pid"], 4242)
+            loaded, error = tmux_manager.read_manager_record(paths, "manager-one")
+            self.assertIsNone(error)
+            assert loaded is not None
+            self.assertEqual(loaded["dashboard_viewer_pid"], 4242)
+            self.assertEqual(loaded["dashboard_viewer_heartbeat_at"], "now")
+            self.assertEqual(loaded["manager_pane_index"], "1")
+            self.assertEqual(loaded["worker_pane_index"], "2")
 
     def test_manager_start_queues_to_existing_live_manager_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -705,7 +979,9 @@ class TmuxControlTests(unittest.TestCase):
                 "window_id": "@1",
                 "manager_window_id": "@1",
                 "worker_pane_id": "%3",
+                "worker_pane_index": "2",
                 "manager_pane_id": "%2",
+                "manager_pane_index": "1",
                 "manager_reused": True,
                 "worker_reused": True,
                 "target": "session:0",
@@ -729,6 +1005,8 @@ class TmuxControlTests(unittest.TestCase):
             self.assertEqual(loaded["manager_pid"], 424242)
             self.assertEqual(loaded["manager_process_mode"], "foreground")
             self.assertEqual(loaded["pending_job"]["job_id"], "job-two")
+            self.assertEqual(loaded["pending_job"]["pane_id"], "%3")
+            self.assertEqual(loaded["pending_job"]["pane_index"], "2")
 
     def test_main_start_existing_manager_does_not_enter_dashboard_loop(self) -> None:
         result = {

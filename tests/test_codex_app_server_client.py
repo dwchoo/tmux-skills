@@ -69,6 +69,19 @@ class FakeUnixWebSocketAppServer:
                             self._send_message(conn, {"id": message["id"], "result": {"serverInfo": {"name": "fake"}}})
                         elif method == "initialized":
                             continue
+                        elif method == "thread/start":
+                            self._send_message(
+                                conn,
+                                {
+                                    "id": message["id"],
+                                    "result": {
+                                        "thread": {
+                                            "id": "thr_started",
+                                            "cwd": message["params"].get("cwd"),
+                                        }
+                                    },
+                                },
+                            )
                         elif method == "thread/resume":
                             thread_id = self.resume_thread_id
                             if thread_id is None:
@@ -197,28 +210,35 @@ class AppServerClientTests(unittest.TestCase):
                 try:
                     client.connect()
                     client.initialize()
+                    started = client.start_thread(
+                        cwd="/workspace",
+                        developer_instructions="bridge handler",
+                        sandbox="danger-full-access",
+                        approval_policy="never",
+                    )
                     resume = client.resume_thread("thr_test")
                     turn = client.start_turn("thr_test", "wake prompt", "/workspace")
                 finally:
                     client.close()
 
+            self.assertEqual(codex_app_server_client.response_thread_id(started), "thr_started")
             self.assertEqual(codex_app_server_client.response_thread_id(resume), "thr_test")
             self.assertEqual(codex_app_server_client.response_thread_id(turn), "thr_test")
             self.assertEqual(codex_app_server_client.response_turn_id(turn), "turn_1")
             self.assertEqual(
                 [item["method"] for item in client.transcript["outbound"]],
-                ["initialize", "initialized", "thread/resume", "turn/start"],
+                ["initialize", "initialized", "thread/start", "thread/resume", "turn/start"],
             )
             self.assertFalse(any("jsonrpc" in item for item in client.transcript["outbound"]))
             self.assertEqual(client.transcript["outbound"][0]["params"]["clientInfo"]["title"], "tmux-control bridge")
             self.assertEqual(client.transcript["outbound"][0]["params"]["clientInfo"]["version"], "0.1")
             self.assertEqual(client.transcript["outbound"][0]["params"]["capabilities"]["experimentalApi"], False)
             self.assertEqual(
-                client.transcript["outbound"][3]["params"]["input"],
+                client.transcript["outbound"][4]["params"]["input"],
                 [{"type": "text", "text": "wake prompt", "text_elements": []}],
             )
             self.assertEqual(client.transcript["notifications"][0]["method"], "turn/started")
-            self.assertEqual([item["method"] for item in server.received], ["initialize", "initialized", "thread/resume", "turn/start"])
+            self.assertEqual([item["method"] for item in server.received], ["initialize", "initialized", "thread/start", "thread/resume", "turn/start"])
 
     def test_mismatched_resume_thread_is_permanent_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
