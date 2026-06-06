@@ -220,10 +220,6 @@ def command_matches_bridge(record: dict[str, Any], command: str | None) -> bool:
     )
 
 
-def bridge_pid_matches(record: dict[str, Any]) -> bool:
-    return command_matches_bridge(record, process_command_line(int(record.get("pid") or 0)))
-
-
 def bridge_process_state(record: dict[str, Any]) -> dict[str, Any]:
     pid = int(record.get("pid") or 0)
     command = process_command_line(pid)

@@ -19,6 +19,7 @@ from typing import Any
 import codex_app_server_client
 import tmux_bridge
 import tmux_state
+import tmux_text
 
 
 MANAGER_VERSION = 1
@@ -27,28 +28,115 @@ MANAGER_STATUSES = {"starting", "idle", "queued", "running", "waiting_for_codex"
 MANAGER_CANCEL_STATUSES = {"cancel_requested", "cancelled"}
 MANAGER_PROCESS_MODES = {"foreground", "background"}
 MANAGER_DASHBOARD_RENDERERS = {"pane", "none"}
+MANAGER_TUI_BACKENDS = {"compact", "textual"}
 DASHBOARD_MODES = ("summary", "jobs", "events")
 MANAGER_PS_POC_STATUS_UNSUPPORTED = "unsupported_by_current_codex_surface"
 MANAGER_PS_POC_STATUS_VERIFIED = "verified"
 MANAGER_TERMINAL_JOB_STATUSES = {"succeeded", "failed", "stopped", "timeout", "cancelled", "stale"}
 MANAGER_DELETABLE_JOB_STATUSES = MANAGER_TERMINAL_JOB_STATUSES | {"complete", "completed", "error"}
 BRIDGE_VERIFICATION_STATUSES = {"unverified", "awaiting_ack", "verified", "expired", "mismatched_config", "submission_failed"}
-TMUX_INJECT_NOTIFICATION_STATUSES = {"injected", "inject_pending", "inject_refused"}
+TMUX_INJECT_NOTIFICATION_STATUSES = {"awaiting_receipt", "injected", "inject_pending", "inject_refused", "receipt_blocked", "coalesced"}
 TMUX_INJECT_PRIMARY_SUBMIT_KEY = "C-m"
 TMUX_INJECT_FOLLOWUP_SUBMIT_KEY = "C-m"
 TMUX_INJECT_QUEUE_SUBMIT_KEY = "Tab"
-TMUX_INJECT_ACK_RECHECK_SECONDS = 5.0
-CODEX_SDK_REASONING_EFFORT = "low"
+TMUX_INJECT_ACK_RECHECK_SECONDS = 10.0
+TMUX_INJECT_RECEIPT_RETRY_MAX = 1
+TMUX_INJECT_RECEIPT_SIDECAR_CHECK_MAX = 6
+TMUX_INJECT_CAPTURE_LINES = 30
+TMUX_INJECT_CAPTURE_MAX_CHARS = 4000
+DEFAULT_CODEX_SDK_MODEL = "gpt-5.5"
+DEFAULT_CODEX_SDK_REASONING_EFFORT = "low"
+DEFAULT_CODEX_SIDECAR_FAST_PATH = True
+TMUX_SKILLS_CONFIG_FILENAME = "tmux-skills.config.json"
 TMUX_INJECT_WAKE_PROMPT = "\n".join(
     [
-        "tmux-skills manager event is ready.",
+        "tmux-skills event ready. Use $tmux-control only.",
         "",
         "Manager ID: {manager_id}",
         "Event ID: {event_id}",
         "",
-        "Inspect the manager state for this workspace, decide the next action, and acknowledge the event after inspection.",
+        "Inspect manager status first. Handle only the latest unacked event.",
+        "If stale or already handled, ack/report only.",
+        "After run-next, wait for the next manager event; do not poll or monitor directly.",
     ]
 )
+
+
+def tmux_skills_config_path() -> Path:
+    override = tmux_state.one_line_text(os.environ.get("TMUX_SKILLS_CONFIG"))
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parent.parent / TMUX_SKILLS_CONFIG_FILENAME
+
+
+def read_tmux_skills_config() -> dict[str, Any]:
+    path = tmux_skills_config_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def codex_sidecar_config() -> dict[str, Any]:
+    config = read_tmux_skills_config()
+    sidecar = config.get("codex_sidecar") if isinstance(config.get("codex_sidecar"), dict) else {}
+    model = tmux_state.one_line_text(os.environ.get("TMUX_SKILLS_CODEX_SDK_MODEL")) or tmux_state.one_line_text(sidecar.get("model"))
+    effort = (
+        tmux_state.token_text(os.environ.get("TMUX_SKILLS_CODEX_SDK_REASONING_EFFORT"))
+        or tmux_state.token_text(sidecar.get("reasoning_effort"))
+        or DEFAULT_CODEX_SDK_REASONING_EFFORT
+    )
+    if effort not in {"low", "medium", "high"}:
+        effort = DEFAULT_CODEX_SDK_REASONING_EFFORT
+    fast_path = sidecar.get("deterministic_fast_path")
+    if isinstance(fast_path, str):
+        fast_path_enabled = tmux_state.token_text(fast_path) not in {"0", "false", "no", "off"}
+    elif isinstance(fast_path, bool):
+        fast_path_enabled = fast_path
+    else:
+        fast_path_enabled = DEFAULT_CODEX_SIDECAR_FAST_PATH
+    return {
+        "enabled": bool(sidecar.get("enabled", False)),
+        "model": model or DEFAULT_CODEX_SDK_MODEL,
+        "reasoning_effort": effort,
+        "deterministic_fast_path": fast_path_enabled,
+        "config_path": str(tmux_skills_config_path()),
+    }
+
+
+def config_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    token = tmux_state.token_text(value)
+    if not token:
+        return default
+    return token not in {"0", "false", "no", "off"}
+
+
+def debug_sidecar_trace_enabled() -> bool:
+    override = tmux_state.token_text(os.environ.get("TMUX_SKILLS_DEBUG_SIDECAR"))
+    if override:
+        return config_bool(override)
+    config = read_tmux_skills_config()
+    debug = config.get("debug") if isinstance(config.get("debug"), dict) else {}
+    return config_bool(debug.get("sidecar_trace"), default=False)
+
+
+def debug_sidecar_payload_enabled() -> bool:
+    override = tmux_state.token_text(os.environ.get("TMUX_SKILLS_DEBUG_SIDECAR_PAYLOAD"))
+    if override:
+        return config_bool(override)
+    config = read_tmux_skills_config()
+    debug = config.get("debug") if isinstance(config.get("debug"), dict) else {}
+    return config_bool(debug.get("sidecar_payload"), default=False)
+
+
+def bounded_debug_text(value: Any, *, max_chars: int = 4000) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
 
 
 def manager_id_value(value: str | None) -> str:
@@ -75,6 +163,49 @@ def manager_process_mode_value(value: str | None) -> str:
 def manager_dashboard_renderer_value(value: str | None) -> str:
     renderer = tmux_state.token_text(value) or "pane"
     return renderer if renderer in MANAGER_DASHBOARD_RENDERERS else "pane"
+
+
+def manager_tui_backend_value(value: str | None) -> str:
+    backend = tmux_state.token_text(value) or "compact"
+    return backend if backend in MANAGER_TUI_BACKENDS else "compact"
+
+
+def manager_tui_backend_env() -> str:
+    return manager_tui_backend_value(os.environ.get("TMUX_SKILLS_MANAGER_TUI"))
+
+
+def manager_tui_venv_python(paths: dict[str, Path]) -> Path:
+    return paths["root"] / "manager-tui-venv" / "bin" / "python"
+
+
+def ensure_manager_tui_venv(paths: dict[str, Path], *, timeout_seconds: float = 60.0) -> dict[str, Any]:
+    python_path = manager_tui_venv_python(paths)
+    marker_path = python_path.parent.parent / ".textual-rich-installed"
+    if python_path.exists() and marker_path.exists():
+        return {"ok": True, "python": str(python_path), "venv": str(python_path.parent.parent), "reused": True}
+    venv_dir = python_path.parent.parent
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        create = subprocess.run(["uv", "venv", str(venv_dir)], text=True, capture_output=True, timeout=timeout_seconds)
+    except Exception as exc:
+        return {"ok": False, "reason": f"uv venv failed: {exc}", "python": str(python_path), "venv": str(venv_dir)}
+    if create.returncode != 0:
+        reason = create.stderr.strip() or create.stdout.strip() or f"uv venv exited {create.returncode}"
+        return {"ok": False, "reason": tmux_state.one_line_text(reason), "python": str(python_path), "venv": str(venv_dir)}
+    try:
+        install = subprocess.run(
+            ["uv", "pip", "install", "--python", str(python_path), "textual", "rich"],
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        return {"ok": False, "reason": f"uv pip install failed: {exc}", "python": str(python_path), "venv": str(venv_dir)}
+    if install.returncode != 0:
+        reason = install.stderr.strip() or install.stdout.strip() or f"uv pip install exited {install.returncode}"
+        return {"ok": False, "reason": tmux_state.one_line_text(reason), "python": str(python_path), "venv": str(venv_dir)}
+    marker_path.write_text(tmux_state.utc_now(), encoding="utf-8")
+    return {"ok": True, "python": str(python_path), "venv": str(venv_dir), "reused": False}
 
 
 def manager_launcher_for_mode(process_mode: str | None) -> tuple[str, str]:
@@ -304,10 +435,24 @@ def ensure_dashboard_viewer(record: dict[str, Any], paths: dict[str, Path]) -> t
 
     dashboard_file = Path(str(record.get("dashboard_path") or manager_dashboard_path(paths, str(record["manager_id"]))))
     manager_file = manager_record_path(paths, str(record["manager_id"]))
+    viewer_backend = manager_tui_backend_env()
+    viewer_setup: dict[str, Any] | None = None
+    viewer_python = sys.executable or "python3"
     viewer_script = script_dir() / "tmux_manager_viewer.py"
+    if viewer_backend == "textual":
+        viewer_setup = ensure_manager_tui_venv(paths)
+        if viewer_setup.get("ok"):
+            viewer_python = str(viewer_setup["python"])
+            viewer_script = script_dir() / "tmux_manager_tui.py"
+        else:
+            record["last_dashboard_viewer_error"] = str(viewer_setup.get("reason") or "Textual viewer setup failed")
+            viewer_backend = "compact"
+    record["dashboard_viewer_backend"] = viewer_backend
+    if viewer_setup is not None:
+        record["dashboard_viewer_setup"] = viewer_setup
     poll_seconds = str(record.get("poll_seconds") or 2.0)
     command_args = [
-        sys.executable or "python3",
+        viewer_python,
         str(viewer_script),
         "--manager-id",
         str(record["manager_id"]),
@@ -393,28 +538,46 @@ def normalize_notify(
 
 
 def codex_sdk_model_name() -> str | None:
-    override = tmux_state.one_line_text(os.environ.get("TMUX_SKILLS_CODEX_SDK_MODEL"))
-    if override:
-        return override
-    for env_name in ("CODEX_MODEL", "OPENAI_MODEL"):
-        value = tmux_state.one_line_text(os.environ.get(env_name))
-        if value:
-            return value
-    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-    config_path = codex_home / "config.toml"
-    try:
-        import tomllib
+    return tmux_state.one_line_text(codex_sidecar_config().get("model")) or None
 
-        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if isinstance(data, dict):
-        return tmux_state.one_line_text(data.get("model"))
-    return None
+
+def codex_sdk_reasoning_effort() -> str:
+    return tmux_state.token_text(codex_sidecar_config().get("reasoning_effort")) or DEFAULT_CODEX_SDK_REASONING_EFFORT
+
+
+def codex_sidecar_fast_path_enabled() -> bool:
+    return bool(codex_sidecar_config().get("deterministic_fast_path"))
 
 
 def codex_sidecar_enabled() -> bool:
-    return tmux_state.token_text(os.environ.get("TMUX_SKILLS_CODEX_SIDECAR")) in {"1", "true", "yes", "on"}
+    override = tmux_state.token_text(os.environ.get("TMUX_SKILLS_CODEX_SIDECAR"))
+    if override:
+        return override in {"1", "true", "yes", "on"}
+    return bool(codex_sidecar_config().get("enabled"))
+
+
+def monotonic_ms() -> float:
+    return time.monotonic() * 1000.0
+
+
+def elapsed_ms(start_ms: float) -> int:
+    return max(0, int(round(monotonic_ms() - start_ms)))
+
+
+def timing_entry(start_ms: float, **fields: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {"elapsed_ms": elapsed_ms(start_ms)}
+    for key, value in fields.items():
+        if value is not None:
+            entry[key] = value
+    return entry
+
+
+def merge_timing(*items: dict[str, Any] | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for item in items:
+        if isinstance(item, dict):
+            merged.update(item)
+    return merged
 
 
 def codex_sidecar_venv_python(payload: dict[str, Any]) -> Path:
@@ -511,11 +674,21 @@ def codex_sidecar_output_schema(payload: dict[str, Any]) -> dict[str, Any]:
 def codex_sidecar_decision(payload: dict[str, Any], *, timeout_seconds: float = 90.0) -> dict[str, Any] | None:
     if not codex_sidecar_enabled():
         return None
+    total_start = monotonic_ms()
+    setup_start = monotonic_ms()
     setup = ensure_codex_sidecar_venv(payload)
+    setup_timing = timing_entry(setup_start)
     if not setup.get("ok"):
-        return {"source": "codex_sidecar_error", "reason": str(setup.get("reason") or "openai-codex sidecar venv setup failed"), "setup": setup}
+        return {
+            "source": "codex_sidecar_error",
+            "reason": str(setup.get("reason") or "openai-codex sidecar venv setup failed"),
+            "setup": setup,
+            "timing": {"setup": setup_timing, "total": timing_entry(total_start)},
+        }
     helper_path = script_dir() / "tmux_codex_sidecar.py"
-    request = json.dumps({"payload": payload}, sort_keys=True)
+    request_payload = {"payload": payload, "sidecar_config": codex_sidecar_config()}
+    request = json.dumps(request_payload, sort_keys=True)
+    call_start = monotonic_ms()
     try:
         proc = subprocess.run(
             [str(setup["python"]), str(helper_path)],
@@ -525,28 +698,96 @@ def codex_sidecar_decision(payload: dict[str, Any], *, timeout_seconds: float = 
             timeout=timeout_seconds,
         )
     except Exception as exc:
-        return {"source": "codex_sidecar_error", "reason": f"openai-codex sidecar helper failed: {exc}", "setup": setup}
+        return {
+            "source": "codex_sidecar_error",
+            "reason": f"openai-codex sidecar helper failed: {exc}",
+            "setup": setup,
+            "timing": {"setup": setup_timing, "sdk_call": timing_entry(call_start), "total": timing_entry(total_start)},
+        }
+    call_timing = timing_entry(call_start, returncode=proc.returncode)
     parsed = parse_codex_sidecar_json(proc.stdout)
+    total_timing = timing_entry(total_start)
+    timing = {"setup": setup_timing, "sdk_call": call_timing, "total": total_timing}
+    debug: dict[str, Any] | None = None
+    if debug_sidecar_trace_enabled():
+        debug = {
+            "helper_returncode": proc.returncode,
+            "helper_stdout_tail": bounded_debug_text(proc.stdout),
+            "helper_stderr_tail": bounded_debug_text(proc.stderr),
+        }
+        if debug_sidecar_payload_enabled():
+            debug["request"] = request_payload
     if proc.returncode != 0 or parsed is None:
         reason = proc.stderr.strip() or proc.stdout.strip() or f"openai-codex sidecar helper exited {proc.returncode}"
-        return {"source": "codex_sidecar_error", "reason": tmux_state.one_line_text(reason), "setup": setup}
+        result = {"source": "codex_sidecar_error", "reason": tmux_state.one_line_text(reason), "setup": setup, "timing": timing}
+        if debug:
+            result["sidecar_debug"] = debug
+        return result
     if parsed.get("source") == "codex_sidecar_error":
-        return parsed | {"setup": setup}
+        result = parsed | {"setup": setup, "timing": timing}
+        if debug:
+            result["sidecar_debug"] = debug
+        return result
     output = str(parsed.get("output") or "")
     decision = parse_codex_sidecar_json(output)
     if decision is None:
-        return {"source": "codex_sidecar_error", "reason": tmux_state.one_line_text(output) or "openai-codex sidecar returned no decision JSON", "setup": setup}
-    return decision | {"source": "codex_sidecar", "setup": setup}
+        result = {
+            "source": "codex_sidecar_error",
+            "reason": tmux_state.one_line_text(output) or "openai-codex sidecar returned no decision JSON",
+            "setup": setup,
+            "timing": timing,
+        }
+        if debug:
+            debug["final_response_tail"] = bounded_debug_text(output)
+            result["sidecar_debug"] = debug
+        return result
+    result = decision | {"source": "codex_sidecar", "setup": setup, "timing": timing, "sidecar_config": codex_sidecar_config()}
+    if debug:
+        debug["final_response_tail"] = bounded_debug_text(output)
+        result["sidecar_debug"] = debug
+    return result
 
 
 def tmux_inject_ack_recheck_seconds() -> float:
     value = os.environ.get("TMUX_SKILLS_TMUX_INJECT_ACK_RECHECK_SECONDS")
+    if value is None:
+        receipt = read_tmux_skills_config().get("tmux_inject_receipt")
+        if isinstance(receipt, dict):
+            value = receipt.get("recheck_seconds")
     if value is None:
         return TMUX_INJECT_ACK_RECHECK_SECONDS
     try:
         return max(0.0, float(value))
     except ValueError:
         return TMUX_INJECT_ACK_RECHECK_SECONDS
+
+
+def tmux_inject_receipt_retry_max() -> int:
+    value = os.environ.get("TMUX_SKILLS_TMUX_INJECT_RECEIPT_RETRY_MAX")
+    if value is None:
+        receipt = read_tmux_skills_config().get("tmux_inject_receipt")
+        if isinstance(receipt, dict):
+            value = receipt.get("max_retries")
+    if value is None:
+        return TMUX_INJECT_RECEIPT_RETRY_MAX
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return TMUX_INJECT_RECEIPT_RETRY_MAX
+
+
+def tmux_inject_receipt_sidecar_check_max() -> int:
+    value = os.environ.get("TMUX_SKILLS_TMUX_INJECT_RECEIPT_SIDECAR_CHECK_MAX")
+    if value is None:
+        receipt = read_tmux_skills_config().get("tmux_inject_receipt")
+        if isinstance(receipt, dict):
+            value = receipt.get("max_sidecar_checks")
+    if value is None:
+        return TMUX_INJECT_RECEIPT_SIDECAR_CHECK_MAX
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return TMUX_INJECT_RECEIPT_SIDECAR_CHECK_MAX
 
 
 def tmux_inject_ack_recheck_due(notification: dict[str, Any] | None) -> bool:
@@ -556,7 +797,7 @@ def tmux_inject_ack_recheck_due(notification: dict[str, Any] | None) -> bool:
         return False
     if notification.get("mode") != "tmux-inject":
         return False
-    if notification.get("status") not in {"injected", "inject_pending"}:
+    if notification.get("status") not in {"awaiting_receipt", "injected", "inject_pending", "coalesced"}:
         return False
     delivery_check = notification.get("delivery_check") if isinstance(notification.get("delivery_check"), dict) else {}
     checked_at = (
@@ -568,6 +809,264 @@ def tmux_inject_ack_recheck_due(notification: dict[str, Any] | None) -> bool:
     )
     age = tmux_state.age_seconds(checked_at)
     return age is None or age >= tmux_inject_ack_recheck_seconds()
+
+
+def pending_tmux_inject_wake_event_id(record: dict[str, Any], current_event_id: str) -> str:
+    for notification in record.get("notifications", []):
+        if not isinstance(notification, dict):
+            continue
+        event_id = str(notification.get("event_id") or "")
+        if not event_id or event_id == current_event_id:
+            continue
+        if notification.get("mode") != "tmux-inject":
+            continue
+        if notification.get("acknowledged_by_codex"):
+            continue
+        if notification.get("status") in {"awaiting_receipt", "injected", "inject_pending", "receipt_blocked"} and notification.get("submitted_to_tmux"):
+            return event_id
+    return ""
+
+
+def codex_capture_indicates_working(capture_output: str) -> bool:
+    for line in capture_output.splitlines()[-30:]:
+        stripped = tmux_text.strip_ansi(line)
+        if "Working" in stripped and "esc to interrupt" in stripped:
+            return True
+    return False
+
+
+def normalize_tmux_inject_receipt_sidecar_decision(value: Any, *, retry_count: int, sidecar_check_count: int) -> dict[str, Any]:
+    payload = dict(value) if isinstance(value, dict) else {}
+    action = tmux_state.token_text(payload.get("action")) or "wait"
+    if action not in {"retry", "wait", "block"}:
+        action = "wait"
+    try:
+        confidence = float(payload.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    status = "awaiting_receipt" if action in {"retry", "wait"} else "receipt_blocked"
+    return {
+        "action": action,
+        "status": status,
+        "confidence": min(max(confidence, 0.0), 1.0),
+        "reason": tmux_state.one_line_text(payload.get("reason")) or "Codex sidecar receipt recovery decision",
+        "retry_count": retry_count,
+        "sidecar_check_count": sidecar_check_count,
+    }
+
+
+def codex_sdk_receipt_recheck_decision(
+    record: dict[str, Any],
+    candidate: dict[str, Any],
+    capture: dict[str, Any],
+    composer_state: dict[str, Any],
+    *,
+    retry_count: int,
+    sidecar_check_count: int,
+    timeout_seconds: float = 90.0,
+) -> dict[str, Any]:
+    sidecar = codex_sidecar_decision(
+        {
+            "task": "Judge receipt recovery for a tmux-inject wake prompt after no manager ack was observed.",
+            "allowed_actions": ["retry", "wait", "block"],
+            "workspace": record.get("workspace"),
+            "state_dir": record.get("state_dir"),
+            "manager_id": record.get("manager_id"),
+            "event_id": candidate.get("event_id"),
+            "job_id": candidate.get("job_id"),
+            "bound_pane_id": record.get("codex_pane_id"),
+            "receipt_recovery": True,
+            "retry_count": retry_count,
+            "sidecar_check_count": sidecar_check_count,
+            "max_retries": tmux_inject_receipt_retry_max(),
+            "max_sidecar_checks": tmux_inject_receipt_sidecar_check_max(),
+            "composer_state": composer_state,
+            "pane_capture_tail": receipt_sidecar_pane_capture_tail(capture, composer_state),
+            "rules": [
+                "Return JSON with action, submit_key, confidence, and reason.",
+                "Choose retry only when the prior wake prompt appears lost and the Codex pane is idle/empty.",
+                "Choose wait when Codex appears busy/working, a prompt may be queued, or the state is uncertain.",
+                "Choose block when user text or unrelated composer content is visible, or retry/check limits are reached.",
+                "If composer_state.status is placeholder_composer_suggestion, treat composer_preview as idle placeholder UI, not user text.",
+                "Never block only because placeholder text such as Explain this codebase is visible.",
+                "Never choose a different pane or suggest shell commands.",
+            ],
+        },
+        timeout_seconds=timeout_seconds,
+    )
+    if sidecar and sidecar.get("source") == "codex_sidecar":
+        decision = normalize_tmux_inject_receipt_sidecar_decision(sidecar, retry_count=retry_count, sidecar_check_count=sidecar_check_count) | {
+            "source": "codex_sidecar",
+            "sidecar_setup": sidecar.get("setup"),
+            "timing": sidecar.get("timing"),
+            "sidecar_config": sidecar.get("sidecar_config") or codex_sidecar_config(),
+            "sidecar_debug": sidecar.get("sidecar_debug"),
+        }
+        if decision.get("action") == "block" and composer_state.get("status") == "placeholder_composer_suggestion" and composer_state.get("safe_to_inject"):
+            decision = decision | {
+                "action": "wait",
+                "status": "awaiting_receipt",
+                "reason": "sidecar block overridden: composer_state is safe placeholder UI, not user text",
+                "sidecar_overridden_action": "block",
+                "sidecar_original_reason": decision.get("reason"),
+            }
+        return decision
+    return {
+        "action": "wait",
+        "status": "awaiting_receipt",
+        "confidence": 0.0,
+        "reason": "Codex sidecar receipt decision unavailable; waiting instead of retrying",
+        "retry_count": retry_count,
+        "sidecar_check_count": sidecar_check_count,
+        "source": "codex_sidecar_unavailable",
+        "sidecar": sidecar,
+        "sidecar_debug": sidecar.get("sidecar_debug") if isinstance(sidecar, dict) else None,
+    }
+
+
+def receipt_sidecar_history_entry(receipt_check: dict[str, Any], *, checked_at: str) -> dict[str, Any] | None:
+    if not debug_sidecar_trace_enabled():
+        return None
+    source = tmux_state.one_line_text(receipt_check.get("source"))
+    reason = tmux_state.one_line_text(receipt_check.get("reason"))
+    sidecar_related = source.startswith("codex_sidecar") or "sidecar" in reason.lower() or receipt_check.get("sidecar_config") is not None
+    if not sidecar_related:
+        return None
+    entry: dict[str, Any] = {
+        "checked_at": checked_at,
+        "action": tmux_state.token_text(receipt_check.get("action")) or "wait",
+        "status": tmux_state.token_text(receipt_check.get("status")) or "awaiting_receipt",
+        "reason": reason,
+        "source": source or "deterministic",
+        "confidence": receipt_check.get("confidence"),
+        "retry_count": receipt_check.get("retry_count"),
+        "sidecar_check_count": receipt_check.get("next_sidecar_check_count", receipt_check.get("sidecar_check_count")),
+    }
+    for key in ("timing", "sidecar_config", "composer_state", "sidecar_debug"):
+        if receipt_check.get(key) is not None:
+            entry[key] = receipt_check.get(key)
+    sidecar = receipt_check.get("sidecar")
+    if isinstance(sidecar, dict):
+        entry["sidecar"] = {
+            key: sidecar.get(key)
+            for key in ("source", "reason", "timing", "sidecar_config", "sidecar_debug")
+            if sidecar.get(key) is not None
+        }
+    return entry
+
+
+def append_receipt_sidecar_history(existing: dict[str, Any], receipt_check: dict[str, Any], *, checked_at: str) -> list[dict[str, Any]] | None:
+    entry = receipt_sidecar_history_entry(receipt_check, checked_at=checked_at)
+    if entry is None:
+        return None
+    history = existing.get("receipt_sidecar_history")
+    values = [dict(item) for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+    values.append(entry)
+    return values[-50:]
+
+
+def tmux_inject_receipt_recheck_decision(
+    prompt: str,
+    capture: dict[str, Any],
+    existing: dict[str, Any],
+    *,
+    record: dict[str, Any] | None = None,
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    output = str(capture.get("output") or "")
+    raw_output = str(capture.get("raw_output") or "")
+    try:
+        retry_count = int(existing.get("receipt_retry_count") or 0)
+    except (TypeError, ValueError):
+        retry_count = 0
+    try:
+        sidecar_check_count = int(existing.get("receipt_sidecar_check_count") or 0)
+    except (TypeError, ValueError):
+        sidecar_check_count = 0
+    composer_state = tmux_inject_composer_state(prompt, output, raw_output)
+    if not capture.get("captured"):
+        return {
+            "action": "wait",
+            "status": "awaiting_receipt",
+            "reason": tmux_state.one_line_text(capture.get("reason")) or "receipt recheck could not capture Codex pane",
+            "composer_state": composer_state,
+            "retry_count": retry_count,
+            "sidecar_check_count": sidecar_check_count,
+        }
+    if wake_prompt_still_staged(prompt, output):
+        return {
+            "action": "delivery_check",
+            "status": "inject_pending",
+            "reason": "wake prompt remains staged; bounded submit follow-up may be needed",
+            "composer_state": composer_state,
+            "retry_count": retry_count,
+            "sidecar_check_count": sidecar_check_count,
+        }
+    if codex_capture_indicates_working(output):
+        return {
+            "action": "wait",
+            "status": "awaiting_receipt",
+            "reason": "Codex pane appears to be working; waiting for manager ack",
+            "composer_state": composer_state,
+            "retry_count": retry_count,
+            "sidecar_check_count": sidecar_check_count,
+        }
+    if composer_state.get("safe_to_inject"):
+        retry_max = tmux_inject_receipt_retry_max()
+        if retry_count >= retry_max:
+            return {
+                "action": "block",
+                "status": "receipt_blocked",
+                "reason": f"receipt retry limit reached ({retry_max})",
+                "composer_state": composer_state,
+                "retry_count": retry_count,
+                "sidecar_check_count": sidecar_check_count,
+            }
+        sidecar_max = tmux_inject_receipt_sidecar_check_max()
+        if sidecar_check_count >= sidecar_max:
+            return {
+                "action": "block",
+                "status": "receipt_blocked",
+                "reason": f"receipt sidecar check limit reached ({sidecar_max})",
+                "composer_state": composer_state,
+                "retry_count": retry_count,
+                "sidecar_check_count": sidecar_check_count,
+            }
+        if record is None or candidate is None:
+            return {
+                "action": "wait",
+                "status": "awaiting_receipt",
+                "reason": "receipt recovery requires Codex sidecar context before retrying",
+                "composer_state": composer_state,
+                "retry_count": retry_count,
+                "sidecar_check_count": sidecar_check_count,
+                "next_sidecar_check_count": sidecar_check_count + 1,
+            }
+        sidecar_decision = codex_sdk_receipt_recheck_decision(
+            record,
+            candidate,
+            capture,
+            composer_state,
+            retry_count=retry_count,
+            sidecar_check_count=sidecar_check_count + 1,
+        )
+        result = sidecar_decision | {
+            "composer_state": composer_state,
+            "retry_count": retry_count,
+            "sidecar_check_count": sidecar_check_count,
+            "next_sidecar_check_count": sidecar_check_count + 1,
+        }
+        if result.get("action") == "retry":
+            result["next_retry_count"] = retry_count + 1
+        return result
+    return {
+        "action": "block",
+        "status": "receipt_blocked",
+        "reason": tmux_state.one_line_text(composer_state.get("reason")) or "Codex composer is not safe for receipt retry",
+        "composer_state": composer_state,
+        "retry_count": retry_count,
+        "sidecar_check_count": sidecar_check_count,
+    }
 
 
 def pending_followup_decision(reason: str, *, prompt: str, capture_output: str, source: str) -> dict[str, Any]:
@@ -650,7 +1149,7 @@ def bridge_receipt_verified(record: dict[str, Any]) -> tuple[bool, str | None]:
 
 def terminal_event_acknowledged(record: dict[str, Any]) -> tuple[bool, str | None]:
     notify = record.get("notify") if isinstance(record.get("notify"), dict) else {"mode": "none"}
-    if notify.get("mode") != "bridge":
+    if notify.get("mode") not in {"bridge", "tmux-inject"}:
         return True, None
     event_ids = unacknowledged_terminal_event_ids(record)
     if not event_ids and record.get("status") != "waiting_for_codex":
@@ -1846,6 +2345,30 @@ def codex_sdk_inject_decision(
             },
             bound_pane_id,
         ) | {"source": "env"}
+    if codex_sidecar_fast_path_enabled():
+        if not bound_pane_id:
+            return {
+                "decision": "refuse",
+                "target_pane": bound_pane_id,
+                "confidence": 1.0,
+                "reason": "tmux-inject has no bound Codex pane",
+                "source": "deterministic_fast_path",
+            }
+        if not validation.get("safe"):
+            return {
+                "decision": "refuse",
+                "target_pane": bound_pane_id,
+                "confidence": 1.0,
+                "reason": tmux_state.one_line_text(validation.get("reason")) or "Codex pane validation failed",
+                "source": "deterministic_fast_path",
+            }
+        return {
+            "decision": "inject",
+            "target_pane": bound_pane_id,
+            "confidence": 1.0,
+            "reason": "deterministic fast path allows injection into the bound Codex pane",
+            "source": "deterministic_fast_path",
+        }
     sidecar = codex_sidecar_decision(
         {
             "task": "Decide whether tmux-skills may inject a wake prompt into the bound Codex pane.",
@@ -1865,7 +2388,12 @@ def codex_sdk_inject_decision(
         timeout_seconds=timeout_seconds,
     )
     if sidecar and sidecar.get("source") == "codex_sidecar":
-        return normalize_tmux_inject_sdk_decision(sidecar, bound_pane_id) | {"source": "codex_sidecar", "sidecar_setup": sidecar.get("setup")}
+        return normalize_tmux_inject_sdk_decision(sidecar, bound_pane_id) | {
+            "source": "codex_sidecar",
+            "sidecar_setup": sidecar.get("setup"),
+            "timing": sidecar.get("timing"),
+            "sidecar_config": sidecar.get("sidecar_config") or codex_sidecar_config(),
+        }
     if not bound_pane_id:
         return {
             "decision": "refuse",
@@ -1901,26 +2429,37 @@ def build_tmux_inject_wake_prompt(record: dict[str, Any], candidate: dict[str, A
     )
 
 
-def capture_tmux_pane_text(pane_id: str, *, lines: int = 80, max_chars: int = 12000) -> dict[str, Any]:
+def capture_tmux_pane_text(
+    pane_id: str,
+    *,
+    lines: int = TMUX_INJECT_CAPTURE_LINES,
+    max_chars: int = TMUX_INJECT_CAPTURE_MAX_CHARS,
+) -> dict[str, Any]:
     target = tmux_state.one_line_text(pane_id)
     if not target:
         return {"captured": False, "reason": "pane id is blank", "output": ""}
     proc = subprocess.run(
-        [*tmux_command_prefix(), "capture-pane", "-p", "-t", target, "-S", f"-{max(1, lines)}"],
+        [*tmux_command_prefix(), "capture-pane", "-p", "-e", "-t", target, "-S", f"-{max(1, lines)}"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
     )
-    output = proc.stdout if proc.returncode == 0 else ""
+    raw_output = proc.stdout if proc.returncode == 0 else ""
+    output = tmux_text.strip_ansi(raw_output)
     omitted = max(0, len(output) - max_chars)
     if omitted:
         output = output[-max_chars:]
+    raw_omitted = max(0, len(raw_output) - max_chars * 4)
+    if raw_omitted:
+        raw_output = raw_output[-max_chars * 4 :]
     return {
         "captured": proc.returncode == 0,
         "returncode": proc.returncode,
         "output": output,
+        "raw_output": raw_output,
         "omitted_chars": omitted,
+        "raw_omitted_chars": raw_omitted,
         "reason": None if proc.returncode == 0 else (proc.stderr.strip() or f"tmux capture-pane exited {proc.returncode}"),
     }
 
@@ -1929,19 +2468,159 @@ def latest_staged_wake_prompt_block(prompt: str, capture_output: str) -> str:
     if not prompt or not capture_output:
         return ""
     tail_lines = capture_output.splitlines()[-30:]
-    first_line = prompt.splitlines()[0]
+    prompt_lines = prompt.splitlines()
+    first_line = prompt_lines[0] if prompt_lines else ""
+    manager_line = next((line.strip() for line in prompt_lines if line.strip().startswith("Manager ID:")), "")
+    event_line = next((line.strip() for line in prompt_lines if line.strip().startswith("Event ID:")), "")
     for index in range(len(tail_lines) - 1, -1, -1):
         if first_line in tail_lines[index]:
             block = "\n".join(tail_lines[index:])
-            if "Manager ID:" in block and "Event ID:" in block:
+            if manager_line and manager_line not in block:
+                continue
+            if event_line and event_line not in block:
+                continue
+            if "Manager ID:" in block and "Event ID:" in block and codex_composer_block_is_active(block):
                 return block
     return ""
 
 
+def codex_composer_footer_line(line: str) -> bool:
+    text = tmux_text.strip_ansi(line).strip()
+    if not text:
+        return False
+    return (
+        "queue message" in text
+        or "submit message" in text
+        or "to submit" in text
+        or ("Context" in text and "left" in text)
+    )
+
+
+def codex_composer_block_is_active(block: str) -> bool:
+    if not block:
+        return False
+    lines = block.splitlines()
+    if not lines or not tmux_text.strip_ansi(lines[0]).lstrip().startswith("›"):
+        return False
+    for line in lines[1:]:
+        stripped = tmux_text.strip_ansi(line).lstrip()
+        if codex_composer_footer_line(stripped):
+            return True
+        if not stripped:
+            continue
+        if stripped.startswith(("•", "└", "│", "├", "┌")):
+            return False
+        if stripped and set(stripped) <= {"─"}:
+            return False
+        if stripped.startswith("›"):
+            return False
+    return False
+
+
+def codex_composer_block_content(block: str) -> str:
+    if not block:
+        return ""
+    first = tmux_text.strip_ansi(block.splitlines()[0]).lstrip()
+    return first[1:].strip() if first.startswith("›") else first.strip()
+
+
+def codex_composer_block_is_placeholder(block: str) -> bool:
+    content = codex_composer_block_content(block)
+    if not content:
+        return False
+    first = block.splitlines()[0]
+    if "›" not in tmux_text.strip_ansi(first):
+        return False
+    prompt_index = first.find("›")
+    after_prompt = first[prompt_index + 1 :] if prompt_index >= 0 else first
+    return "\x1b[2m" in after_prompt and content in {"Explain this codebase"}
+
+
+def latest_codex_composer_block(capture_output: str) -> str:
+    if not capture_output:
+        return ""
+    tail_lines = capture_output.splitlines()[-30:]
+    for index in range(len(tail_lines) - 1, -1, -1):
+        if tmux_text.strip_ansi(tail_lines[index]).lstrip().startswith("›"):
+            block = "\n".join(tail_lines[index:])
+            if codex_composer_block_is_active(block):
+                return block
+    return ""
+
+
+def tmux_inject_composer_state(prompt: str, capture_output: str, raw_capture_output: str | None = None) -> dict[str, Any]:
+    block = latest_codex_composer_block(capture_output)
+    raw_block = latest_codex_composer_block(raw_capture_output or "")
+    staged_block = latest_staged_wake_prompt_block(prompt, capture_output)
+    if staged_block:
+        return {
+            "status": "manager_wake_prompt_staged",
+            "safe_to_inject": False,
+            "safe_to_submit": True,
+            "prompt_still_staged": wake_prompt_still_staged(prompt, capture_output),
+            "reason": "manager wake prompt is staged in the Codex composer",
+        }
+    if not block:
+        return {
+            "status": "no_composer_text_detected",
+            "safe_to_inject": True,
+            "safe_to_submit": False,
+            "prompt_still_staged": False,
+            "reason": "no Codex composer text detected in bounded capture",
+        }
+    content = codex_composer_block_content(block)
+    if not content:
+        return {
+            "status": "empty_composer",
+            "safe_to_inject": True,
+            "safe_to_submit": False,
+            "prompt_still_staged": False,
+            "reason": "Codex composer appears empty",
+        }
+    if raw_block and codex_composer_block_is_placeholder(raw_block):
+        return {
+            "status": "placeholder_composer_suggestion",
+            "safe_to_inject": True,
+            "safe_to_submit": False,
+            "prompt_still_staged": False,
+            "reason": "Codex composer shows a placeholder suggestion, not user-entered text",
+            "composer_preview": content[:120],
+        }
+    if content.startswith("tmux-skills event ready"):
+        return {
+            "status": "other_wake_prompt_staged",
+            "safe_to_inject": False,
+            "safe_to_submit": False,
+            "prompt_still_staged": False,
+            "reason": "a different tmux-skills wake prompt is already staged",
+            "composer_preview": content[:120],
+        }
+    return {
+        "status": "composer_text_present",
+        "safe_to_inject": False,
+        "safe_to_submit": False,
+        "prompt_still_staged": False,
+        "reason": "Codex composer contains text that was not written by tmux-skills",
+        "composer_preview": content[:120],
+    }
+
+
+def receipt_sidecar_pane_capture_tail(capture: dict[str, Any], composer_state: dict[str, Any], *, max_lines: int = 15, max_chars: int = 1200) -> str:
+    output = str(capture.get("output") or "")
+    if composer_state.get("status") != "placeholder_composer_suggestion":
+        return "\n".join(output.splitlines()[-max_lines:])[-max_chars:]
+    block = latest_codex_composer_block(output)
+    sanitized = output
+    if block and block in sanitized:
+        sanitized = sanitized.rsplit(block, 1)[0].rstrip()
+    marker = "[Codex composer placeholder suggestion omitted by tmux-skills; pane is idle/safe placeholder UI.]"
+    sanitized = f"{sanitized}\n{marker}".strip()
+    return "\n".join(sanitized.splitlines()[-max_lines:])[-max_chars:]
+
+
 def wake_prompt_still_staged(prompt: str, capture_output: str) -> bool:
     block = latest_staged_wake_prompt_block(prompt, capture_output)
-    footer_hint = "queue message" in block or "to submit message" in block or "Context" in block
-    return bool(block and footer_hint)
+    return bool(block and codex_composer_block_is_active(block))
 
 
 def default_tmux_inject_followup_submit_key(prompt: str, capture_output: str) -> str:
@@ -1954,10 +2633,14 @@ def default_tmux_inject_followup_submit_key(prompt: str, capture_output: str) ->
 def normalize_tmux_inject_followup_decision(value: Any, *, prompt: str, capture_output: str) -> dict[str, Any]:
     payload = dict(value) if isinstance(value, dict) else {}
     raw_action = tmux_state.token_text(payload.get("action")) or ""
-    staged = wake_prompt_still_staged(prompt, capture_output)
+    composer_state = tmux_inject_composer_state(prompt, capture_output)
+    staged = bool(composer_state.get("prompt_still_staged"))
     submit_key = tmux_state.one_line_text(payload.get("submit_key")) or default_tmux_inject_followup_submit_key(prompt, capture_output)
     reason = tmux_state.one_line_text(payload.get("reason")) or "heuristic post-injection decision"
-    if staged:
+    if composer_state.get("status") in {"composer_text_present", "other_wake_prompt_staged"}:
+        action = "defer"
+        reason = tmux_state.one_line_text(composer_state.get("reason")) or reason
+    elif staged:
         action = "submit"
         if raw_action == "confirmed":
             reason = f"{reason}; deterministic staged prompt override"
@@ -2000,13 +2683,31 @@ def codex_sdk_inject_followup_decision(
             prompt=prompt,
             capture_output=output,
         ) | {"source": "env"}
+    composer_state = tmux_inject_composer_state(prompt, output, str(capture.get("raw_output") or ""))
+    if composer_state.get("status") in {"composer_text_present", "other_wake_prompt_staged"}:
+        return {
+            "action": "defer",
+            "submit_key": TMUX_INJECT_FOLLOWUP_SUBMIT_KEY,
+            "confidence": 1.0,
+            "reason": tmux_state.one_line_text(composer_state.get("reason")) or "unsafe Codex composer state",
+            "source": "deterministic",
+            "composer_state": composer_state,
+        }
     if wake_prompt_still_staged(prompt, output):
         return pending_followup_decision(
             "deterministic staged prompt requires immediate bounded follow-up",
             prompt=prompt,
             capture_output=output,
             source="deterministic",
-        ) | {"sidecar_skipped": "staged prompt cannot wait for SDK confirmation"}
+        ) | {"sidecar_skipped": "staged prompt cannot wait for SDK confirmation", "composer_state": composer_state}
+    if codex_sidecar_fast_path_enabled():
+        return {
+            "action": "confirmed",
+            "submit_key": TMUX_INJECT_FOLLOWUP_SUBMIT_KEY,
+            "confidence": 0.9,
+            "reason": "deterministic fast path confirms the wake prompt is no longer staged",
+            "source": "deterministic_fast_path",
+        }
     sidecar = codex_sidecar_decision(
         {
             "task": "Decide whether a tmux-inject wake prompt was submitted to Codex or remains staged in the composer.",
@@ -2021,16 +2722,21 @@ def codex_sdk_inject_followup_decision(
             "pane_capture_tail": output[-6000:],
             "rules": [
                 "Return JSON with action, submit_key, confidence, and reason.",
-                "Choose submit only if the wake prompt remains in the Codex composer/input area.",
+                "Choose submit only if the wake prompt remains in the Codex composer/input area and no unrelated text is visible.",
                 "Use submit_key Tab when the composer footer says queue message.",
-                "Choose confirmed if the prompt is no longer staged.",
+                "Choose defer when user text, a different prompt, or unknown staged content is visible.",
+                "Choose confirmed if the prompt is no longer staged and no unrelated composer text is visible.",
                 "Never choose a different pane or describe shell commands.",
             ],
         },
         timeout_seconds=timeout_seconds,
     )
     if sidecar and sidecar.get("source") == "codex_sidecar":
-        return normalize_tmux_inject_followup_decision(sidecar, prompt=prompt, capture_output=output) | {"source": "codex_sidecar", "sidecar_setup": sidecar.get("setup")}
+        return normalize_tmux_inject_followup_decision(sidecar, prompt=prompt, capture_output=output) | {
+            "source": "codex_sidecar",
+            "sidecar_setup": sidecar.get("setup"),
+            "timing": sidecar.get("timing"),
+        }
     result = pending_followup_decision(
         "deterministic pane inspection after tmux-inject delivery",
         prompt=prompt,
@@ -2086,6 +2792,8 @@ def codex_sdk_terminal_event_assessment(
     *,
     timeout_seconds: float = 90.0,
 ) -> dict[str, Any]:
+    if codex_sidecar_fast_path_enabled() and tmux_state.token_text(candidate.get("status")) in MANAGER_TERMINAL_JOB_STATUSES:
+        return deterministic_terminal_event_assessment(candidate)
     sidecar = codex_sidecar_decision(
         {
             "task": "Assess a tmux-skills terminal event and recommend whether main Codex should inspect it.",
@@ -2107,7 +2815,12 @@ def codex_sdk_terminal_event_assessment(
         timeout_seconds=timeout_seconds,
     )
     if sidecar and sidecar.get("source") == "codex_sidecar":
-        return normalize_terminal_event_assessment(sidecar, candidate=candidate) | {"source": "codex_sidecar", "sidecar_setup": sidecar.get("setup")}
+        return normalize_terminal_event_assessment(sidecar, candidate=candidate) | {
+            "source": "codex_sidecar",
+            "sidecar_setup": sidecar.get("setup"),
+            "timing": sidecar.get("timing"),
+            "sidecar_config": sidecar.get("sidecar_config") or codex_sidecar_config(),
+        }
     return deterministic_terminal_event_assessment(candidate, sidecar=sidecar)
 
 
@@ -2132,10 +2845,40 @@ def send_tmux_submit_key(pane_id: str, submit_key: str) -> dict[str, Any]:
 
 
 def inject_tmux_wake_prompt(pane_id: str, prompt: str) -> dict[str, Any]:
+    total_start = monotonic_ms()
     target = tmux_state.one_line_text(pane_id)
     if not target:
-        return {"injected": False, "pasted": False, "entered": False, "reason": "pane id is blank"}
+        return {"injected": False, "pasted": False, "entered": False, "reason": "pane id is blank", "timing": {"total": timing_entry(total_start)}}
+    preflight_start = monotonic_ms()
+    preflight_capture = capture_tmux_pane_text(target)
+    preflight_state = tmux_inject_composer_state(
+        prompt,
+        str(preflight_capture.get("output") or ""),
+        str(preflight_capture.get("raw_output") or ""),
+    )
+    preflight_timing = timing_entry(preflight_start, captured=preflight_capture.get("captured"), status=preflight_state.get("status"))
+    if (not preflight_capture.get("captured")) or not preflight_state.get("safe_to_inject"):
+        reason = (
+            tmux_state.one_line_text(preflight_capture.get("reason"))
+            if not preflight_capture.get("captured")
+            else tmux_state.one_line_text(preflight_state.get("reason"))
+        )
+        return {
+            "injected": False,
+            "pasted": False,
+            "entered": False,
+            "reason": reason or "Codex composer is not safe for tmux-inject",
+            "preflight": {
+                "captured": preflight_capture.get("captured"),
+                "returncode": preflight_capture.get("returncode"),
+                "omitted_chars": preflight_capture.get("omitted_chars"),
+                "composer_state": preflight_state,
+                "reason": preflight_capture.get("reason"),
+            },
+            "timing": {"preflight_capture": preflight_timing, "total": timing_entry(total_start)},
+        }
     buffer_name = "tmux-skills-" + hashlib.sha256(f"{target}\n{prompt}".encode("utf-8")).hexdigest()[:16]
+    load_start = monotonic_ms()
     load = subprocess.run(
         [*tmux_command_prefix(), "load-buffer", "-b", buffer_name, "-"],
         input=prompt,
@@ -2144,6 +2887,7 @@ def inject_tmux_wake_prompt(pane_id: str, prompt: str) -> dict[str, Any]:
         stderr=subprocess.PIPE,
         check=False,
     )
+    load_timing = timing_entry(load_start, returncode=load.returncode)
     if load.returncode != 0:
         return {
             "injected": False,
@@ -2151,7 +2895,16 @@ def inject_tmux_wake_prompt(pane_id: str, prompt: str) -> dict[str, Any]:
             "entered": False,
             "reason": load.stderr.strip() or "tmux load-buffer failed",
             "load_returncode": load.returncode,
+            "preflight": {
+                "captured": preflight_capture.get("captured"),
+                "returncode": preflight_capture.get("returncode"),
+                "omitted_chars": preflight_capture.get("omitted_chars"),
+                "composer_state": preflight_state,
+                "reason": preflight_capture.get("reason"),
+            },
+            "timing": {"preflight_capture": preflight_timing, "load_buffer": load_timing, "total": timing_entry(total_start)},
         }
+    paste_start = monotonic_ms()
     paste = subprocess.run(
         [*tmux_command_prefix(), "paste-buffer", "-b", buffer_name, "-t", target],
         text=True,
@@ -2159,8 +2912,11 @@ def inject_tmux_wake_prompt(pane_id: str, prompt: str) -> dict[str, Any]:
         stderr=subprocess.PIPE,
         check=False,
     )
+    paste_timing = timing_entry(paste_start, returncode=paste.returncode)
     pasted = paste.returncode == 0
+    submit_start = monotonic_ms()
     submit = send_tmux_submit_key(target, TMUX_INJECT_PRIMARY_SUBMIT_KEY) if pasted else None
+    submit_timing = timing_entry(submit_start, returncode=submit.get("returncode") if submit else None, sent=submit.get("sent") if submit else None)
     subprocess.run([*tmux_command_prefix(), "delete-buffer", "-b", buffer_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     submitted = bool(submit and submit.get("sent"))
     result = {
@@ -2171,6 +2927,20 @@ def inject_tmux_wake_prompt(pane_id: str, prompt: str) -> dict[str, Any]:
         "paste_returncode": paste.returncode,
         "enter_returncode": submit.get("returncode") if submit else None,
         "submit_returncode": submit.get("returncode") if submit else None,
+        "preflight": {
+            "captured": preflight_capture.get("captured"),
+            "returncode": preflight_capture.get("returncode"),
+            "omitted_chars": preflight_capture.get("omitted_chars"),
+            "composer_state": preflight_state,
+            "reason": preflight_capture.get("reason"),
+        },
+        "timing": {
+            "preflight_capture": preflight_timing,
+            "load_buffer": load_timing,
+            "paste_buffer": paste_timing,
+            "submit_key": submit_timing,
+            "total": timing_entry(total_start),
+        },
     }
     if not pasted:
         result["reason"] = paste.stderr.strip() or "tmux paste-buffer failed"
@@ -2186,16 +2956,27 @@ def verify_tmux_inject_delivery(
     injection: dict[str, Any],
     prompt: str,
 ) -> dict[str, Any]:
+    total_start = monotonic_ms()
     pane_id = tmux_state.one_line_text(record.get("codex_pane_id"))
     time.sleep(0.5)
+    capture_start = monotonic_ms()
     before = capture_tmux_pane_text(pane_id)
+    capture_before_timing = timing_entry(capture_start, lines=TMUX_INJECT_CAPTURE_LINES, max_chars=TMUX_INJECT_CAPTURE_MAX_CHARS)
+    decision_start = monotonic_ms()
     decision = codex_sdk_inject_followup_decision(record, candidate, validation, injection, before, prompt)
+    decision_timing = timing_entry(decision_start, source=decision.get("source"))
     followup: dict[str, Any] | None = None
+    followup_timing: dict[str, Any] | None = None
     after: dict[str, Any] | None = None
+    capture_after_timing: dict[str, Any] | None = None
     if decision.get("action") == "submit":
+        followup_start = monotonic_ms()
         followup = send_tmux_submit_key(pane_id, str(decision.get("submit_key") or TMUX_INJECT_FOLLOWUP_SUBMIT_KEY))
+        followup_timing = timing_entry(followup_start, submit_key=followup.get("submit_key"), sent=followup.get("sent"))
         time.sleep(0.5)
+        capture_after_start = monotonic_ms()
         after = capture_tmux_pane_text(pane_id)
+        capture_after_timing = timing_entry(capture_after_start, lines=TMUX_INJECT_CAPTURE_LINES, max_chars=TMUX_INJECT_CAPTURE_MAX_CHARS)
     final_capture = after or before
     final_output = str(final_capture.get("output") or "")
     return {
@@ -2220,7 +3001,29 @@ def verify_tmux_inject_delivery(
             "reason": after.get("reason"),
         },
         "prompt_still_staged": wake_prompt_still_staged(prompt, final_output),
+        "timing": {
+            "capture_before": capture_before_timing,
+            "decision": decision_timing,
+            "followup": followup_timing,
+            "capture_after": capture_after_timing,
+            "total": timing_entry(total_start),
+        },
     }
+
+
+def tmux_inject_status_after_delivery(delivery_check: dict[str, Any] | None, injection: dict[str, Any] | None) -> tuple[str, str | None]:
+    delivery = delivery_check if isinstance(delivery_check, dict) else {}
+    decision = delivery.get("decision") if isinstance(delivery.get("decision"), dict) else {}
+    inject_result = injection if isinstance(injection, dict) else {}
+    if delivery.get("prompt_still_staged"):
+        return "inject_pending", "tmux-inject wake prompt is still staged in the Codex composer after submit attempts"
+    if decision.get("action") == "defer":
+        return "receipt_blocked", str(decision.get("reason") or "tmux-inject delivery awaits Codex ack")
+    if decision.get("action") == "refuse":
+        return "inject_refused", str(decision.get("reason") or "Codex SDK follow-up refused tmux-inject delivery")
+    if inject_result.get("injected"):
+        return "awaiting_receipt", "tmux-inject wake prompt delivered; waiting for manager ack"
+    return "inject_pending", str(inject_result.get("reason") or "tmux injection did not complete prompt submission")
 
 
 def send_worker_interrupt(pane_id: str | None) -> dict[str, Any]:
@@ -2377,7 +3180,9 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
     event_id = str(candidate["event_id"])
     submitted = list(record.get("submitted_event_ids") or [])
     notify = record.get("notify") if isinstance(record.get("notify"), dict) else {"mode": "none"}
+    notify_start = monotonic_ms()
     now = tmux_state.utc_now()
+    notification_timing: dict[str, Any] = {}
     existing = notification_for_event(record, event_id) or {}
     if event_id in submitted and not (
         notify.get("mode") == "tmux-inject"
@@ -2387,7 +3192,13 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
         return record
     terminal_assessment = existing.get("terminal_assessment") if isinstance(existing.get("terminal_assessment"), dict) else None
     if terminal_assessment is None:
+        assessment_start = monotonic_ms()
         terminal_assessment = codex_sdk_terminal_event_assessment(record, candidate)
+        notification_timing["terminal_assessment"] = timing_entry(assessment_start, source=terminal_assessment.get("source"))
+        if isinstance(terminal_assessment.get("timing"), dict):
+            notification_timing["terminal_assessment_sidecar"] = terminal_assessment.get("timing")
+    else:
+        notification_timing["terminal_assessment"] = {"reused": True}
     base = {
         "event_id": event_id,
         "source": candidate.get("source"),
@@ -2400,8 +3211,10 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
         "observed_at": existing.get("observed_at") or now,
         "acknowledged_by_codex": bool(existing.get("acknowledged_by_codex")),
         "terminal_assessment": terminal_assessment,
+        "timing": notification_timing,
     }
     if notify.get("mode") == "none":
+        notification_timing["total"] = timing_entry(notify_start)
         record = upsert_notification(
             record,
             event_id,
@@ -2422,29 +3235,96 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
         bound_pane_id = tmux_state.one_line_text(record.get("codex_pane_id") or notify.get("codex_pane_id") or notify.get("codex_pane"))
         record["codex_pane_id"] = bound_pane_id
         prompt = build_tmux_inject_wake_prompt(record, candidate)
+        coalesced_by_event_id = pending_tmux_inject_wake_event_id(record, event_id)
+        if coalesced_by_event_id and not existing.get("submitted_to_tmux"):
+            reason = f"tmux-inject wake prompt already pending for event {coalesced_by_event_id}"
+            notification_timing["total"] = timing_entry(notify_start)
+            record = upsert_notification(
+                record,
+                event_id,
+                base
+                | {
+                    "mode": "tmux-inject",
+                    "status": "coalesced",
+                    "submit_attempted_at": now,
+                    "submitted_to_app_server": False,
+                    "submitted_to_tmux": False,
+                    "injected_to_tmux": False,
+                    "codex_pane_id": bound_pane_id,
+                    "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                    "coalesced_by_event_id": coalesced_by_event_id,
+                    "reason": reason,
+                },
+            )
+            events = dict(record.get("events") or {})
+            event = dict(events.get(event_id) or {})
+            events[event_id] = event | {
+                "event_id": event_id,
+                "notification_status": "coalesced",
+                "submitted_to_app_server": False,
+                "submitted_to_tmux": False,
+                "injected_to_tmux": False,
+                "codex_pane_id": bound_pane_id,
+                "coalesced_by_event_id": coalesced_by_event_id,
+                "last_error": reason,
+            }
+            record["events"] = events
+            return record
+        validation_start = monotonic_ms()
         validation = pane_codex_validation(bound_pane_id)
+        notification_timing["pane_validation"] = timing_entry(validation_start, safe=validation.get("safe"), status=validation.get("status"))
         if (
             existing.get("mode") == "tmux-inject"
-            and existing.get("status") in {"inject_pending", "injected"}
+            and existing.get("status") in {"awaiting_receipt", "inject_pending", "injected", "receipt_blocked"}
             and existing.get("submitted_to_tmux")
             and bound_pane_id
             and validation.get("safe")
         ):
             injection = dict(existing.get("injection") or {"pasted": True, "injected": False})
-            delivery_check = verify_tmux_inject_delivery(record, candidate, validation, injection, prompt)
-            decision = delivery_check.get("decision") if isinstance(delivery_check.get("decision"), dict) else {}
-            if delivery_check.get("prompt_still_staged"):
-                status = "inject_pending"
-                reason = "tmux-inject wake prompt is still staged in the Codex composer after submit attempts"
-            elif decision.get("action") == "defer":
-                status = "inject_pending"
-                reason = str(decision.get("reason") or "tmux-inject delivery awaits Codex ack")
-            elif decision.get("action") == "refuse":
-                status = "inject_refused"
-                reason = str(decision.get("reason") or "Codex SDK follow-up refused tmux-inject delivery")
+            delivery_check: dict[str, Any] | None = None
+            receipt_check: dict[str, Any] | None = None
+            status = "awaiting_receipt"
+            reason: str | None = "tmux-inject wake prompt delivered; waiting for manager ack"
+            if existing.get("status") == "inject_pending":
+                delivery_start = monotonic_ms()
+                delivery_check = verify_tmux_inject_delivery(record, candidate, validation, injection, prompt)
+                notification_timing["delivery_check"] = timing_entry(delivery_start)
+                if isinstance(delivery_check.get("timing"), dict):
+                    notification_timing["delivery_check_detail"] = delivery_check.get("timing")
+                status, reason = tmux_inject_status_after_delivery(delivery_check, injection)
             else:
-                status = "injected"
-                reason = None
+                receipt_start = monotonic_ms()
+                receipt_capture = capture_tmux_pane_text(bound_pane_id)
+                receipt_check = tmux_inject_receipt_recheck_decision(prompt, receipt_capture, existing, record=record, candidate=candidate)
+                notification_timing["receipt_check"] = timing_entry(receipt_start, action=receipt_check.get("action"), status=receipt_check.get("status"))
+                action = receipt_check.get("action")
+                if action == "delivery_check":
+                    delivery_start = monotonic_ms()
+                    delivery_check = verify_tmux_inject_delivery(record, candidate, validation, injection, prompt)
+                    notification_timing["delivery_check"] = timing_entry(delivery_start)
+                    if isinstance(delivery_check.get("timing"), dict):
+                        notification_timing["delivery_check_detail"] = delivery_check.get("timing")
+                    status, reason = tmux_inject_status_after_delivery(delivery_check, injection)
+                elif action == "retry":
+                    injection_start = monotonic_ms()
+                    injection = inject_tmux_wake_prompt(bound_pane_id, prompt)
+                    notification_timing["prompt_injection"] = timing_entry(injection_start, pasted=injection.get("pasted"), injected=injection.get("injected"), receipt_retry=True)
+                    if isinstance(injection.get("timing"), dict):
+                        notification_timing["prompt_injection_detail"] = injection.get("timing")
+                    if injection.get("pasted"):
+                        delivery_start = monotonic_ms()
+                        delivery_check = verify_tmux_inject_delivery(record, candidate, validation, injection, prompt)
+                        notification_timing["delivery_check"] = timing_entry(delivery_start)
+                        if isinstance(delivery_check.get("timing"), dict):
+                            notification_timing["delivery_check_detail"] = delivery_check.get("timing")
+                        status, reason = tmux_inject_status_after_delivery(delivery_check, injection)
+                    else:
+                        status = "inject_pending"
+                        reason = str(injection.get("reason") or "tmux receipt retry did not paste prompt")
+                else:
+                    status = str(receipt_check.get("status") or "awaiting_receipt")
+                    reason = str(receipt_check.get("reason") or "tmux-inject delivery awaits Codex ack")
+            notification_timing["total"] = timing_entry(notify_start)
             fields = base | {
                 "mode": "tmux-inject",
                 "status": status,
@@ -2457,12 +3337,27 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
                 "pane_validation": validation,
                 "sdk_decision": existing.get("sdk_decision"),
                 "injection": injection,
-                "delivery_check": delivery_check,
+                "receipt_retry_count": (receipt_check or {}).get("next_retry_count", existing.get("receipt_retry_count") or 0),
+                "receipt_sidecar_check_count": (receipt_check or {}).get("next_sidecar_check_count", existing.get("receipt_sidecar_check_count") or 0),
             }
+            if delivery_check is not None:
+                fields["delivery_check"] = delivery_check
+            if receipt_check is not None:
+                fields["receipt_check"] = receipt_check
+                receipt_sidecar_history = append_receipt_sidecar_history(existing, receipt_check, checked_at=now)
+                if receipt_sidecar_history is not None:
+                    fields["receipt_sidecar_history"] = receipt_sidecar_history
+                    fields["receipt_debug_summary"] = (
+                        f"sidecar checks={receipt_check.get('next_sidecar_check_count', receipt_check.get('sidecar_check_count'))}; "
+                        f"last action={receipt_check.get('action')}; reason={tmux_state.one_line_text(receipt_check.get('reason'))}"
+                    )
             if existing.get("submitted_at"):
                 fields["submitted_at"] = existing.get("submitted_at")
             if existing.get("injected_at"):
                 fields["injected_at"] = existing.get("injected_at")
+            if receipt_check and receipt_check.get("action") == "retry" and injection.get("pasted"):
+                fields["submitted_at"] = now
+                fields["injected_at"] = now
             if reason:
                 fields["reason"] = reason
             record = upsert_notification(record, event_id, fields)
@@ -2481,7 +3376,11 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
             }
             record["events"] = events
             return record
+        sdk_start = monotonic_ms()
         sdk_decision = codex_sdk_inject_decision(record, candidate, validation)
+        notification_timing["inject_decision"] = timing_entry(sdk_start, source=sdk_decision.get("source"), decision=sdk_decision.get("decision"))
+        if isinstance(sdk_decision.get("timing"), dict):
+            notification_timing["inject_decision_sidecar"] = sdk_decision.get("timing")
         status = "inject_pending"
         refused_reason = None
         injection: dict[str, Any] | None = None
@@ -2503,29 +3402,25 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
             status = "inject_refused"
             refused_reason = "tmux-inject planner selected a pane different from the bound Codex pane"
         elif sdk_decision.get("decision") == "inject":
+            injection_start = monotonic_ms()
             injection = inject_tmux_wake_prompt(bound_pane_id, prompt)
+            notification_timing["prompt_injection"] = timing_entry(injection_start, pasted=injection.get("pasted"), injected=injection.get("injected"))
+            if isinstance(injection.get("timing"), dict):
+                notification_timing["prompt_injection_detail"] = injection.get("timing")
             if injection.get("pasted"):
+                delivery_start = monotonic_ms()
                 delivery_check = verify_tmux_inject_delivery(record, candidate, validation, injection, prompt)
-                delivery_decision = delivery_check.get("decision") if isinstance(delivery_check.get("decision"), dict) else {}
-                if delivery_check.get("prompt_still_staged"):
-                    status = "inject_pending"
-                    refused_reason = "tmux-inject wake prompt is still staged in the Codex composer after submit attempts"
-                elif delivery_decision.get("action") == "defer":
-                    status = "inject_pending"
-                    refused_reason = str(delivery_decision.get("reason") or "tmux-inject delivery awaits Codex ack")
-                elif delivery_decision.get("action") == "refuse":
-                    status = "inject_refused"
-                    refused_reason = str(delivery_decision.get("reason") or "Codex SDK follow-up refused tmux-inject delivery")
-                elif injection.get("injected"):
-                    status = "injected"
-                else:
-                    status = "inject_pending"
+                notification_timing["delivery_check"] = timing_entry(delivery_start)
+                if isinstance(delivery_check.get("timing"), dict):
+                    notification_timing["delivery_check_detail"] = delivery_check.get("timing")
+                status, refused_reason = tmux_inject_status_after_delivery(delivery_check, injection)
             else:
                 status = "inject_pending"
                 refused_reason = str(injection.get("reason") or "tmux injection did not paste prompt")
         else:
             status = "inject_pending"
             refused_reason = str(sdk_decision.get("reason") or "tmux-inject planner deferred injection")
+        notification_timing["total"] = timing_entry(notify_start)
         fields = base | {
             "mode": "tmux-inject",
             "status": status,

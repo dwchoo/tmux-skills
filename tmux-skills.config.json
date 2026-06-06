@@ -1,0 +1,17 @@
+{
+  "codex_sidecar": {
+    "enabled": true,
+    "model": "gpt-5.5",
+    "reasoning_effort": "low",
+    "deterministic_fast_path": true
+  },
+  "debug": {
+    "sidecar_trace": true,
+    "sidecar_payload": false
+  },
+  "tmux_inject_receipt": {
+    "recheck_seconds": 10,
+    "max_sidecar_checks": 6,
+    "max_retries": 1
+  }
+}
