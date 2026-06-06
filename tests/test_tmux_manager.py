@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -408,52 +409,229 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertTrue(notification["acknowledged_by_codex"])
             self.assertEqual(ack["record"]["last_ack"]["event_id"], status["event_id"])
 
-    def test_tmux_inject_sdk_uses_default_codex_model_with_low_effort(self) -> None:
-        calls: list[dict[str, object]] = []
-
-        class FakeResponses:
-            def create(self, **kwargs: object) -> object:
-                calls.append(kwargs)
-                return type(
-                    "FakeResponse",
-                    (),
-                    {
-                        "output_text": json.dumps(
-                            {
-                                "decision": "inject",
-                                "target_pane": "%9",
-                                "confidence": 0.8,
-                                "reason": "safe",
-                            }
-                        )
-                    },
-                )()
-
-        class FakeOpenAI:
-            def __init__(self, *, timeout: float) -> None:
-                self.timeout = timeout
-                self.responses = FakeResponses()
-
+    def test_tmux_inject_ack_marks_event_summary_acknowledged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
-            codex_home = Path(tmp_name) / "codex"
-            codex_home.mkdir()
-            (codex_home / "config.toml").write_text('model = "codex-default-test"\n', encoding="utf-8")
-            fake_module = type("FakeOpenAIModule", (), {"OpenAI": FakeOpenAI})
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+
             with (
-                mock.patch.dict(sys.modules, {"openai": fake_module}),
-                mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "CODEX_HOME": str(codex_home)}, clear=False),
+                mock.patch.object(tmux_manager, "pane_codex_validation", return_value={"safe": True, "status": "live_codex"}),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_inject_decision",
+                    return_value={"decision": "inject", "target_pane": "%9", "confidence": 1.0, "reason": "ok"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_terminal_event_assessment",
+                    return_value={"source": "deterministic", "summary": "done", "recommended_action": "wake_codex", "confidence": 1.0, "reason": "test"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "inject_tmux_wake_prompt",
+                    return_value={"injected": True, "pasted": True, "entered": True},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "verify_tmux_inject_delivery",
+                    return_value={"checked": True, "decision": {"action": "confirmed"}, "prompt_still_staged": False},
+                ),
             ):
-                for name in ("TMUX_SKILLS_CODEX_SDK_MODEL", "CODEX_MODEL", "OPENAI_MODEL"):
-                    os.environ.pop(name, None)
+                updated = tmux_manager.transition_terminal(record, paths=paths, status=status)
+            tmux_manager.write_manager_record(paths, updated)
+
+            ack = tmux_manager.ack_manager_event(
+                manager_id="manager-one",
+                event_id=str(status["event_id"]),
+                workspace=str(workspace),
+                note="received",
+            )
+
+            event = ack["record"]["events"][str(status["event_id"])]
+            self.assertTrue(event["acknowledged_by_codex"])
+            self.assertEqual(event["ack_note"], "received")
+            self.assertEqual(event["notification_status"], "acknowledged")
+
+    def test_tmux_inject_pending_submission_records_delivery_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+
+            with (
+                mock.patch.object(tmux_manager, "pane_codex_validation", return_value={"safe": True, "status": "live_codex"}),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_inject_decision",
+                    return_value={"decision": "inject", "target_pane": "%9", "confidence": 1.0, "reason": "ok"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_terminal_event_assessment",
+                    return_value={"source": "deterministic", "summary": "done", "recommended_action": "wake_codex", "confidence": 1.0, "reason": "test"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "inject_tmux_wake_prompt",
+                    return_value={"injected": True, "pasted": True, "entered": True},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "verify_tmux_inject_delivery",
+                    return_value={"checked": True, "decision": {"action": "submit"}, "prompt_still_staged": True},
+                ),
+            ):
+                updated = tmux_manager.transition_terminal(record, paths=paths, status=status)
+
+            self.assertEqual(updated["last_notification"]["status"], "inject_pending")
+            self.assertEqual(updated["submitted_event_ids"], [status["event_id"]])
+            self.assertEqual(updated["notified_event_ids"], [status["event_id"]])
+            self.assertTrue(updated["events"][str(status["event_id"])]["submitted_to_tmux"])
+
+    def test_terminal_event_assessment_uses_codex_sidecar_when_enabled(self) -> None:
+        with mock.patch.object(
+            tmux_manager,
+            "codex_sidecar_decision",
+            return_value={
+                "source": "codex_sidecar",
+                "summary": "random digit 7 observed",
+                "recommended_action": "wake_codex",
+                "confidence": 0.94,
+                "reason": "terminal output requires Codex inspection",
+                "setup": {"ok": True, "reused": True},
+            },
+        ):
+            result = tmux_manager.codex_sdk_terminal_event_assessment(
+                {"manager_id": "manager-one", "workspace": "/tmp/workspace", "state_dir": "/tmp/state"},
+                {"event_id": "evt-one", "job_id": "job-one", "status": "succeeded", "last_output": "RANDOM_DIGIT=7"},
+            )
+
+        self.assertEqual(result["source"], "codex_sidecar")
+        self.assertEqual(result["recommended_action"], "wake_codex")
+        self.assertEqual(result["sidecar_setup"], {"ok": True, "reused": True})
+
+    def test_tmux_inject_followup_staged_prompt_overrides_sidecar_confirmed(self) -> None:
+        prompt = (
+            "tmux-skills manager event is ready.\n\n"
+            "Manager ID: manager-one\n"
+            "Event ID: evt-one\n\n"
+            "Inspect the manager state for this workspace, decide the next action, and acknowledge the event after inspection."
+        )
+        capture_output = f"previous output\n{prompt}\n\nCtrl+J newline   Enter to submit message\n"
+
+        result = tmux_manager.normalize_tmux_inject_followup_decision(
+            {"action": "confirmed", "confidence": 0.99, "reason": "sidecar thought it was sent"},
+            prompt=prompt,
+            capture_output=capture_output,
+        )
+
+        self.assertEqual(result["action"], "submit")
+        self.assertIn("deterministic staged prompt override", result["reason"])
+
+    def test_tmux_inject_followup_staged_prompt_skips_sidecar_for_immediate_submit(self) -> None:
+        prompt = (
+            "tmux-skills manager event is ready.\n\n"
+            "Manager ID: manager-one\n"
+            "Event ID: evt-one\n\n"
+            "Inspect the manager state for this workspace, decide the next action, and acknowledge the event after inspection."
+        )
+        capture = {"captured": True, "output": f"Working\n{prompt}\n\nCtrl+J newline   Enter to submit message\n"}
+
+        with mock.patch.object(tmux_manager, "codex_sidecar_decision") as sidecar:
+            result = tmux_manager.codex_sdk_inject_followup_decision(
+                {"manager_id": "manager-one", "workspace": "/tmp/workspace", "state_dir": "/tmp/state", "codex_pane_id": "%1"},
+                {"event_id": "evt-one"},
+                {"safe": True, "status": "live_codex"},
+                {"injected": True, "submitted_to_tmux": True},
+                capture,
+                prompt,
+            )
+
+        sidecar.assert_not_called()
+        self.assertEqual(result["action"], "submit")
+        self.assertEqual(result["source"], "deterministic")
+        self.assertEqual(result["sidecar_skipped"], "staged prompt cannot wait for SDK confirmation")
+
+    def test_manager_status_adds_manager_sequence_without_overwriting_job_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            status = self.build_terminal_status(paths)
+            status["attempt"] = 1
+            tmux_state.write_status(tmux_state.status_path(paths, "job-one"), status)
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            record["jobs"] = {"job-one": {"job_id": "job-one", "manager_sequence": 2}}
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.manager_status("manager-one", workspace=str(workspace))
+
+            self.assertEqual(result["current_job_status"]["attempt"], 1)
+            self.assertEqual(result["current_job_status"]["manager_sequence"], 2)
+
+    def test_tmux_inject_planner_uses_deterministic_guardrails_without_api_key(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "", "TMUX_SKILLS_CODEX_SDK_DECISION": ""}, clear=False):
+            result = tmux_manager.codex_sdk_inject_decision(
+                {"manager_id": "manager-one", "codex_pane_id": "%9"},
+                {"event_id": "event-one"},
+                {"safe": True},
+            )
+
+        self.assertEqual(result["decision"], "inject")
+        self.assertEqual(result["target_pane"], "%9")
+        self.assertEqual(result["source"], "deterministic")
+        self.assertNotIn("OPENAI_API_KEY", result["reason"])
+
+    def test_tmux_inject_planner_can_use_codex_sidecar_with_low_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            state_dir = Path(tmp_name) / "state"
+            python_path = state_dir / "sidecar-venv" / "bin" / "python"
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                if command[:2] == ["uv", "venv"]:
+                    python_path.parent.mkdir(parents=True, exist_ok=True)
+                    python_path.write_text("", encoding="utf-8")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                if command[:3] == ["uv", "pip", "install"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "source": "codex_sidecar",
+                            "output": json.dumps({"decision": "inject", "target_pane": "%9", "confidence": 0.75, "reason": "safe"}),
+                        }
+                    ),
+                    stderr="",
+                )
+
+            with (
+                mock.patch.object(tmux_manager.subprocess, "run", side_effect=fake_run),
+                mock.patch.dict(os.environ, {"TMUX_SKILLS_CODEX_SIDECAR": "1", "TMUX_SKILLS_CODEX_SDK_DECISION": ""}, clear=False),
+            ):
                 result = tmux_manager.codex_sdk_inject_decision(
-                    {"manager_id": "manager-one", "codex_pane_id": "%9"},
+                    {"manager_id": "manager-one", "codex_pane_id": "%9", "workspace": "/tmp/workspace", "state_dir": str(state_dir)},
                     {"event_id": "event-one"},
                     {"safe": True},
                 )
 
+        self.assertEqual(calls[0], ["uv", "venv", str(state_dir / "sidecar-venv")])
+        self.assertEqual(calls[1][:4], ["uv", "pip", "install", "--python"])
+        self.assertEqual(calls[2][0], str(python_path))
+        self.assertTrue(calls[2][1].endswith("tmux_codex_sidecar.py"))
         self.assertEqual(result["decision"], "inject")
-        self.assertEqual(calls[0]["model"], "codex-default-test")
-        self.assertEqual(calls[0]["reasoning"], {"effort": "low"})
+        self.assertEqual(result["source"], "codex_sidecar")
+        self.assertEqual(result["sidecar_setup"]["venv"], str(state_dir / "sidecar-venv"))
 
     def test_tmux_inject_delivery_check_sends_followup_when_prompt_staged(self) -> None:
         record = {"manager_id": "manager-one", "codex_pane_id": "%9"}
@@ -510,6 +688,115 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertTrue(result["capture_before"]["prompt_still_staged"])
         self.assertFalse(result["capture_after"]["prompt_still_staged"])
         self.assertFalse(result["prompt_still_staged"])
+
+    def test_tmux_inject_detects_queued_composer_prompt_while_codex_is_working(self) -> None:
+        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        capture = "\n".join(
+            [
+                "• Working (8m 01s • esc to interrupt)",
+                "",
+                "› tmux-skills manager event is ready.",
+                "",
+                "  Manager ID: manager-one",
+                "  Event ID: event-one",
+                "",
+                "  Inspect the manager state for this workspace, decide the next action, and acknowledge the event",
+                "  after inspection.",
+                "",
+                "",
+                "  tab to queue message",
+            ]
+        )
+
+        self.assertTrue(tmux_manager.wake_prompt_still_staged(prompt, capture))
+        self.assertEqual(tmux_manager.default_tmux_inject_followup_submit_key(prompt, capture), "Tab")
+
+    def test_tmux_inject_deterministic_inspection_queues_staged_prompt_while_working(self) -> None:
+        record = {"manager_id": "manager-one", "codex_pane_id": "%9"}
+        candidate = {"event_id": "event-one", "job_id": "job-one"}
+        validation = {"safe": True}
+        injection = {"injected": True, "pasted": True, "entered": True}
+        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        capture = {
+            "captured": True,
+            "returncode": 0,
+            "output": "\n".join(
+                [
+                    "• Working (8m 01s • esc to interrupt)",
+                    "",
+                    "› tmux-skills manager event is ready.",
+                    "",
+                    "  Manager ID: manager-one",
+                    "  Event ID: event-one",
+                    "",
+                    "  tab to queue message",
+                ]
+            ),
+            "omitted_chars": 0,
+        }
+
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "", "TMUX_SKILLS_CODEX_SDK_FOLLOWUP_ACTION": ""}, clear=False):
+            result = tmux_manager.codex_sdk_inject_followup_decision(record, candidate, validation, injection, capture, prompt)
+
+        self.assertEqual(result["action"], "submit")
+        self.assertEqual(result["submit_key"], "Tab")
+        self.assertEqual(result["source"], "deterministic")
+        self.assertNotIn("OPENAI_API_KEY", result["reason"])
+
+    def test_tmux_inject_followup_can_use_codex_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            state_dir = Path(tmp_name) / "state"
+            python_path = state_dir / "sidecar-venv" / "bin" / "python"
+            python_path.parent.mkdir(parents=True)
+            python_path.write_text("", encoding="utf-8")
+            (state_dir / "sidecar-venv" / ".openai-codex-installed").write_text("ok", encoding="utf-8")
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "source": "codex_sidecar",
+                            "output": json.dumps({"action": "confirmed", "submit_key": "Enter", "confidence": 0.7, "reason": "prompt is no longer staged"}),
+                        }
+                    ),
+                    stderr="",
+                )
+
+            record = {"manager_id": "manager-one", "codex_pane_id": "%9", "workspace": "/tmp/workspace", "state_dir": str(state_dir)}
+            candidate = {"event_id": "event-one", "job_id": "job-one"}
+            validation = {"safe": True}
+            injection = {"injected": True, "pasted": True, "entered": True}
+            prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+            capture = {
+                "captured": True,
+                "returncode": 0,
+                "output": "\n".join(
+                    [
+                        "• Working (8m 01s • esc to interrupt)",
+                        "",
+                        "received manager event event-one",
+                    ]
+                ),
+                "omitted_chars": 0,
+            }
+
+            with (
+                mock.patch.object(tmux_manager.subprocess, "run", side_effect=fake_run),
+                mock.patch.dict(os.environ, {"TMUX_SKILLS_CODEX_SIDECAR": "1", "TMUX_SKILLS_CODEX_SDK_FOLLOWUP_ACTION": ""}, clear=False),
+            ):
+                result = tmux_manager.codex_sdk_inject_followup_decision(record, candidate, validation, injection, capture, prompt)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], str(python_path))
+        self.assertTrue(calls[0][1].endswith("tmux_codex_sidecar.py"))
+        self.assertEqual(result["action"], "confirmed")
+        self.assertEqual(result["submit_key"], "Enter")
+        self.assertEqual(result["source"], "codex_sidecar")
+        self.assertTrue(result["sidecar_setup"]["reused"])
 
     def test_tmux_inject_stays_pending_when_prompt_remains_staged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -1034,6 +1321,64 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(merged["bridge_verification"]["status"], "verified")
             self.assertTrue(merged["bridge_verification"]["acknowledged_by_codex"])
             self.assertEqual(merged["last_ack"]["event_id"], "preflight-one")
+
+    def test_external_ack_merge_preserves_event_summary_ack(self) -> None:
+        stale = {
+            "manager_id": "manager-one",
+            "status": "waiting_for_codex",
+            "pending_job": None,
+            "last_notification": {
+                "event_id": "evt-one",
+                "status": "inject_pending",
+                "acknowledged_by_codex": False,
+            },
+            "notifications": [
+                {
+                    "event_id": "evt-one",
+                    "status": "inject_pending",
+                    "acknowledged_by_codex": False,
+                }
+            ],
+            "events": {
+                "evt-one": {
+                    "event_id": "evt-one",
+                    "source": "manager_terminal",
+                    "status": "succeeded",
+                    "acknowledged_by_codex": False,
+                }
+            },
+        }
+        latest = {
+            "manager_id": "manager-one",
+            "status": "idle",
+            "pending_job": None,
+            "last_ack": {"event_id": "evt-one", "turn_id": "turn-main"},
+            "notifications": [
+                {
+                    "event_id": "evt-one",
+                    "status": "acknowledged",
+                    "acknowledged_by_codex": True,
+                    "ack_turn_id": "turn-main",
+                    "ack_note": "received",
+                }
+            ],
+            "events": {
+                "evt-one": {
+                    "event_id": "evt-one",
+                    "source": "manager_terminal",
+                    "status": "succeeded",
+                    "acknowledged_by_codex": True,
+                    "ack_turn_id": "turn-main",
+                    "ack_note": "received",
+                }
+            },
+        }
+
+        merged = tmux_manager.merge_external_manager_update(stale, latest)
+
+        self.assertTrue(merged["events"]["evt-one"]["acknowledged_by_codex"])
+        self.assertEqual(merged["events"]["evt-one"]["ack_note"], "received")
+        self.assertTrue(merged["notifications"][0]["acknowledged_by_codex"])
 
     def test_external_preflight_ack_merge_preserves_newer_terminal_last_notification(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:

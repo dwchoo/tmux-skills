@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -35,6 +36,7 @@ BRIDGE_VERIFICATION_STATUSES = {"unverified", "awaiting_ack", "verified", "expir
 TMUX_INJECT_NOTIFICATION_STATUSES = {"injected", "inject_pending", "inject_refused"}
 TMUX_INJECT_PRIMARY_SUBMIT_KEY = "C-m"
 TMUX_INJECT_FOLLOWUP_SUBMIT_KEY = "C-m"
+TMUX_INJECT_QUEUE_SUBMIT_KEY = "Tab"
 TMUX_INJECT_ACK_RECHECK_SECONDS = 5.0
 CODEX_SDK_REASONING_EFFORT = "low"
 TMUX_INJECT_WAKE_PROMPT = "\n".join(
@@ -227,10 +229,6 @@ def pid_is_running(pid: int | None) -> bool:
     return True
 
 
-def dashboard_viewer_state(paths: dict[str, Path], manager_id: str) -> tuple[dict[str, Any] | None, str | None]:
-    return tmux_state.read_json(manager_dashboard_viewer_state_path(paths, manager_id))
-
-
 def refresh_dashboard_viewer_fields(record: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
     record = dict(record)
     manager_id = manager_id_value(str(record.get("manager_id") or ""))
@@ -366,15 +364,6 @@ def ensure_dashboard_viewer(record: dict[str, Any], paths: dict[str, Path]) -> t
     }
 
 
-def render_dashboard_to_pane(pane_id: str | None, dashboard_file: Path) -> dict[str, Any]:
-    return {
-        "rendered": False,
-        "reason": "manager dashboards are rendered by tmux_manager_viewer.py",
-        "pane_id": pane_id,
-        "dashboard_path": str(dashboard_file),
-    }
-
-
 def normalize_notify(
     mode: str,
     thread_id: str | None = None,
@@ -424,6 +413,132 @@ def codex_sdk_model_name() -> str | None:
     return None
 
 
+def codex_sidecar_enabled() -> bool:
+    return tmux_state.token_text(os.environ.get("TMUX_SKILLS_CODEX_SIDECAR")) in {"1", "true", "yes", "on"}
+
+
+def codex_sidecar_venv_python(payload: dict[str, Any]) -> Path:
+    state_dir = tmux_state.one_line_text(payload.get("state_dir"))
+    workspace = tmux_state.one_line_text(payload.get("workspace")) or os.getcwd()
+    root = Path(state_dir) if state_dir else tmux_state.state_paths(workspace, None)["root"]
+    return root / "sidecar-venv" / "bin" / "python"
+
+
+def ensure_codex_sidecar_venv(payload: dict[str, Any], *, timeout_seconds: float = 60.0) -> dict[str, Any]:
+    python_path = codex_sidecar_venv_python(payload)
+    marker_path = python_path.parent.parent / ".openai-codex-installed"
+    if python_path.exists() and marker_path.exists():
+        return {"ok": True, "python": str(python_path), "venv": str(python_path.parent.parent), "reused": True}
+    venv_dir = python_path.parent.parent
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        create = subprocess.run(["uv", "venv", str(venv_dir)], text=True, capture_output=True, timeout=timeout_seconds)
+    except Exception as exc:
+        return {"ok": False, "reason": f"uv venv failed: {exc}", "python": str(python_path), "venv": str(venv_dir)}
+    if create.returncode != 0:
+        reason = create.stderr.strip() or create.stdout.strip() or f"uv venv exited {create.returncode}"
+        return {"ok": False, "reason": tmux_state.one_line_text(reason), "python": str(python_path), "venv": str(venv_dir)}
+    try:
+        install = subprocess.run(
+            ["uv", "pip", "install", "--python", str(python_path), "openai-codex"],
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        return {"ok": False, "reason": f"uv pip install failed: {exc}", "python": str(python_path), "venv": str(venv_dir)}
+    if install.returncode != 0:
+        reason = install.stderr.strip() or install.stdout.strip() or f"uv pip install exited {install.returncode}"
+        return {"ok": False, "reason": tmux_state.one_line_text(reason), "python": str(python_path), "venv": str(venv_dir)}
+    marker_path.write_text(tmux_state.utc_now(), encoding="utf-8")
+    return {"ok": True, "python": str(python_path), "venv": str(venv_dir), "reused": False}
+
+
+def parse_codex_sidecar_json(output: str) -> dict[str, Any] | None:
+    text = output.strip()
+    if not text:
+        return None
+    candidates = [text]
+    candidates.extend(line.strip() for line in reversed(text.splitlines()) if line.strip().startswith("{") and line.strip().endswith("}"))
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def codex_sidecar_output_schema(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("terminal_assessment"):
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["summary", "recommended_action", "confidence", "reason"],
+            "properties": {
+                "summary": {"type": "string"},
+                "recommended_action": {"type": "string", "enum": ["wake_codex", "defer", "refuse"]},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "reason": {"type": "string"},
+            },
+        }
+    if payload.get("allowed_actions"):
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["action", "submit_key", "confidence", "reason"],
+            "properties": {
+                "action": {"type": "string", "enum": ["confirmed", "submit", "defer", "refuse"]},
+                "submit_key": {"type": "string"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "reason": {"type": "string"},
+            },
+        }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["decision", "target_pane", "confidence", "reason"],
+        "properties": {
+            "decision": {"type": "string", "enum": ["inject", "defer", "refuse"]},
+            "target_pane": {"type": "string"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "reason": {"type": "string"},
+        },
+    }
+
+
+def codex_sidecar_decision(payload: dict[str, Any], *, timeout_seconds: float = 90.0) -> dict[str, Any] | None:
+    if not codex_sidecar_enabled():
+        return None
+    setup = ensure_codex_sidecar_venv(payload)
+    if not setup.get("ok"):
+        return {"source": "codex_sidecar_error", "reason": str(setup.get("reason") or "openai-codex sidecar venv setup failed"), "setup": setup}
+    helper_path = script_dir() / "tmux_codex_sidecar.py"
+    request = json.dumps({"payload": payload}, sort_keys=True)
+    try:
+        proc = subprocess.run(
+            [str(setup["python"]), str(helper_path)],
+            input=request,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        return {"source": "codex_sidecar_error", "reason": f"openai-codex sidecar helper failed: {exc}", "setup": setup}
+    parsed = parse_codex_sidecar_json(proc.stdout)
+    if proc.returncode != 0 or parsed is None:
+        reason = proc.stderr.strip() or proc.stdout.strip() or f"openai-codex sidecar helper exited {proc.returncode}"
+        return {"source": "codex_sidecar_error", "reason": tmux_state.one_line_text(reason), "setup": setup}
+    if parsed.get("source") == "codex_sidecar_error":
+        return parsed | {"setup": setup}
+    output = str(parsed.get("output") or "")
+    decision = parse_codex_sidecar_json(output)
+    if decision is None:
+        return {"source": "codex_sidecar_error", "reason": tmux_state.one_line_text(output) or "openai-codex sidecar returned no decision JSON", "setup": setup}
+    return decision | {"source": "codex_sidecar", "setup": setup}
+
+
 def tmux_inject_ack_recheck_seconds() -> float:
     value = os.environ.get("TMUX_SKILLS_TMUX_INJECT_ACK_RECHECK_SECONDS")
     if value is None:
@@ -456,9 +571,10 @@ def tmux_inject_ack_recheck_due(notification: dict[str, Any] | None) -> bool:
 
 
 def pending_followup_decision(reason: str, *, prompt: str, capture_output: str, source: str) -> dict[str, Any]:
-    action = "submit" if wake_prompt_still_staged(prompt, capture_output) else "defer"
+    action = "submit" if wake_prompt_still_staged(prompt, capture_output) else "confirmed"
+    confidence = 0.85 if source == "deterministic" else 0.0
     return normalize_tmux_inject_followup_decision(
-        {"action": action, "submit_key": TMUX_INJECT_FOLLOWUP_SUBMIT_KEY, "confidence": 0.0, "reason": reason},
+        {"action": action, "submit_key": default_tmux_inject_followup_submit_key(prompt, capture_output), "confidence": confidence, "reason": reason},
         prompt=prompt,
         capture_output=capture_output,
     ) | {"source": source}
@@ -870,8 +986,9 @@ def build_pending_job(
     cwd: str | None = None,
     pane_id: str | None = None,
     pane_index: str | None = None,
+    manager_sequence: int | None = None,
 ) -> dict[str, Any]:
-    return {
+    pending = {
         "job_id": tmux_state.safe_id(job_id),
         "command_file": str(command_request_path),
         "cwd": cwd,
@@ -879,6 +996,9 @@ def build_pending_job(
         "pane_index": tmux_state.one_line_text(pane_index),
         "queued_at": tmux_state.utc_now(),
     }
+    if manager_sequence is not None:
+        pending["manager_sequence"] = manager_sequence
+    return pending
 
 
 def build_manager_record(
@@ -982,6 +1102,36 @@ def upsert_notification(record: dict[str, Any], event_id: str, fields: dict[str,
         notifications.append(updated)
     record["notifications"] = notifications
     record["last_notification"] = updated
+    return record
+
+
+def sync_event_from_notification(record: dict[str, Any], event_id: str, notification: dict[str, Any]) -> dict[str, Any]:
+    events = dict(record.get("events") or {})
+    event = dict(events.get(event_id) or {})
+    fields: dict[str, Any] = {"event_id": event_id}
+    for key in (
+        "acknowledged_by_codex",
+        "acknowledged_at",
+        "ack_turn_id",
+        "ack_note",
+        "handled_at",
+        "handled_by_job_id",
+        "handled_without_ack",
+        "submitted_to_app_server",
+        "submitted_to_tmux",
+        "injected_to_tmux",
+        "submitted_at",
+        "notification_status",
+        "codex_pane_id",
+        "last_error",
+        "terminal_assessment",
+    ):
+        if key in notification:
+            fields[key] = notification[key]
+    if "status" in notification and "notification_status" not in fields:
+        fields["notification_status"] = notification["status"]
+    events[event_id] = event | fields
+    record["events"] = events
     return record
 
 
@@ -1253,10 +1403,11 @@ def queue_manager_job(
 
     request_path = write_command_request(paths, record["manager_id"], item_id, str(text))
     record = mark_last_terminal_event_handled(record, next_job_id=item_id)
+    manager_sequence = len([value for value in record.get("job_ids", []) if tmux_state.one_line_text(value)]) + 1
     target_pane_index = tmux_state.one_line_text(pane_index)
     if not target_pane_index and target_pane_id == tmux_state.one_line_text(record.get("worker_pane_id")):
         target_pane_index = tmux_state.one_line_text(record.get("worker_pane_index"))
-    record["pending_job"] = build_pending_job(item_id, request_path, cwd, target_pane_id, target_pane_index)
+    record["pending_job"] = build_pending_job(item_id, request_path, cwd, target_pane_id, target_pane_index, manager_sequence)
     record["status"] = "queued"
     record["worker_pane_ids"] = unique_text_values(list(record.get("worker_pane_ids") or []) + [target_pane_id])
     if not record.get("worker_pane_id"):
@@ -1392,6 +1543,7 @@ def ack_manager_event(
             "acknowledged_at": now,
             "ack_turn_id": ack_turn_id,
             "ack_note": tmux_state.one_line_text(note),
+            "notification_status": status,
         }
         record["events"] = events
     record["last_ack"] = {
@@ -1457,6 +1609,11 @@ def start_pending_job(record: dict[str, Any]) -> dict[str, Any]:
         "sent": False,
         "reason": proc.stderr.strip() or proc.stdout.strip() or f"tmux_control.py run exited {proc.returncode}",
     }
+    manager_sequence = pending.get("manager_sequence")
+    if not isinstance(manager_sequence, int):
+        manager_sequence = len([value for value in record.get("job_ids", []) if tmux_state.one_line_text(value)]) + 1
+    if isinstance(result, dict):
+        result["manager_sequence"] = manager_sequence
     jobs = dict(record.get("jobs") or {})
     jobs[job_id] = {
         "job_id": job_id,
@@ -1468,6 +1625,7 @@ def start_pending_job(record: dict[str, Any]) -> dict[str, Any]:
         "started_at": started_at,
         "run_returncode": proc.returncode,
         "run_result": result,
+        "manager_sequence": manager_sequence,
         "status": "running" if proc.returncode == 0 else "failed_to_start",
     }
     record["jobs"] = jobs
@@ -1674,7 +1832,7 @@ def codex_sdk_inject_decision(
     candidate: dict[str, Any],
     validation: dict[str, Any],
     *,
-    timeout_seconds: float = 2.0,
+    timeout_seconds: float = 90.0,
 ) -> dict[str, Any]:
     bound_pane_id = tmux_state.one_line_text(record.get("codex_pane_id"))
     fixture_decision = tmux_state.token_text(os.environ.get("TMUX_SKILLS_CODEX_SDK_DECISION"))
@@ -1684,88 +1842,56 @@ def codex_sdk_inject_decision(
                 "decision": fixture_decision,
                 "target_pane": os.environ.get("TMUX_SKILLS_CODEX_SDK_TARGET_PANE") or bound_pane_id,
                 "confidence": os.environ.get("TMUX_SKILLS_CODEX_SDK_CONFIDENCE") or 1.0,
-                "reason": "environment-supplied Codex SDK planner decision",
+                "reason": "environment-supplied tmux-inject planner decision",
             },
             bound_pane_id,
         ) | {"source": "env"}
-    if not os.environ.get("OPENAI_API_KEY"):
-        return {
-            "decision": "defer",
-            "target_pane": bound_pane_id,
-            "confidence": 0.0,
-            "reason": "Codex SDK unavailable: OPENAI_API_KEY is not set",
-            "source": "sdk_unavailable",
-        }
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception as exc:
-        return {
-            "decision": "defer",
-            "target_pane": bound_pane_id,
-            "confidence": 0.0,
-            "reason": f"Codex SDK unavailable: {exc}",
-            "source": "sdk_unavailable",
-        }
-    model = codex_sdk_model_name()
-    if not model:
-        return {
-            "decision": "defer",
-            "target_pane": bound_pane_id,
-            "confidence": 0.0,
-            "reason": "Codex SDK model is not configured",
-            "source": "sdk_unavailable",
-        }
-    prompt = json.dumps(
+    sidecar = codex_sidecar_decision(
         {
             "task": "Decide whether tmux-skills may inject a wake prompt into the bound Codex pane.",
             "allowed_decisions": ["inject", "defer", "refuse"],
+            "workspace": record.get("workspace"),
+            "state_dir": record.get("state_dir"),
             "manager_id": record.get("manager_id"),
             "event_id": candidate.get("event_id"),
             "bound_pane_id": bound_pane_id,
             "pane_validation": validation,
             "rules": [
-                "Return only JSON with decision, target_pane, confidence, and reason.",
-                "Do not execute tmux commands or describe shell commands.",
+                "Return JSON with decision, target_pane, confidence, and reason.",
                 "Choose inject only when the bound pane is the target and validation is safe.",
+                "Never choose a pane different from bound_pane_id.",
             ],
         },
-        sort_keys=True,
+        timeout_seconds=timeout_seconds,
     )
-    schema = {
-        "type": "json_schema",
-        "name": "tmux_inject_decision",
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["decision", "target_pane", "confidence", "reason"],
-            "properties": {
-                "decision": {"type": "string", "enum": ["inject", "defer", "refuse"]},
-                "target_pane": {"type": "string"},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "reason": {"type": "string"},
-            },
-        },
-        "strict": True,
-    }
-    try:
-        client = OpenAI(timeout=timeout_seconds)
-        response = client.responses.create(
-            model=model,
-            input=prompt,
-            reasoning={"effort": CODEX_SDK_REASONING_EFFORT},
-            text={"format": schema},
-        )
-        output_text = getattr(response, "output_text", "")
-        payload = json.loads(output_text)
-    except Exception as exc:
+    if sidecar and sidecar.get("source") == "codex_sidecar":
+        return normalize_tmux_inject_sdk_decision(sidecar, bound_pane_id) | {"source": "codex_sidecar", "sidecar_setup": sidecar.get("setup")}
+    if not bound_pane_id:
         return {
-            "decision": "defer",
+            "decision": "refuse",
             "target_pane": bound_pane_id,
-            "confidence": 0.0,
-            "reason": f"Codex SDK planner failed: {exc}",
-            "source": "sdk_error",
+            "confidence": 1.0,
+            "reason": "tmux-inject has no bound Codex pane",
+            "source": "deterministic",
+            "sidecar": sidecar,
         }
-    return normalize_tmux_inject_sdk_decision(payload, bound_pane_id) | {"source": "sdk"}
+    if not validation.get("safe"):
+        return {
+            "decision": "refuse",
+            "target_pane": bound_pane_id,
+            "confidence": 1.0,
+            "reason": tmux_state.one_line_text(validation.get("reason")) or "Codex pane validation failed",
+            "source": "deterministic",
+            "sidecar": sidecar,
+        }
+    return {
+        "decision": "inject",
+        "target_pane": bound_pane_id,
+        "confidence": 1.0,
+        "reason": "deterministic guardrails allow injection into the bound Codex pane",
+        "source": "deterministic",
+        "sidecar": sidecar,
+    }
 
 
 def build_tmux_inject_wake_prompt(record: dict[str, Any], candidate: dict[str, Any]) -> str:
@@ -1799,24 +1925,46 @@ def capture_tmux_pane_text(pane_id: str, *, lines: int = 80, max_chars: int = 12
     }
 
 
-def wake_prompt_still_staged(prompt: str, capture_output: str) -> bool:
+def latest_staged_wake_prompt_block(prompt: str, capture_output: str) -> str:
     if not prompt or not capture_output:
-        return False
-    tail = "\n".join(capture_output.splitlines()[-30:])
-    if "• Working" in tail or "Working (" in tail:
-        return False
+        return ""
+    tail_lines = capture_output.splitlines()[-30:]
     first_line = prompt.splitlines()[0]
-    has_prompt = first_line in tail and "Manager ID:" in tail and "Event ID:" in tail
-    footer_hint = "queue message" in tail or "to submit message" in tail or "Context" in tail
-    return bool(has_prompt and footer_hint)
+    for index in range(len(tail_lines) - 1, -1, -1):
+        if first_line in tail_lines[index]:
+            block = "\n".join(tail_lines[index:])
+            if "Manager ID:" in block and "Event ID:" in block:
+                return block
+    return ""
+
+
+def wake_prompt_still_staged(prompt: str, capture_output: str) -> bool:
+    block = latest_staged_wake_prompt_block(prompt, capture_output)
+    footer_hint = "queue message" in block or "to submit message" in block or "Context" in block
+    return bool(block and footer_hint)
+
+
+def default_tmux_inject_followup_submit_key(prompt: str, capture_output: str) -> str:
+    block = latest_staged_wake_prompt_block(prompt, capture_output)
+    if "queue message" in block:
+        return TMUX_INJECT_QUEUE_SUBMIT_KEY
+    return TMUX_INJECT_FOLLOWUP_SUBMIT_KEY
 
 
 def normalize_tmux_inject_followup_decision(value: Any, *, prompt: str, capture_output: str) -> dict[str, Any]:
     payload = dict(value) if isinstance(value, dict) else {}
-    action = tmux_state.token_text(payload.get("action")) or ""
-    if action not in {"confirmed", "submit", "defer", "refuse"}:
-        action = "submit" if wake_prompt_still_staged(prompt, capture_output) else "confirmed"
-    submit_key = tmux_state.one_line_text(payload.get("submit_key")) or TMUX_INJECT_FOLLOWUP_SUBMIT_KEY
+    raw_action = tmux_state.token_text(payload.get("action")) or ""
+    staged = wake_prompt_still_staged(prompt, capture_output)
+    submit_key = tmux_state.one_line_text(payload.get("submit_key")) or default_tmux_inject_followup_submit_key(prompt, capture_output)
+    reason = tmux_state.one_line_text(payload.get("reason")) or "heuristic post-injection decision"
+    if staged:
+        action = "submit"
+        if raw_action == "confirmed":
+            reason = f"{reason}; deterministic staged prompt override"
+    else:
+        action = raw_action if raw_action in {"confirmed", "defer", "refuse"} else "confirmed"
+        if raw_action == "submit":
+            reason = f"{reason}; deterministic capture no longer shows staged prompt"
     try:
         confidence = float(payload.get("confidence", 0.0))
     except (TypeError, ValueError):
@@ -1825,7 +1973,7 @@ def normalize_tmux_inject_followup_decision(value: Any, *, prompt: str, capture_
         "action": action,
         "submit_key": submit_key,
         "confidence": min(max(confidence, 0.0), 1.0),
-        "reason": tmux_state.one_line_text(payload.get("reason")) or "heuristic post-injection decision",
+        "reason": reason,
     }
 
 
@@ -1837,7 +1985,7 @@ def codex_sdk_inject_followup_decision(
     capture: dict[str, Any],
     prompt: str,
     *,
-    timeout_seconds: float = 2.0,
+    timeout_seconds: float = 90.0,
 ) -> dict[str, Any]:
     output = str(capture.get("output") or "")
     fixture_action = tmux_state.token_text(os.environ.get("TMUX_SKILLS_CODEX_SDK_FOLLOWUP_ACTION"))
@@ -1847,39 +1995,24 @@ def codex_sdk_inject_followup_decision(
                 "action": fixture_action,
                 "submit_key": os.environ.get("TMUX_SKILLS_CODEX_SDK_FOLLOWUP_SUBMIT_KEY") or TMUX_INJECT_FOLLOWUP_SUBMIT_KEY,
                 "confidence": os.environ.get("TMUX_SKILLS_CODEX_SDK_CONFIDENCE") or 1.0,
-                "reason": "environment-supplied Codex SDK follow-up decision",
+                "reason": "environment-supplied tmux-inject follow-up decision",
             },
             prompt=prompt,
             capture_output=output,
         ) | {"source": "env"}
-    if not os.environ.get("OPENAI_API_KEY"):
+    if wake_prompt_still_staged(prompt, output):
         return pending_followup_decision(
-            "Codex SDK unavailable: OPENAI_API_KEY is not set",
+            "deterministic staged prompt requires immediate bounded follow-up",
             prompt=prompt,
             capture_output=output,
-            source="sdk_unavailable",
-        )
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception as exc:
-        return pending_followup_decision(
-            f"Codex SDK unavailable: {exc}",
-            prompt=prompt,
-            capture_output=output,
-            source="sdk_unavailable",
-        )
-    model = codex_sdk_model_name()
-    if not model:
-        return pending_followup_decision(
-            "Codex SDK model is not configured",
-            prompt=prompt,
-            capture_output=output,
-            source="sdk_unavailable",
-        )
-    sdk_prompt = json.dumps(
+            source="deterministic",
+        ) | {"sidecar_skipped": "staged prompt cannot wait for SDK confirmation"}
+    sidecar = codex_sidecar_decision(
         {
             "task": "Decide whether a tmux-inject wake prompt was submitted to Codex or remains staged in the composer.",
             "allowed_actions": ["confirmed", "submit", "defer", "refuse"],
+            "workspace": record.get("workspace"),
+            "state_dir": record.get("state_dir"),
             "manager_id": record.get("manager_id"),
             "event_id": candidate.get("event_id"),
             "bound_pane_id": record.get("codex_pane_id"),
@@ -1887,48 +2020,95 @@ def codex_sdk_inject_followup_decision(
             "injection": injection,
             "pane_capture_tail": output[-6000:],
             "rules": [
-                "Return only JSON with action, submit_key, confidence, and reason.",
-                "Choose submit only if the wake prompt appears to remain in the Codex composer/input area.",
-                "Use submit_key C-m unless capture clearly indicates another bounded submit key is needed.",
-                "Choose confirmed if Codex appears to be working on the wake prompt or the prompt is no longer staged.",
-                "Do not choose a different tmux pane and do not describe shell commands.",
+                "Return JSON with action, submit_key, confidence, and reason.",
+                "Choose submit only if the wake prompt remains in the Codex composer/input area.",
+                "Use submit_key Tab when the composer footer says queue message.",
+                "Choose confirmed if the prompt is no longer staged.",
+                "Never choose a different pane or describe shell commands.",
             ],
         },
-        sort_keys=True,
+        timeout_seconds=timeout_seconds,
     )
-    schema = {
-        "type": "json_schema",
-        "name": "tmux_inject_followup_decision",
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["action", "submit_key", "confidence", "reason"],
-            "properties": {
-                "action": {"type": "string", "enum": ["confirmed", "submit", "defer", "refuse"]},
-                "submit_key": {"type": "string"},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "reason": {"type": "string"},
-            },
-        },
-        "strict": True,
-    }
+    if sidecar and sidecar.get("source") == "codex_sidecar":
+        return normalize_tmux_inject_followup_decision(sidecar, prompt=prompt, capture_output=output) | {"source": "codex_sidecar", "sidecar_setup": sidecar.get("setup")}
+    result = pending_followup_decision(
+        "deterministic pane inspection after tmux-inject delivery",
+        prompt=prompt,
+        capture_output=output,
+        source="deterministic",
+    )
+    if sidecar:
+        result["sidecar"] = sidecar
+    return result
+
+
+def normalize_terminal_event_assessment(value: Any, *, candidate: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(value) if isinstance(value, dict) else {}
+    action = tmux_state.token_text(payload.get("recommended_action")) or "wake_codex"
+    if action not in {"wake_codex", "defer", "refuse"}:
+        action = "wake_codex"
     try:
-        client = OpenAI(timeout=timeout_seconds)
-        response = client.responses.create(
-            model=model,
-            input=sdk_prompt,
-            reasoning={"effort": CODEX_SDK_REASONING_EFFORT},
-            text={"format": schema},
-        )
-        payload = json.loads(getattr(response, "output_text", ""))
-    except Exception as exc:
-        return pending_followup_decision(
-            f"Codex SDK follow-up failed: {exc}",
-            prompt=prompt,
-            capture_output=output,
-            source="sdk_error",
-        )
-    return normalize_tmux_inject_followup_decision(payload, prompt=prompt, capture_output=output) | {"source": "sdk"}
+        confidence = float(payload.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    summary = tmux_state.one_line_text(payload.get("summary"))
+    if not summary:
+        summary = f"terminal event {candidate.get('event_id') or 'unknown'} status={candidate.get('status') or 'unknown'}"
+    return {
+        "summary": summary,
+        "recommended_action": action,
+        "confidence": min(max(confidence, 0.0), 1.0),
+        "reason": tmux_state.one_line_text(payload.get("reason")) or "terminal event should be inspected by Codex",
+    }
+
+
+def deterministic_terminal_event_assessment(candidate: dict[str, Any], *, sidecar: dict[str, Any] | None = None) -> dict[str, Any]:
+    status = tmux_state.token_text(candidate.get("status")) or "unknown"
+    last_output = str(candidate.get("last_output") or "")
+    digit_match = re.search(r"RANDOM_DIGIT=(\d)", last_output)
+    digit_text = f" random_digit={digit_match.group(1)}" if digit_match else ""
+    summary = f"terminal event {candidate.get('event_id') or 'unknown'} status={status}{digit_text}"
+    result = {
+        "summary": summary,
+        "recommended_action": "wake_codex" if status in MANAGER_TERMINAL_JOB_STATUSES else "defer",
+        "confidence": 0.8 if digit_match else 0.65,
+        "reason": "deterministic terminal event assessment from bounded status tail",
+        "source": "deterministic",
+    }
+    if sidecar:
+        result["sidecar"] = sidecar
+    return result
+
+
+def codex_sdk_terminal_event_assessment(
+    record: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    timeout_seconds: float = 90.0,
+) -> dict[str, Any]:
+    sidecar = codex_sidecar_decision(
+        {
+            "task": "Assess a tmux-skills terminal event and recommend whether main Codex should inspect it.",
+            "terminal_assessment": True,
+            "workspace": record.get("workspace"),
+            "state_dir": record.get("state_dir"),
+            "manager_id": record.get("manager_id"),
+            "event_id": candidate.get("event_id"),
+            "job_id": candidate.get("job_id"),
+            "job_status": candidate.get("status"),
+            "exit_code": candidate.get("exit_code"),
+            "last_output_tail": str(candidate.get("last_output") or "")[-2000:],
+            "rules": [
+                "Return JSON with summary, recommended_action, confidence, and reason.",
+                "Choose wake_codex for terminal worker results that main Codex should inspect or acknowledge.",
+                "Do not suggest shell commands or follow-up jobs.",
+            ],
+        },
+        timeout_seconds=timeout_seconds,
+    )
+    if sidecar and sidecar.get("source") == "codex_sidecar":
+        return normalize_terminal_event_assessment(sidecar, candidate=candidate) | {"source": "codex_sidecar", "sidecar_setup": sidecar.get("setup")}
+    return deterministic_terminal_event_assessment(candidate, sidecar=sidecar)
 
 
 def send_tmux_submit_key(pane_id: str, submit_key: str) -> dict[str, Any]:
@@ -2123,6 +2303,16 @@ def load_job_status(paths: dict[str, Path], job_id: str | None) -> dict[str, Any
     return tmux_state.normalize_status(data, path)
 
 
+def status_with_manager_metadata(status: dict[str, Any] | None, record: dict[str, Any], job_id: str | None) -> dict[str, Any] | None:
+    if status is None or not job_id:
+        return status
+    jobs = record.get("jobs") if isinstance(record.get("jobs"), dict) else {}
+    job = jobs.get(job_id) if isinstance(jobs.get(job_id), dict) else {}
+    if "manager_sequence" in job:
+        return dict(status) | {"manager_sequence": job["manager_sequence"]}
+    return status
+
+
 def task_path_for_job(paths: dict[str, Path], job_id: str | None) -> str | None:
     if not job_id:
         return None
@@ -2195,6 +2385,9 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
         and tmux_inject_ack_recheck_due(existing)
     ):
         return record
+    terminal_assessment = existing.get("terminal_assessment") if isinstance(existing.get("terminal_assessment"), dict) else None
+    if terminal_assessment is None:
+        terminal_assessment = codex_sdk_terminal_event_assessment(record, candidate)
     base = {
         "event_id": event_id,
         "source": candidate.get("source"),
@@ -2206,6 +2399,7 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
         "log_path": candidate.get("log_path"),
         "observed_at": existing.get("observed_at") or now,
         "acknowledged_by_codex": bool(existing.get("acknowledged_by_codex")),
+        "terminal_assessment": terminal_assessment,
     }
     if notify.get("mode") == "none":
         record = upsert_notification(
@@ -2272,9 +2466,8 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
             if reason:
                 fields["reason"] = reason
             record = upsert_notification(record, event_id, fields)
-            if status == "injected":
-                append_unique_text(record, "submitted_event_ids", event_id)
-                append_unique_text(record, "notified_event_ids", event_id)
+            append_unique_text(record, "submitted_event_ids", event_id)
+            append_unique_text(record, "notified_event_ids", event_id)
             events = dict(record.get("events") or {})
             event = dict(events.get(event_id) or {})
             events[event_id] = event | {
@@ -2301,14 +2494,14 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
             refused_reason = str(validation.get("reason") or "Codex pane validation failed")
         elif sdk_decision.get("decision") == "refuse":
             status = "inject_refused"
-            refused_reason = str(sdk_decision.get("reason") or "Codex SDK planner refused injection")
+            refused_reason = str(sdk_decision.get("reason") or "tmux-inject planner refused injection")
         elif (
             sdk_decision.get("decision") == "inject"
             and tmux_state.one_line_text(sdk_decision.get("target_pane"))
             and tmux_state.one_line_text(sdk_decision.get("target_pane")) != bound_pane_id
         ):
             status = "inject_refused"
-            refused_reason = "Codex SDK planner selected a pane different from the bound Codex pane"
+            refused_reason = "tmux-inject planner selected a pane different from the bound Codex pane"
         elif sdk_decision.get("decision") == "inject":
             injection = inject_tmux_wake_prompt(bound_pane_id, prompt)
             if injection.get("pasted"):
@@ -2332,7 +2525,7 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
                 refused_reason = str(injection.get("reason") or "tmux injection did not paste prompt")
         else:
             status = "inject_pending"
-            refused_reason = str(sdk_decision.get("reason") or "Codex SDK planner deferred injection")
+            refused_reason = str(sdk_decision.get("reason") or "tmux-inject planner deferred injection")
         fields = base | {
             "mode": "tmux-inject",
             "status": status,
@@ -2355,7 +2548,7 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
             fields["submitted_at"] = now
             fields["injected_at"] = now
         record = upsert_notification(record, event_id, fields)
-        if injection and injection.get("pasted") and status == "injected":
+        if injection and injection.get("pasted"):
             append_unique_text(record, "submitted_event_ids", event_id)
             append_unique_text(record, "notified_event_ids", event_id)
         events = dict(record.get("events") or {})
@@ -2466,12 +2659,20 @@ def transition_terminal(
             "pane_id": target_pane_id,
             "pane_index": target_pane_index,
             "status": status.get("status"),
+            "exit_code": status.get("exit_code"),
+            "last_output": tmux_state.tail_text(str(status.get("last_output") or ""), limit=2000),
             "status_path": status.get("status_path"),
             "task_path": task_path_for_job(paths, target_job_id),
             "log_path": status.get("log_path"),
         }
     else:
         return record
+    jobs = dict(record.get("jobs") or {})
+    job = dict(jobs.get(target_job_id) or {})
+    if "manager_sequence" in job:
+        candidate["manager_sequence"] = job["manager_sequence"]
+        if status is not None:
+            status["manager_sequence"] = job["manager_sequence"]
     record["last_terminal_event_id"] = candidate["event_id"]
     record["last_terminal_candidate"] = candidate
     events = dict(record.get("events") or {})
@@ -2566,6 +2767,16 @@ def merge_external_ack_fields(record: dict[str, Any], latest: dict[str, Any] | N
             continue
         if notification.get("acknowledged_by_codex") or str(notification.get("status") or "").startswith("handled"):
             merged = upsert_notification(merged, event_id, dict(notification))
+            merged = sync_event_from_notification(merged, event_id, dict(notification))
+    latest_events = latest.get("events") if isinstance(latest.get("events"), dict) else {}
+    merged_events = dict(merged.get("events") or {})
+    for event_id, latest_event in latest_events.items():
+        if not isinstance(latest_event, dict):
+            continue
+        if latest_event.get("acknowledged_by_codex") or latest_event.get("handled_at") or latest_event.get("handled_by_job_id"):
+            current_event = dict(merged_events.get(str(event_id)) or {})
+            merged_events[str(event_id)] = current_event | dict(latest_event)
+    merged["events"] = merged_events
     latest_verification = latest.get("bridge_verification") if isinstance(latest.get("bridge_verification"), dict) else None
     if latest_verification and latest_verification.get("event_id"):
         current_verification = merged.get("bridge_verification") if isinstance(merged.get("bridge_verification"), dict) else {}
@@ -2612,9 +2823,10 @@ def manager_status(manager_id: str, workspace: str | None = None, state_dir: str
         return {"manager_id": item_id, "found": False, "reason": error, "manager_path": str(manager_record_path(paths, item_id))}
     if record is None:
         return {"manager_id": item_id, "found": False, "reason": "manager record not found", "manager_path": str(manager_record_path(paths, item_id))}
-    job_status = load_job_status(paths, str(record.get("current_job_id") or ""))
+    current_job_id = str(record.get("current_job_id") or "")
+    job_status = status_with_manager_metadata(load_job_status(paths, current_job_id), record, current_job_id)
     active_statuses = {
-        job_id: load_job_status(paths, job_id)
+        job_id: status_with_manager_metadata(load_job_status(paths, job_id), record, job_id)
         for job_id in active_job_ids(record)
     }
     return {
@@ -2895,11 +3107,6 @@ def dashboard_cell(value: Any, width: int) -> str:
     if len(text) > width:
         text = text[: max(1, width - 1)] + "~"
     return text.ljust(width)
-
-
-def dashboard_path_label(value: Any) -> str:
-    text = tmux_state.one_line_text(value)
-    return Path(str(text)).name if text else "-"
 
 
 def dashboard_short_id(value: Any, width: int = 24) -> str:
