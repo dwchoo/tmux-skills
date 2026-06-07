@@ -1667,6 +1667,39 @@ class TmuxControlTests(unittest.TestCase):
         self.assertIn("next ready task", text)
         self.assertNotIn("newest ready task", text)
 
+    def test_skill_and_workflow_reference_stay_progressively_disclosed(self) -> None:
+        skill_lines = SKILL_DOC.read_text(encoding="utf-8").splitlines()
+        workflow_text = WORKFLOWS_DOC.read_text(encoding="utf-8")
+        workflow_lines = workflow_text.splitlines()
+
+        self.assertLess(len(skill_lines), 165)
+        self.assertLessEqual(len(workflow_lines), 100)
+        self.assertIn("Copyable examples only; the full manager", workflow_text)
+
+    def test_workflow_reference_preserves_required_examples(self) -> None:
+        text = WORKFLOWS_DOC.read_text(encoding="utf-8")
+        required_examples = [
+            "python scripts/tmux_control.py run ",
+            "python scripts/tmux_control.py manager start ",
+            "python scripts/tmux_control.py manager submit ",
+            "python scripts/tmux_control.py manager ack ",
+            "python scripts/tmux_control.py manager run-next ",
+            "python scripts/tmux_control.py task load ",
+            "python scripts/tmux_control.py monitor ",
+            "python scripts/tmux_control.py capture ",
+        ]
+
+        for example in required_examples:
+            with self.subTest(example=example):
+                self.assertIn(example, text)
+
+    def test_workflows_feature_doc_owns_detailed_manager_contract(self) -> None:
+        text = WORKFLOWS_FEATURES_DOC.read_text(encoding="utf-8")
+
+        for keyword in ["wake_id", "sidecar", "receipt", "placeholder", "timing"]:
+            with self.subTest(keyword=keyword):
+                self.assertIn(keyword, text)
+
     def test_workflows_feature_doc_commands_match_public_parser(self) -> None:
         parser = tmux_control.build_parser()
         command_lines = control_commands_from_bash_blocks(WORKFLOWS_FEATURES_DOC)

@@ -21,7 +21,7 @@ Use this file as the LLM entry point. Start with the core files for orientation,
 
 ## References
 
-- [Workflows](references/WORKFLOWS.md): Copyable tmux-skills workflow examples for long-running jobs, resume, monitors, and output review.
+- [Workflows](references/WORKFLOWS.md): Examples-only tmux-skills snippets for long-running jobs, manager handoff, resume, monitors, and output review.
 
 ## Optional
 

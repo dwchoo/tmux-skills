@@ -13,7 +13,7 @@ This directory is the LLM wiki for tmux-skills. It is the canonical place for de
 | Choose the right workflow or feature | [`workflows-and-features.md`](workflows-and-features.md) |
 | Work on managed `watch` or queue behavior | [`managed-workers.md`](managed-workers.md) |
 | Validate real tmux lifecycle behavior | [`real-use-e2e.md`](real-use-e2e.md) |
-| Copy common workflows | [`../references/WORKFLOWS.md`](../references/WORKFLOWS.md) |
+| Copy examples only | [`../references/WORKFLOWS.md`](../references/WORKFLOWS.md) |
 
 ## Maintenance rules
 
@@ -24,5 +24,5 @@ This directory is the LLM wiki for tmux-skills. It is the canonical place for de
 - `docs/llm-wiki-style-guide.md` is canonical for writing and maintaining this LLM wiki.
 - `docs/managed-workers.md` is canonical for managed worker contracts.
 - `docs/real-use-e2e.md` is canonical for scenario test intent and coverage.
-- `references/` is for copyable snippets and examples.
+- `references/` is for copyable snippets and examples only; detailed contracts stay in canonical docs.
 - Avoid duplicating long command contracts across files. Link to the canonical doc instead.
