@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import tmux_state
+import tmux_manager
 import codex_app_server_client
 
 
@@ -2117,15 +2118,9 @@ class Harness:
             result = self.poll_until("tmux-inject-response-ready", 180.0, response_ready)
             status_record = result["manager_status"].get("record") if isinstance(result.get("manager_status"), dict) else {}
             event_id = str(status_record.get("last_terminal_event_id") or "")
-            expected_prompt = "\n".join(
-                [
-                    "tmux-skills manager event is ready.",
-                    "",
-                    f"Manager ID: {manager_id}",
-                    f"Event ID: {event_id}",
-                    "",
-                    "Inspect the manager state for this workspace, decide the next action, and acknowledge the event after inspection.",
-                ]
+            expected_prompt = tmux_manager.build_tmux_inject_wake_prompt(
+                {"manager_id": manager_id},
+                {"event_id": event_id, "wake_id": tmux_manager.tmux_inject_wake_id(event_id)},
             )
             notification = status_record.get("last_notification") if isinstance(status_record.get("last_notification"), dict) else {}
             if notification.get("prompt_sha256") != hashlib.sha256(expected_prompt.encode("utf-8")).hexdigest():

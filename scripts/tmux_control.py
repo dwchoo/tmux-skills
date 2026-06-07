@@ -1597,6 +1597,47 @@ def manager(args: argparse.Namespace) -> dict[str, Any]:
             state_dir=args.state_dir,
             cwd=args.cwd,
         )
+    if args.manager_action == "notification":
+        manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
+        if args.notification_action == "list":
+            return tmux_manager.manager_notification_list(
+                manager_id=manager_id,
+                workspace=args.workspace,
+                state_dir=args.state_dir,
+                status=args.status,
+            )
+        if args.notification_action == "retry":
+            return tmux_manager.manager_notification_retry(
+                manager_id=manager_id,
+                event_id=args.event_id,
+                workspace=args.workspace,
+                state_dir=args.state_dir,
+                note=args.note,
+            )
+        if args.notification_action == "ack":
+            return tmux_manager.ack_manager_event(
+                manager_id=manager_id,
+                event_id=args.event_id,
+                workspace=args.workspace,
+                state_dir=args.state_dir,
+                note=args.note,
+            )
+        if args.notification_action == "discard":
+            return tmux_manager.manager_notification_discard(
+                manager_id=manager_id,
+                event_id=args.event_id,
+                workspace=args.workspace,
+                state_dir=args.state_dir,
+                note=args.note,
+            )
+        if args.notification_action == "clear":
+            return tmux_manager.manager_notification_clear(
+                manager_id=manager_id,
+                workspace=args.workspace,
+                state_dir=args.state_dir,
+                status=args.status,
+            )
+        die(f"unknown manager notification command: {args.notification_action}")
     if args.manager_action == "submit":
         return manager_submit(args)
     if args.manager_action == "cancel":
@@ -3999,6 +4040,35 @@ def build_parser() -> argparse.ArgumentParser:
     manager_ack_parser.add_argument("--note")
     manager_ack_parser.add_argument("--workspace")
     manager_ack_parser.add_argument("--state-dir")
+
+    manager_notification_parser = manager_subparsers.add_parser("notification", help="Inspect or manually control manager notifications")
+    manager_notification_parser.add_argument("--manager-id")
+    manager_notification_parser.add_argument("--workspace")
+    manager_notification_parser.add_argument("--state-dir")
+    manager_notification_subparsers = manager_notification_parser.add_subparsers(dest="notification_action", required=True)
+    manager_notification_list_parser = manager_notification_subparsers.add_parser("list", help="List notification states")
+    manager_notification_list_parser.add_argument("--status")
+    manager_notification_retry_parser = manager_notification_subparsers.add_parser("retry", help="Manually retry a deferred notification")
+    manager_notification_retry_parser.add_argument("--event-id", required=True)
+    manager_notification_retry_parser.add_argument("--note")
+    manager_notification_ack_parser = manager_notification_subparsers.add_parser("ack", help="Acknowledge a notification event")
+    manager_notification_ack_parser.add_argument("--event-id", required=True)
+    manager_notification_ack_parser.add_argument("--note")
+    manager_notification_discard_parser = manager_notification_subparsers.add_parser("discard", help="Discard a notification without retrying")
+    manager_notification_discard_parser.add_argument("--event-id", required=True)
+    manager_notification_discard_parser.add_argument("--note")
+    manager_notification_clear_parser = manager_notification_subparsers.add_parser("clear", help="Clear acknowledged/handled/discarded notifications")
+    manager_notification_clear_parser.add_argument("--status")
+    for scoped_parser in (
+        manager_notification_list_parser,
+        manager_notification_retry_parser,
+        manager_notification_ack_parser,
+        manager_notification_discard_parser,
+        manager_notification_clear_parser,
+    ):
+        scoped_parser.add_argument("--manager-id", default=argparse.SUPPRESS)
+        scoped_parser.add_argument("--workspace", default=argparse.SUPPRESS)
+        scoped_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
 
     manager_next_parser = manager_subparsers.add_parser("run-next", help="Queue follow-up work for a manager")
     manager_next_parser.add_argument("--manager-id")

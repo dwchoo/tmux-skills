@@ -20,6 +20,12 @@ import tmux_state  # noqa: E402
 
 
 class TmuxManagerTests(unittest.TestCase):
+    def tmux_inject_prompt(self, event_id: str = "event-one", manager_id: str = "manager-one") -> str:
+        return tmux_manager.build_tmux_inject_wake_prompt(
+            {"manager_id": manager_id},
+            {"event_id": event_id, "wake_id": tmux_manager.tmux_inject_wake_id(event_id)},
+        )
+
     def build_record(self, paths: dict[str, Path], notify: dict[str, object] | None = None) -> dict[str, object]:
         request_path = tmux_manager.write_command_request(paths, "manager-one", "job-one", "echo ok")
         record = tmux_manager.build_manager_record(
@@ -218,17 +224,21 @@ class TmuxManagerTests(unittest.TestCase):
             prompt,
             "\n".join(
                 [
+                    "ID:cbf7f0;",
                     "tmux-skills event ready. Use $tmux-control only.",
                     "",
                     "Manager ID: manager-one",
                     "Event ID: event-one",
                     "",
-                    "Inspect manager status first. Handle only the latest unacked event.",
+                    "Inspect manager status once. Handle only the latest unacked event.",
                     "If stale or already handled, ack/report only.",
                     "After run-next, wait for the next manager event; do not poll or monitor directly.",
                 ]
             ),
         )
+        self.assertEqual(tmux_manager.tmux_inject_prompt_wake_id(prompt), "cbf7f0")
+        self.assertEqual(tmux_manager.tmux_inject_prompt_wake_id("ID:cbf7f0;tmux-skills event ready"), "cbf7f0")
+        self.assertEqual(tmux_manager.tmux_inject_prompt_wake_id("ID:cbf7f0tmux-skills event ready"), "cbf7f0")
         self.assertIn("$tmux-control", prompt)
         for forbidden in (
             "Ack command",
@@ -285,8 +295,11 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(delivery.call_count, 1)
             self.assertEqual(inject.call_args.args[0], "%9")
             self.assertIn("Manager ID: manager-one", inject.call_args.args[1])
+            self.assertTrue(inject.call_args.args[1].startswith(f"ID:{tmux_manager.tmux_inject_wake_id(str(status['event_id']))};"))
             self.assertEqual(first["last_notification"]["mode"], "tmux-inject")
             self.assertEqual(first["last_notification"]["status"], "awaiting_receipt")
+            self.assertEqual(first["last_notification"]["wake_id"], tmux_manager.tmux_inject_wake_id(str(status["event_id"])))
+            self.assertEqual(first["events"][status["event_id"]]["wake_id"], tmux_manager.tmux_inject_wake_id(str(status["event_id"])))
             self.assertEqual(first["last_notification"]["delivery_check"]["decision"]["action"], "confirmed")
             self.assertIn("total", first["last_notification"]["timing"])
             self.assertIn("terminal_assessment", first["last_notification"]["timing"])
@@ -731,10 +744,11 @@ class TmuxManagerTests(unittest.TestCase):
         candidate = {"event_id": "event-one", "job_id": "job-one"}
         validation = {"safe": True}
         injection = {"injected": True, "pasted": True, "entered": True}
-        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        prompt = self.tmux_inject_prompt("event-one")
         staged_capture = "\n".join(
             [
-                "› tmux-skills event ready. Use $tmux-control only.",
+                "› ID:cbf7f0;",
+                "  tmux-skills event ready. Use $tmux-control only.",
                 "",
                 "  Manager ID: manager-one",
                 "  Event ID: event-one",
@@ -744,7 +758,8 @@ class TmuxManagerTests(unittest.TestCase):
         )
         submitted_capture = "\n".join(
             [
-                "› tmux-skills event ready. Use $tmux-control only.",
+                "› ID:cbf7f0;",
+                "  tmux-skills event ready. Use $tmux-control only.",
                 "",
                 "• Working (0s • esc to interrupt)",
             ]
@@ -790,10 +805,11 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertFalse(result["prompt_still_staged"])
 
     def test_tmux_inject_staged_prompt_requires_matching_event(self) -> None:
-        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-two")
+        prompt = self.tmux_inject_prompt("event-two")
         capture = "\n".join(
             [
-                "› tmux-skills event ready. Use $tmux-control only.",
+                "› ID:cbf7f0;",
+                "  tmux-skills event ready. Use $tmux-control only.",
                 "",
                 "  Manager ID: manager-one",
                 "  Event ID: event-one",
@@ -808,7 +824,7 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertFalse(state["safe_to_submit"])
 
     def test_tmux_inject_preflight_refuses_user_composer_text(self) -> None:
-        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        prompt = self.tmux_inject_prompt("event-one")
         capture = {
             "captured": True,
             "returncode": 0,
@@ -831,7 +847,7 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertIn("not written by tmux-skills", result["reason"])
 
     def test_tmux_inject_preflight_ignores_historical_prompt_transcript(self) -> None:
-        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        prompt = self.tmux_inject_prompt("event-one")
         capture = "\n".join(
             [
                 "› 지금 manager가 프롬프트 주입을 안하는거 같은데?",
@@ -853,7 +869,7 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertTrue(state["safe_to_inject"])
 
     def test_tmux_inject_preflight_refuses_active_user_composer_text_with_footer(self) -> None:
-        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        prompt = self.tmux_inject_prompt("event-one")
         capture = "\n".join(
             [
                 "› Explain this codebase",
@@ -869,7 +885,7 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertEqual(state["composer_preview"], "Explain this codebase")
 
     def test_tmux_inject_preflight_allows_dim_placeholder_suggestion(self) -> None:
-        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        prompt = self.tmux_inject_prompt("event-one")
         capture = "\n".join(
             [
                 "› Explain this codebase",
@@ -931,7 +947,7 @@ class TmuxManagerTests(unittest.TestCase):
         candidate = {"event_id": "event-one", "job_id": "job-one"}
         validation = {"safe": True}
         injection = {"injected": True, "pasted": True, "entered": True}
-        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        prompt = self.tmux_inject_prompt("event-one")
         capture = {
             "captured": True,
             "returncode": 0,
@@ -945,12 +961,13 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertEqual(result["composer_state"]["status"], "composer_text_present")
 
     def test_tmux_inject_detects_queued_composer_prompt_while_codex_is_working(self) -> None:
-        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        prompt = self.tmux_inject_prompt("event-one")
         capture = "\n".join(
             [
                 "• Working (8m 01s • esc to interrupt)",
                 "",
-                "› tmux-skills event ready. Use $tmux-control only.",
+                "› ID:cbf7f0;",
+                "  tmux-skills event ready. Use $tmux-control only.",
                 "",
                 "  Manager ID: manager-one",
                 "  Event ID: event-one",
@@ -971,7 +988,7 @@ class TmuxManagerTests(unittest.TestCase):
         candidate = {"event_id": "event-one", "job_id": "job-one"}
         validation = {"safe": True}
         injection = {"injected": True, "pasted": True, "entered": True}
-        prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+        prompt = self.tmux_inject_prompt("event-one")
         capture = {
             "captured": True,
             "returncode": 0,
@@ -979,7 +996,8 @@ class TmuxManagerTests(unittest.TestCase):
                 [
                     "• Working (8m 01s • esc to interrupt)",
                     "",
-                    "› tmux-skills event ready. Use $tmux-control only.",
+                    "› ID:cbf7f0;",
+                    "  tmux-skills event ready. Use $tmux-control only.",
                     "",
                     "  Manager ID: manager-one",
                     "  Event ID: event-one",
@@ -997,6 +1015,149 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertEqual(result["submit_key"], "Tab")
         self.assertEqual(result["source"], "deterministic")
         self.assertNotIn("OPENAI_API_KEY", result["reason"])
+
+    def test_tmux_inject_user_composer_text_defers_without_auto_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            status = self.build_terminal_status(paths)
+
+            with (
+                mock.patch.object(tmux_manager, "pane_codex_validation", return_value={"safe": True, "status": "live_codex"}),
+                mock.patch.object(
+                    tmux_manager,
+                    "codex_sdk_inject_decision",
+                    return_value={"decision": "inject", "target_pane": "%9", "confidence": 1.0, "reason": "ok"},
+                ),
+                mock.patch.object(
+                    tmux_manager,
+                    "inject_tmux_wake_prompt",
+                    return_value={
+                        "injected": False,
+                        "pasted": False,
+                        "entered": False,
+                        "reason": "Codex composer contains text that was not written by tmux-skills",
+                        "preflight": {
+                            "captured": True,
+                            "composer_state": {
+                                "status": "composer_text_present",
+                                "safe_to_inject": False,
+                                "safe_to_submit": False,
+                                "reason": "Codex composer contains text that was not written by tmux-skills",
+                            },
+                        },
+                    },
+                ) as inject,
+            ):
+                updated = tmux_manager.transition_terminal(record, paths=paths, status=status)
+
+            self.assertEqual(updated["last_notification"]["status"], "deferred")
+            self.assertTrue(updated["last_notification"]["requires_manual_resume"])
+            self.assertEqual(updated["submitted_event_ids"], [])
+            self.assertEqual(updated["events"][status["event_id"]]["notification_status"], "deferred")
+            inject.assert_called_once()
+
+            with (
+                mock.patch.object(tmux_manager, "tmux_inject_ack_recheck_due", return_value=True) as due,
+                mock.patch.object(tmux_manager, "notify_terminal_event") as notify,
+            ):
+                cycled = tmux_manager.manager_cycle(updated, paths=paths)
+
+            due.assert_not_called()
+            notify.assert_not_called()
+            self.assertEqual(cycled["last_notification"]["status"], "deferred")
+
+    def test_manager_notification_retry_resumes_deferred_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            event_id = "event-one"
+            record = tmux_manager.upsert_notification(
+                record,
+                event_id,
+                {
+                    "event_id": event_id,
+                    "job_id": "job-one",
+                    "mode": "tmux-inject",
+                    "status": "deferred",
+                    "notification_phase": "deferred",
+                    "requires_manual_resume": True,
+                    "defer_reason": "composer_text_present",
+                    "submitted_to_tmux": True,
+                    "injected_to_tmux": False,
+                },
+            )
+            record["submitted_event_ids"] = [event_id]
+            record["events"] = {
+                event_id: {
+                    "event_id": event_id,
+                    "job_id": "job-one",
+                    "notification_status": "deferred",
+                    "requires_manual_resume": True,
+                    "defer_reason": "composer_text_present",
+                }
+            }
+            tmux_manager.write_manager_record(paths, record)
+
+            listed = tmux_manager.manager_notification_list(manager_id="manager-one", workspace=str(workspace), status="deferred")
+            self.assertTrue(listed["found"])
+            self.assertEqual([item["event_id"] for item in listed["notifications"]], [event_id])
+            self.assertTrue(listed["notifications"][0]["requires_manual_resume"])
+
+            retried = tmux_manager.manager_notification_retry(
+                manager_id="manager-one",
+                event_id=event_id,
+                workspace=str(workspace),
+                note="resume after user review",
+            )
+
+            self.assertTrue(retried["retried"])
+            updated = retried["record"]
+            self.assertEqual(updated["last_notification"]["status"], "inject_pending")
+            self.assertEqual(updated["last_notification"]["notification_phase"], "manual_retry_ready")
+            self.assertFalse(updated["last_notification"]["requires_manual_resume"])
+            self.assertEqual(updated["submitted_event_ids"], [])
+            self.assertEqual(updated["events"][event_id]["notification_status"], "inject_pending")
+
+    def test_manager_notification_discard_and_clear_finished_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_tmux_inject_record(paths)
+            event_id = "event-one"
+            record = tmux_manager.upsert_notification(
+                record,
+                event_id,
+                {
+                    "event_id": event_id,
+                    "job_id": "job-one",
+                    "mode": "tmux-inject",
+                    "status": "deferred",
+                    "requires_manual_resume": True,
+                },
+            )
+            record["events"] = {event_id: {"event_id": event_id, "notification_status": "deferred"}}
+            tmux_manager.write_manager_record(paths, record)
+
+            discarded = tmux_manager.manager_notification_discard(
+                manager_id="manager-one",
+                event_id=event_id,
+                workspace=str(workspace),
+                note="drop stale wake",
+            )
+            self.assertTrue(discarded["discarded"])
+            self.assertEqual(discarded["record"]["last_notification"]["status"], "discarded")
+            self.assertTrue(discarded["record"]["events"][event_id]["acknowledged_by_codex"])
+
+            cleared = tmux_manager.manager_notification_clear(manager_id="manager-one", workspace=str(workspace))
+            self.assertTrue(cleared["cleared"])
+            self.assertEqual(cleared["removed_event_ids"], [event_id])
+            self.assertEqual(cleared["record"]["notifications"], [])
 
     def test_tmux_inject_followup_can_use_codex_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -1025,7 +1186,7 @@ class TmuxManagerTests(unittest.TestCase):
             candidate = {"event_id": "event-one", "job_id": "job-one"}
             validation = {"safe": True}
             injection = {"injected": True, "pasted": True, "entered": True}
-            prompt = tmux_manager.TMUX_INJECT_WAKE_PROMPT.format(manager_id="manager-one", event_id="event-one")
+            prompt = self.tmux_inject_prompt("event-one")
             capture = {
                 "captured": True,
                 "returncode": 0,
@@ -1430,6 +1591,122 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(updated["last_notification"]["receipt_retry_count"], 1)
             self.assertEqual(updated["last_notification"]["receipt_sidecar_check_count"], 1)
             self.assertEqual(updated["submitted_event_ids"], [status["event_id"]])
+
+    def test_tmux_inject_receipt_recheck_does_not_retry_when_same_wake_id_is_visible(self) -> None:
+        prompt = self.tmux_inject_prompt("event-one")
+        capture = {
+            "captured": True,
+            "returncode": 0,
+            "output": "queued messages\nID:cbf7f0;\ntmux-skills event ready. Use $tmux-control only.\n",
+            "raw_output": "queued messages\nID:cbf7f0;\ntmux-skills event ready. Use $tmux-control only.\n",
+            "omitted_chars": 0,
+        }
+        existing = {"receipt_retry_count": 0, "receipt_sidecar_check_count": 0}
+
+        with mock.patch.object(tmux_manager, "codex_sdk_receipt_recheck_decision") as sidecar:
+            result = tmux_manager.tmux_inject_receipt_recheck_decision(prompt, capture, existing, record={}, candidate={})
+
+        sidecar.assert_not_called()
+        self.assertEqual(result["action"], "wait")
+        self.assertEqual(result["status"], "queued_in_codex")
+        self.assertTrue(result["wake_visibility"]["same_wake_visible"])
+
+    def test_tmux_inject_preflight_blocks_visible_wake_id_without_active_composer(self) -> None:
+        prompt = self.tmux_inject_prompt("event-one")
+
+        same = tmux_manager.tmux_inject_composer_state(prompt, "queued messages\nID:cbf7f0;\n")
+        other = tmux_manager.tmux_inject_composer_state(prompt, "queued messages\nID:0ef821;\n")
+
+        self.assertEqual(same["status"], "same_wake_prompt_visible")
+        self.assertFalse(same["safe_to_inject"])
+        self.assertEqual(other["status"], "other_wake_prompt_staged")
+        self.assertFalse(other["safe_to_inject"])
+
+    def test_tmux_inject_receipt_recheck_blocks_when_other_wake_id_is_visible(self) -> None:
+        prompt = self.tmux_inject_prompt("event-one")
+        capture = {
+            "captured": True,
+            "returncode": 0,
+            "output": "queued messages\nID:0ef821;\ntmux-skills event ready. Use $tmux-control only.\n",
+            "raw_output": "queued messages\nID:0ef821;\ntmux-skills event ready. Use $tmux-control only.\n",
+            "omitted_chars": 0,
+        }
+
+        with mock.patch.object(tmux_manager, "codex_sdk_receipt_recheck_decision") as sidecar:
+            result = tmux_manager.tmux_inject_receipt_recheck_decision(prompt, capture, {}, record={}, candidate={})
+
+        sidecar.assert_not_called()
+        self.assertEqual(result["action"], "block")
+        self.assertEqual(result["status"], "blocked_by_other_wake")
+        self.assertEqual(result["wake_visibility"]["other_wake_ids"], ["0ef821"])
+
+    def test_tmux_inject_stale_handled_visible_wake_does_not_block_latest_event(self) -> None:
+        prompt = self.tmux_inject_prompt("event-two")
+        record = {
+            "notifications": [
+                {
+                    "event_id": "event-one",
+                    "wake_id": "cbf7f0",
+                    "status": "queued_in_codex",
+                    "acknowledged_by_codex": True,
+                    "handled_by_job_id": "job-two",
+                }
+            ],
+            "events": {
+                "event-one": {
+                    "wake_id": "cbf7f0",
+                    "acknowledged_by_codex": True,
+                    "handled_by_job_id": "job-two",
+                }
+            },
+        }
+        capture_output = "old transcript\nID:cbf7f0;\ntmux-skills event ready. Use $tmux-control only.\n"
+        state = tmux_manager.tmux_inject_composer_state(prompt, capture_output, record=record)
+
+        self.assertEqual(state["status"], "no_composer_text_detected")
+        self.assertTrue(state["safe_to_inject"])
+        self.assertEqual(state["stale_or_handled_wake_ids"], ["cbf7f0"])
+        self.assertEqual(state["other_wake_ids"], [])
+
+        capture = {"captured": True, "returncode": 0, "output": capture_output, "raw_output": capture_output, "omitted_chars": 0}
+        with mock.patch.object(
+            tmux_manager,
+            "codex_sdk_receipt_recheck_decision",
+            return_value={"action": "wait", "status": "awaiting_receipt", "reason": "sidecar waits"},
+        ) as sidecar:
+            result = tmux_manager.tmux_inject_receipt_recheck_decision(prompt, capture, {}, record=record, candidate={"event_id": "event-two"})
+
+        sidecar.assert_called_once()
+        self.assertEqual(result["status"], "awaiting_receipt")
+        self.assertEqual(result["composer_state"]["stale_or_handled_wake_ids"], ["cbf7f0"])
+
+    def test_tmux_inject_unacked_other_visible_wake_blocks_latest_event(self) -> None:
+        prompt = self.tmux_inject_prompt("event-two")
+        record = {
+            "notifications": [
+                {
+                    "event_id": "event-one",
+                    "wake_id": "cbf7f0",
+                    "status": "queued_in_codex",
+                    "acknowledged_by_codex": False,
+                    "submitted_to_tmux": True,
+                }
+            ],
+            "events": {"event-one": {"wake_id": "cbf7f0", "notification_status": "queued_in_codex"}},
+        }
+        state = tmux_manager.tmux_inject_composer_state(prompt, "queued messages\nID:cbf7f0;\n", record=record)
+
+        self.assertEqual(state["status"], "other_wake_prompt_staged")
+        self.assertFalse(state["safe_to_inject"])
+        self.assertEqual(state["active_other_wake_ids"], ["cbf7f0"])
+
+    def test_tmux_inject_unknown_visible_wake_blocks_latest_event(self) -> None:
+        prompt = self.tmux_inject_prompt("event-two")
+        state = tmux_manager.tmux_inject_composer_state(prompt, "queued messages\nID:cbf7f0;\n", record={"notifications": [], "events": {}})
+
+        self.assertEqual(state["status"], "other_wake_prompt_staged")
+        self.assertFalse(state["safe_to_inject"])
+        self.assertEqual(state["unknown_wake_ids"], ["cbf7f0"])
 
     def test_tmux_inject_blocks_receipt_recovery_after_sidecar_check_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -2412,6 +2689,8 @@ class TmuxManagerTests(unittest.TestCase):
             )
 
             self.assertTrue(result["queued"])
+            self.assertEqual(result["codex_next_action"], "wait_for_next_manager_event")
+            self.assertIn("do not poll", result["manager_controlled_reminder"])
             request_path = Path(result["command_request_path"])
             self.assertEqual(request_path.read_text(encoding="utf-8"), "echo next")
             loaded, _error = tmux_manager.read_manager_record(paths, "manager-one")

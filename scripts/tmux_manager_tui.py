@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import tmux_manager
+
 
 def read_json(path: Path) -> dict[str, Any]:
     try:
@@ -71,6 +73,10 @@ def run_textual(args: argparse.Namespace) -> int:
         """
         BINDINGS = [
             ("r", "refresh", "Refresh"),
+            ("R", "retry", "Retry"),
+            ("a", "ack", "Ack"),
+            ("x", "discard", "Discard"),
+            ("c", "clear", "Clear"),
             ("q", "quit", "Quit"),
         ]
 
@@ -87,12 +93,51 @@ def run_textual(args: argparse.Namespace) -> int:
             yield Footer()
 
         def on_mount(self) -> None:
+            self.event_ids: list[str] = []
             self.query_one("#jobs", DataTable).add_columns("job", "pane", "status", "event")
-            self.query_one("#events", DataTable).add_columns("event", "job", "status", "notify", "ack")
+            self.query_one("#events", DataTable).add_columns("wake", "event", "job", "status", "notify", "ack")
             self.set_interval(args.poll_seconds, self.refresh_tables)
             self.refresh_tables()
 
         def action_refresh(self) -> None:
+            self.refresh_tables()
+
+        def selected_event_id(self) -> str:
+            table = self.query_one("#events", DataTable)
+            row = getattr(getattr(table, "cursor_coordinate", None), "row", 0)
+            try:
+                return self.event_ids[int(row)]
+            except Exception:
+                return ""
+
+        def manager_scope(self) -> dict[str, Any]:
+            record = read_json(manager_file)
+            return {
+                "manager_id": record.get("manager_id") or args.manager_id,
+                "workspace": record.get("workspace"),
+                "state_dir": record.get("state_dir"),
+            }
+
+        def action_retry(self) -> None:
+            event_id = self.selected_event_id()
+            if event_id:
+                tmux_manager.manager_notification_retry(event_id=event_id, note="TUI retry", **self.manager_scope())
+            self.refresh_tables()
+
+        def action_ack(self) -> None:
+            event_id = self.selected_event_id()
+            if event_id:
+                tmux_manager.ack_manager_event(event_id=event_id, note="TUI ack", **self.manager_scope())
+            self.refresh_tables()
+
+        def action_discard(self) -> None:
+            event_id = self.selected_event_id()
+            if event_id:
+                tmux_manager.manager_notification_discard(event_id=event_id, note="TUI discard", **self.manager_scope())
+            self.refresh_tables()
+
+        def action_clear(self) -> None:
+            tmux_manager.manager_notification_clear(**self.manager_scope())
             self.refresh_tables()
 
         def refresh_tables(self) -> None:
@@ -119,8 +164,11 @@ def run_textual(args: argparse.Namespace) -> int:
                 jobs_table.add_row(row["job_id"], row["pane"], row["status"], row["event"])
             events_table = self.query_one("#events", DataTable)
             events_table.clear()
-            for event in events(record)[-50:]:
+            shown_events = events(record)[-50:]
+            self.event_ids = [str(event.get("event_id") or "") for event in shown_events]
+            for event in shown_events:
                 events_table.add_row(
+                    str(event.get("wake_id") or "-"),
                     str(event.get("event_id") or "-"),
                     str(event.get("job_id") or "-"),
                     str(event.get("status") or "-"),

@@ -35,7 +35,18 @@ MANAGER_PS_POC_STATUS_VERIFIED = "verified"
 MANAGER_TERMINAL_JOB_STATUSES = {"succeeded", "failed", "stopped", "timeout", "cancelled", "stale"}
 MANAGER_DELETABLE_JOB_STATUSES = MANAGER_TERMINAL_JOB_STATUSES | {"complete", "completed", "error"}
 BRIDGE_VERIFICATION_STATUSES = {"unverified", "awaiting_ack", "verified", "expired", "mismatched_config", "submission_failed"}
-TMUX_INJECT_NOTIFICATION_STATUSES = {"awaiting_receipt", "injected", "inject_pending", "inject_refused", "receipt_blocked", "coalesced"}
+TMUX_INJECT_NOTIFICATION_STATUSES = {
+    "awaiting_receipt",
+    "queued_in_codex",
+    "injected",
+    "inject_pending",
+    "inject_refused",
+    "receipt_blocked",
+    "blocked_by_other_wake",
+    "coalesced",
+    "deferred",
+    "discarded",
+}
 TMUX_INJECT_PRIMARY_SUBMIT_KEY = "C-m"
 TMUX_INJECT_FOLLOWUP_SUBMIT_KEY = "C-m"
 TMUX_INJECT_QUEUE_SUBMIT_KEY = "Tab"
@@ -50,16 +61,19 @@ DEFAULT_CODEX_SIDECAR_FAST_PATH = True
 TMUX_SKILLS_CONFIG_FILENAME = "tmux-skills.config.json"
 TMUX_INJECT_WAKE_PROMPT = "\n".join(
     [
+        "ID:{wake_id};",
         "tmux-skills event ready. Use $tmux-control only.",
         "",
         "Manager ID: {manager_id}",
         "Event ID: {event_id}",
         "",
-        "Inspect manager status first. Handle only the latest unacked event.",
+        "Inspect manager status once. Handle only the latest unacked event.",
         "If stale or already handled, ack/report only.",
         "After run-next, wait for the next manager event; do not poll or monitor directly.",
     ]
 )
+TMUX_INJECT_WAKE_ID_PATTERN = re.compile(r"ID:([0-9a-f]{6})")
+MANAGER_CONTROLLED_NEXT_REMINDER = "After manager run-next, wait for the next manager event; do not poll or monitor directly."
 
 
 def tmux_skills_config_path() -> Path:
@@ -797,6 +811,8 @@ def tmux_inject_ack_recheck_due(notification: dict[str, Any] | None) -> bool:
         return False
     if notification.get("mode") != "tmux-inject":
         return False
+    if notification.get("status") == "deferred" or notification.get("requires_manual_resume"):
+        return False
     if notification.get("status") not in {"awaiting_receipt", "injected", "inject_pending", "coalesced"}:
         return False
     delivery_check = notification.get("delivery_check") if isinstance(notification.get("delivery_check"), dict) else {}
@@ -822,9 +838,100 @@ def pending_tmux_inject_wake_event_id(record: dict[str, Any], current_event_id: 
             continue
         if notification.get("acknowledged_by_codex"):
             continue
-        if notification.get("status") in {"awaiting_receipt", "injected", "inject_pending", "receipt_blocked"} and notification.get("submitted_to_tmux"):
+        if notification.get("status") in {"queued_in_codex", "awaiting_receipt", "injected", "inject_pending", "receipt_blocked", "blocked_by_other_wake"} and notification.get("submitted_to_tmux"):
             return event_id
     return ""
+
+
+def tmux_inject_wake_id(event_id: str) -> str:
+    source = tmux_state.one_line_text(event_id) or "unknown"
+    token = re.sub(r"[^0-9a-f]", "", source.lower())
+    if len(token) >= 6:
+        return token[:6]
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:6]
+
+
+def tmux_inject_prompt_wake_id(prompt: str) -> str:
+    for line in str(prompt or "").splitlines()[:3]:
+        match = TMUX_INJECT_WAKE_ID_PATTERN.search(tmux_text.strip_ansi(line))
+        if match:
+            return match.group(1)
+    return ""
+
+
+def tmux_inject_capture_wake_ids(capture_output: str) -> list[str]:
+    ids: list[str] = []
+    for line in str(capture_output or "").splitlines()[-30:]:
+        for match in TMUX_INJECT_WAKE_ID_PATTERN.finditer(tmux_text.strip_ansi(line)):
+            wake_id = match.group(1)
+            if wake_id not in ids:
+                ids.append(wake_id)
+    return ids
+
+
+def tmux_inject_wake_records(record: dict[str, Any] | None, wake_id: str) -> list[dict[str, Any]]:
+    if not isinstance(record, dict) or not wake_id:
+        return []
+    refs: list[dict[str, Any]] = []
+    for notification in record.get("notifications", []):
+        if isinstance(notification, dict) and str(notification.get("wake_id") or "") == wake_id:
+            refs.append({"kind": "notification", "record": notification, "event_id": str(notification.get("event_id") or "")})
+    events = record.get("events") if isinstance(record.get("events"), dict) else {}
+    for event_id, event in events.items():
+        if isinstance(event, dict) and str(event.get("wake_id") or "") == wake_id:
+            refs.append({"kind": "event", "record": event, "event_id": str(event_id or event.get("event_id") or "")})
+    return refs
+
+
+def tmux_inject_wake_ref_is_stale(ref: dict[str, Any]) -> bool:
+    item = ref.get("record") if isinstance(ref.get("record"), dict) else {}
+    status = tmux_state.token_text(item.get("status") or item.get("notification_status"))
+    return bool(
+        item.get("acknowledged_by_codex")
+        or item.get("handled_at")
+        or item.get("handled_by_job_id")
+        or item.get("handled_without_ack")
+        or status in {"acknowledged", "handled"}
+    )
+
+
+def tmux_inject_classify_visible_wake_ids(
+    record: dict[str, Any] | None,
+    *,
+    current_wake_id: str,
+    visible_wake_ids: list[str],
+) -> dict[str, Any]:
+    same = [value for value in visible_wake_ids if value == current_wake_id]
+    active_other: list[str] = []
+    stale_or_handled: list[str] = []
+    unknown: list[str] = []
+    for wake_id in visible_wake_ids:
+        if wake_id == current_wake_id:
+            continue
+        refs = tmux_inject_wake_records(record, wake_id)
+        if not refs:
+            unknown.append(wake_id)
+        elif all(tmux_inject_wake_ref_is_stale(ref) for ref in refs):
+            stale_or_handled.append(wake_id)
+        else:
+            active_other.append(wake_id)
+    blocking = [*active_other, *unknown]
+    return {
+        "wake_id": current_wake_id,
+        "visible_wake_ids": visible_wake_ids,
+        "same_wake_ids": same,
+        "same_wake_visible": bool(same),
+        "active_other_wake_ids": active_other,
+        "stale_or_handled_wake_ids": stale_or_handled,
+        "unknown_wake_ids": unknown,
+        "other_wake_ids": blocking,
+    }
+
+
+def tmux_inject_wake_visibility(prompt: str, capture_output: str, record: dict[str, Any] | None = None) -> dict[str, Any]:
+    wake_id = tmux_inject_prompt_wake_id(prompt)
+    visible = tmux_inject_capture_wake_ids(capture_output)
+    return tmux_inject_classify_visible_wake_ids(record, current_wake_id=wake_id, visible_wake_ids=visible)
 
 
 def codex_capture_indicates_working(capture_output: str) -> bool:
@@ -983,7 +1090,7 @@ def tmux_inject_receipt_recheck_decision(
         sidecar_check_count = int(existing.get("receipt_sidecar_check_count") or 0)
     except (TypeError, ValueError):
         sidecar_check_count = 0
-    composer_state = tmux_inject_composer_state(prompt, output, raw_output)
+    composer_state = tmux_inject_composer_state(prompt, output, raw_output, record=record)
     if not capture.get("captured"):
         return {
             "action": "wait",
@@ -999,6 +1106,28 @@ def tmux_inject_receipt_recheck_decision(
             "status": "inject_pending",
             "reason": "wake prompt remains staged; bounded submit follow-up may be needed",
             "composer_state": composer_state,
+            "retry_count": retry_count,
+            "sidecar_check_count": sidecar_check_count,
+        }
+    wake_visibility = tmux_inject_wake_visibility(prompt, output, record=record)
+    if wake_visibility.get("other_wake_ids"):
+        return {
+            "action": "block",
+            "status": "blocked_by_other_wake",
+            "reason": f"another tmux-skills wake prompt is already visible: {', '.join(wake_visibility['other_wake_ids'])}",
+            "composer_state": composer_state,
+            "wake_visibility": wake_visibility,
+            "retry_count": retry_count,
+            "sidecar_check_count": sidecar_check_count,
+            "requires_manual_resume": True,
+        }
+    if wake_visibility.get("same_wake_visible"):
+        return {
+            "action": "wait",
+            "status": "queued_in_codex",
+            "reason": "the same tmux-skills wake prompt is already visible in Codex; not reinjecting",
+            "composer_state": composer_state,
+            "wake_visibility": wake_visibility,
             "retry_count": retry_count,
             "sidecar_check_count": sidecar_check_count,
         }
@@ -1500,6 +1629,12 @@ def build_pending_job(
     return pending
 
 
+def manager_controlled_response(result: dict[str, Any]) -> dict[str, Any]:
+    result.setdefault("codex_next_action", "wait_for_next_manager_event")
+    result.setdefault("manager_controlled_reminder", MANAGER_CONTROLLED_NEXT_REMINDER)
+    return result
+
+
 def build_manager_record(
     *,
     manager_id: str,
@@ -1621,9 +1756,16 @@ def sync_event_from_notification(record: dict[str, Any], event_id: str, notifica
         "injected_to_tmux",
         "submitted_at",
         "notification_status",
+        "wake_id",
         "codex_pane_id",
         "last_error",
         "terminal_assessment",
+        "notification_phase",
+        "blocked_at",
+        "blocked_reason",
+        "deferred_at",
+        "defer_reason",
+        "requires_manual_resume",
     ):
         if key in notification:
             fields[key] = notification[key]
@@ -1632,6 +1774,43 @@ def sync_event_from_notification(record: dict[str, Any], event_id: str, notifica
     events[event_id] = event | fields
     record["events"] = events
     return record
+
+
+def tmux_inject_defer_reason_from_injection(injection: dict[str, Any] | None) -> str:
+    if not isinstance(injection, dict):
+        return ""
+    preflight = injection.get("preflight") if isinstance(injection.get("preflight"), dict) else {}
+    composer_state = preflight.get("composer_state") if isinstance(preflight.get("composer_state"), dict) else {}
+    status = tmux_state.token_text(composer_state.get("status"))
+    if status in {"composer_text_present", "other_wake_prompt_staged"}:
+        return tmux_state.one_line_text(composer_state.get("reason")) or tmux_state.one_line_text(injection.get("reason"))
+    if composer_state and composer_state.get("safe_to_inject") is False:
+        return tmux_state.one_line_text(composer_state.get("reason")) or tmux_state.one_line_text(injection.get("reason"))
+    return ""
+
+
+def apply_deferred_notification_fields(fields: dict[str, Any], *, reason: str, now: str) -> dict[str, Any]:
+    fields["status"] = "deferred"
+    fields["notification_phase"] = "deferred"
+    fields["deferred_at"] = now
+    fields["defer_reason"] = reason
+    fields["reason"] = reason
+    fields["requires_manual_resume"] = True
+    return fields
+
+
+def tmux_inject_status_from_blocked_injection(injection: dict[str, Any] | None) -> tuple[str, str | None]:
+    if not isinstance(injection, dict):
+        return "", None
+    preflight = injection.get("preflight") if isinstance(injection.get("preflight"), dict) else {}
+    composer_state = preflight.get("composer_state") if isinstance(preflight.get("composer_state"), dict) else {}
+    status = tmux_state.token_text(composer_state.get("status"))
+    reason = tmux_state.one_line_text(composer_state.get("reason")) or tmux_state.one_line_text(injection.get("reason"))
+    if status == "same_wake_prompt_visible":
+        return "queued_in_codex", reason or "the same tmux-skills wake prompt is already visible in Codex"
+    if status == "other_wake_prompt_staged":
+        return "blocked_by_other_wake", reason or "a different tmux-skills wake prompt is already visible in Codex"
+    return "", None
 
 
 def mark_last_terminal_event_handled(record: dict[str, Any], *, next_job_id: str) -> dict[str, Any]:
@@ -1864,41 +2043,41 @@ def queue_manager_job(
     allow_parallel: bool = False,
 ) -> dict[str, Any]:
     if not tmux_state.one_line_text(job_id):
-        return {"manager_id": manager_id, "queued": False, "reason": "manager run-next requires nonblank --job-id"}
+        return manager_controlled_response({"manager_id": manager_id, "queued": False, "reason": "manager run-next requires nonblank --job-id"})
     paths = manager_paths(workspace, state_dir)
     record, error = read_manager_record(paths, manager_id)
     item_id = tmux_state.safe_id(job_id)
     if error:
-        return {"manager_id": manager_id_value(manager_id), "job_id": item_id, "queued": False, "reason": error}
+        return manager_controlled_response({"manager_id": manager_id_value(manager_id), "job_id": item_id, "queued": False, "reason": error})
     if record is None:
-        return {"manager_id": manager_id_value(manager_id), "job_id": item_id, "queued": False, "reason": "manager record not found"}
+        return manager_controlled_response({"manager_id": manager_id_value(manager_id), "job_id": item_id, "queued": False, "reason": "manager record not found"})
     target_pane_id = tmux_state.one_line_text(pane_id) or tmux_state.one_line_text(record.get("worker_pane_id"))
     if not target_pane_id:
-        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager has no worker pane"}
+        return manager_controlled_response({"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager has no worker pane"})
     if record.get("pending_job"):
-        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager already has a pending job"}
+        return manager_controlled_response({"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager already has a pending job"})
     if not allow_parallel and (record.get("status") == "running" or active_job_ids(record)):
-        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager already has active jobs"}
+        return manager_controlled_response({"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager already has active jobs"})
     if pane_has_active_job(record, target_pane_id, excluding_job_id=item_id):
-        return {
+        return manager_controlled_response({
             "manager_id": record["manager_id"],
             "job_id": item_id,
             "queued": False,
             "reason": f"worker pane already has an active job: {target_pane_id}",
-        }
+        })
     allowed, gate_reason = manager_queue_gate(record)
     if not allowed:
-        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": gate_reason}
+        return manager_controlled_response({"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": gate_reason})
 
     text, read_error = command_text_from_source(command_text, command_file)
     if read_error:
-        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": read_error}
+        return manager_controlled_response({"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": read_error})
     if not tmux_state.one_line_text(text):
-        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "command is blank"}
+        return manager_controlled_response({"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "command is blank"})
 
     record = preserve_external_cancel_state(paths, record)
     if manager_cancel_state(record):
-        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager cancellation is requested"}
+        return manager_controlled_response({"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager cancellation is requested"})
 
     request_path = write_command_request(paths, record["manager_id"], item_id, str(text))
     record = mark_last_terminal_event_handled(record, next_job_id=item_id)
@@ -1919,16 +2098,16 @@ def queue_manager_job(
     if manager_cancel_state(record):
         request_path.unlink(missing_ok=True)
         record = write_manager_record(paths, record)
-        return {"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager cancellation is requested"}
+        return manager_controlled_response({"manager_id": record["manager_id"], "job_id": item_id, "queued": False, "reason": "manager cancellation is requested"})
     record = write_manager_record(paths, record)
-    return {
+    return manager_controlled_response({
         "manager_id": record["manager_id"],
         "job_id": item_id,
         "queued": True,
         "manager_path": record["manager_path"],
         "command_request_path": str(request_path),
         "record": record,
-    }
+    })
 
 
 def ack_manager_event(
@@ -2061,6 +2240,209 @@ def ack_manager_event(
         "manager_path": record["manager_path"],
         "record": record,
     }
+
+
+def notification_action_history(notification: dict[str, Any], action: str, *, note: str | None = None) -> list[dict[str, Any]]:
+    history = notification.get("manual_action_history")
+    rows = [dict(value) for value in history if isinstance(value, dict)] if isinstance(history, list) else []
+    entry = {"action": action, "at": tmux_state.utc_now()}
+    if note:
+        entry["note"] = tmux_state.one_line_text(note)
+    rows.append(entry)
+    return rows[-20:]
+
+
+def manager_notification_list(
+    *,
+    manager_id: str,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    item_id = manager_id_value(manager_id)
+    paths = manager_paths(workspace, state_dir)
+    record, error = read_manager_record(paths, item_id)
+    if error:
+        return {"manager_id": item_id, "found": False, "reason": error, "notifications": []}
+    if record is None:
+        return {"manager_id": item_id, "found": False, "reason": "manager record not found", "notifications": []}
+    wanted = tmux_state.token_text(status)
+    rows: list[dict[str, Any]] = []
+    events = record.get("events") if isinstance(record.get("events"), dict) else {}
+    for notification in record.get("notifications") or []:
+        if not isinstance(notification, dict):
+            continue
+        event_id = tmux_state.one_line_text(notification.get("event_id"))
+        item_status = tmux_state.token_text(notification.get("status")) or "unknown"
+        if wanted and item_status != wanted:
+            continue
+        event = events.get(event_id) if isinstance(events.get(event_id), dict) else {}
+        rows.append(
+            {
+                "event_id": event_id,
+                "wake_id": notification.get("wake_id") or event.get("wake_id"),
+                "job_id": notification.get("job_id") or event.get("job_id"),
+                "status": item_status,
+                "mode": notification.get("mode"),
+                "acknowledged_by_codex": bool(notification.get("acknowledged_by_codex") or event.get("acknowledged_by_codex")),
+                "submitted_to_tmux": bool(notification.get("submitted_to_tmux")),
+                "injected_to_tmux": bool(notification.get("injected_to_tmux")),
+                "requires_manual_resume": bool(notification.get("requires_manual_resume")),
+                "receipt_retry_count": notification.get("receipt_retry_count"),
+                "receipt_sidecar_check_count": notification.get("receipt_sidecar_check_count"),
+                "sidecar_decision": (notification.get("receipt_check") or {}).get("action") if isinstance(notification.get("receipt_check"), dict) else None,
+                "defer_reason": notification.get("defer_reason") or notification.get("reason") or event.get("defer_reason"),
+                "observed_at": notification.get("observed_at") or event.get("observed_at"),
+            }
+        )
+    return {"manager_id": item_id, "found": True, "manager_path": record.get("manager_path"), "notifications": rows}
+
+
+def manager_notification_retry(
+    *,
+    manager_id: str,
+    event_id: str,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    item_id = manager_id_value(manager_id)
+    target_event_id = tmux_state.one_line_text(event_id)
+    if not target_event_id:
+        return {"manager_id": item_id, "event_id": event_id, "retried": False, "reason": "notification retry requires --event-id"}
+    paths = manager_paths(workspace, state_dir)
+    record, error = read_manager_record(paths, item_id)
+    if error:
+        return {"manager_id": item_id, "event_id": target_event_id, "retried": False, "reason": error}
+    if record is None:
+        return {"manager_id": item_id, "event_id": target_event_id, "retried": False, "reason": "manager record not found"}
+    notification = notification_for_event(record, target_event_id)
+    if notification is None:
+        return {"manager_id": item_id, "event_id": target_event_id, "retried": False, "reason": "notification not found"}
+    if notification.get("acknowledged_by_codex"):
+        return {"manager_id": item_id, "event_id": target_event_id, "retried": False, "reason": "notification is already acknowledged"}
+    if notification.get("status") != "deferred" and not notification.get("requires_manual_resume"):
+        return {"manager_id": item_id, "event_id": target_event_id, "retried": False, "reason": "notification is not deferred"}
+    now = tmux_state.utc_now()
+    fields = {
+        "status": "inject_pending",
+        "notification_phase": "manual_retry_ready",
+        "manual_resumed_at": now,
+        "requires_manual_resume": False,
+        "submitted_to_tmux": False,
+        "injected_to_tmux": False,
+        "reason": tmux_state.one_line_text(note) or "manual notification retry requested",
+        "manual_action_history": notification_action_history(notification, "retry", note=note),
+    }
+    record = upsert_notification(record, target_event_id, fields)
+    record["submitted_event_ids"] = [value for value in list(record.get("submitted_event_ids") or []) if str(value) != target_event_id]
+    events = dict(record.get("events") or {})
+    event = dict(events.get(target_event_id) or {})
+    events[target_event_id] = event | {
+        "event_id": target_event_id,
+        "notification_status": "inject_pending",
+        "notification_phase": "manual_retry_ready",
+        "requires_manual_resume": False,
+        "submitted_to_tmux": False,
+        "injected_to_tmux": False,
+        "last_error": fields["reason"],
+    }
+    record["events"] = events
+    record = refresh_aggregate_status(record)
+    record = preserve_external_cancel_state(paths, record)
+    record = write_manager_record(paths, record)
+    return {"manager_id": item_id, "event_id": target_event_id, "retried": True, "manager_path": record["manager_path"], "record": record}
+
+
+def manager_notification_discard(
+    *,
+    manager_id: str,
+    event_id: str,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    item_id = manager_id_value(manager_id)
+    target_event_id = tmux_state.one_line_text(event_id)
+    if not target_event_id:
+        return {"manager_id": item_id, "event_id": event_id, "discarded": False, "reason": "notification discard requires --event-id"}
+    paths = manager_paths(workspace, state_dir)
+    record, error = read_manager_record(paths, item_id)
+    if error:
+        return {"manager_id": item_id, "event_id": target_event_id, "discarded": False, "reason": error}
+    if record is None:
+        return {"manager_id": item_id, "event_id": target_event_id, "discarded": False, "reason": "manager record not found"}
+    notification = notification_for_event(record, target_event_id) or {}
+    now = tmux_state.utc_now()
+    reason = tmux_state.one_line_text(note) or "manual notification discard requested"
+    fields = {
+        "event_id": target_event_id,
+        "mode": notification.get("mode") or "manual",
+        "status": "discarded",
+        "notification_phase": "discarded",
+        "acknowledged_by_codex": True,
+        "acknowledged_at": now,
+        "ack_note": reason,
+        "handled_without_ack": True,
+        "requires_manual_resume": False,
+        "reason": reason,
+        "manual_action_history": notification_action_history(notification, "discard", note=note),
+    }
+    record = upsert_notification(record, target_event_id, fields)
+    events = dict(record.get("events") or {})
+    event = dict(events.get(target_event_id) or {})
+    events[target_event_id] = event | {
+        "event_id": target_event_id,
+        "notification_status": "discarded",
+        "notification_phase": "discarded",
+        "acknowledged_by_codex": True,
+        "acknowledged_at": now,
+        "ack_note": reason,
+        "handled_without_ack": True,
+        "requires_manual_resume": False,
+        "last_error": reason,
+    }
+    record["events"] = events
+    record["last_ack"] = {"event_id": target_event_id, "acknowledged_at": now, "turn_id": "", "note": reason}
+    record = refresh_aggregate_status(record)
+    record = preserve_external_cancel_state(paths, record)
+    record = write_manager_record(paths, record)
+    return {"manager_id": item_id, "event_id": target_event_id, "discarded": True, "manager_path": record["manager_path"], "record": record}
+
+
+def manager_notification_clear(
+    *,
+    manager_id: str,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    item_id = manager_id_value(manager_id)
+    paths = manager_paths(workspace, state_dir)
+    record, error = read_manager_record(paths, item_id)
+    if error:
+        return {"manager_id": item_id, "cleared": False, "reason": error}
+    if record is None:
+        return {"manager_id": item_id, "cleared": False, "reason": "manager record not found"}
+    clearable_default = {"acknowledged", "handled", "discarded"}
+    wanted = tmux_state.token_text(status)
+    clearable = {wanted} if wanted else clearable_default
+    kept: list[dict[str, Any]] = []
+    removed: list[str] = []
+    for notification in record.get("notifications") or []:
+        if not isinstance(notification, dict):
+            continue
+        event_id = tmux_state.one_line_text(notification.get("event_id"))
+        if tmux_state.token_text(notification.get("status")) in clearable:
+            removed.append(event_id)
+            continue
+        kept.append(notification)
+    record["notifications"] = kept
+    record["last_notification"] = kept[-1] if kept else None
+    record = refresh_aggregate_status(record)
+    record = preserve_external_cancel_state(paths, record)
+    record = write_manager_record(paths, record)
+    return {"manager_id": item_id, "cleared": True, "removed_event_ids": removed, "manager_path": record["manager_path"], "record": record}
 
 
 def parse_json_output(stdout: str) -> dict[str, Any] | None:
@@ -2423,9 +2805,12 @@ def codex_sdk_inject_decision(
 
 
 def build_tmux_inject_wake_prompt(record: dict[str, Any], candidate: dict[str, Any]) -> str:
+    event_id = str(candidate.get("event_id") or "unknown")
+    wake_id = tmux_state.one_line_text(candidate.get("wake_id")) or tmux_inject_wake_id(event_id)
     return TMUX_INJECT_WAKE_PROMPT.format(
+        wake_id=wake_id,
         manager_id=record.get("manager_id") or "unknown",
-        event_id=candidate.get("event_id") or "unknown",
+        event_id=event_id,
     )
 
 
@@ -2548,10 +2933,16 @@ def latest_codex_composer_block(capture_output: str) -> str:
     return ""
 
 
-def tmux_inject_composer_state(prompt: str, capture_output: str, raw_capture_output: str | None = None) -> dict[str, Any]:
+def tmux_inject_composer_state(
+    prompt: str,
+    capture_output: str,
+    raw_capture_output: str | None = None,
+    record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     block = latest_codex_composer_block(capture_output)
     raw_block = latest_codex_composer_block(raw_capture_output or "")
     staged_block = latest_staged_wake_prompt_block(prompt, capture_output)
+    wake_visibility = tmux_inject_wake_visibility(prompt, capture_output, record=record)
     if staged_block:
         return {
             "status": "manager_wake_prompt_staged",
@@ -2559,6 +2950,25 @@ def tmux_inject_composer_state(prompt: str, capture_output: str, raw_capture_out
             "safe_to_submit": True,
             "prompt_still_staged": wake_prompt_still_staged(prompt, capture_output),
             "reason": "manager wake prompt is staged in the Codex composer",
+            **wake_visibility,
+        }
+    if wake_visibility.get("other_wake_ids"):
+        return {
+            "status": "other_wake_prompt_staged",
+            "safe_to_inject": False,
+            "safe_to_submit": False,
+            "prompt_still_staged": False,
+            "reason": "a different tmux-skills wake prompt is already visible",
+            **wake_visibility,
+        }
+    if wake_visibility.get("same_wake_visible"):
+        return {
+            "status": "same_wake_prompt_visible",
+            "safe_to_inject": False,
+            "safe_to_submit": False,
+            "prompt_still_staged": False,
+            "reason": "the same tmux-skills wake prompt is already visible in Codex",
+            **wake_visibility,
         }
     if not block:
         return {
@@ -2567,6 +2977,7 @@ def tmux_inject_composer_state(prompt: str, capture_output: str, raw_capture_out
             "safe_to_submit": False,
             "prompt_still_staged": False,
             "reason": "no Codex composer text detected in bounded capture",
+            **wake_visibility,
         }
     content = codex_composer_block_content(block)
     if not content:
@@ -2576,6 +2987,7 @@ def tmux_inject_composer_state(prompt: str, capture_output: str, raw_capture_out
             "safe_to_submit": False,
             "prompt_still_staged": False,
             "reason": "Codex composer appears empty",
+            **wake_visibility,
         }
     if raw_block and codex_composer_block_is_placeholder(raw_block):
         return {
@@ -2585,8 +2997,21 @@ def tmux_inject_composer_state(prompt: str, capture_output: str, raw_capture_out
             "prompt_still_staged": False,
             "reason": "Codex composer shows a placeholder suggestion, not user-entered text",
             "composer_preview": content[:120],
+            **wake_visibility,
         }
-    if content.startswith("tmux-skills event ready"):
+    content_wake_ids = tmux_inject_capture_wake_ids(content)
+    prompt_wake_id = tmux_inject_prompt_wake_id(prompt)
+    if prompt_wake_id and prompt_wake_id in content_wake_ids:
+        return {
+            "status": "same_wake_prompt_visible",
+            "safe_to_inject": False,
+            "safe_to_submit": False,
+            "prompt_still_staged": False,
+            "reason": "the same tmux-skills wake prompt is already visible in Codex",
+            "composer_preview": content[:120],
+            **wake_visibility,
+        }
+    if content.startswith("tmux-skills event ready") or content.startswith("ID:") or content_wake_ids:
         return {
             "status": "other_wake_prompt_staged",
             "safe_to_inject": False,
@@ -2594,6 +3019,7 @@ def tmux_inject_composer_state(prompt: str, capture_output: str, raw_capture_out
             "prompt_still_staged": False,
             "reason": "a different tmux-skills wake prompt is already staged",
             "composer_preview": content[:120],
+            **wake_visibility,
         }
     return {
         "status": "composer_text_present",
@@ -2602,6 +3028,7 @@ def tmux_inject_composer_state(prompt: str, capture_output: str, raw_capture_out
         "prompt_still_staged": False,
         "reason": "Codex composer contains text that was not written by tmux-skills",
         "composer_preview": content[:120],
+        **wake_visibility,
     }
 
 
@@ -2683,7 +3110,7 @@ def codex_sdk_inject_followup_decision(
             prompt=prompt,
             capture_output=output,
         ) | {"source": "env"}
-    composer_state = tmux_inject_composer_state(prompt, output, str(capture.get("raw_output") or ""))
+    composer_state = tmux_inject_composer_state(prompt, output, str(capture.get("raw_output") or ""), record=record)
     if composer_state.get("status") in {"composer_text_present", "other_wake_prompt_staged"}:
         return {
             "action": "defer",
@@ -2844,7 +3271,7 @@ def send_tmux_submit_key(pane_id: str, submit_key: str) -> dict[str, Any]:
     }
 
 
-def inject_tmux_wake_prompt(pane_id: str, prompt: str) -> dict[str, Any]:
+def inject_tmux_wake_prompt(pane_id: str, prompt: str, record: dict[str, Any] | None = None) -> dict[str, Any]:
     total_start = monotonic_ms()
     target = tmux_state.one_line_text(pane_id)
     if not target:
@@ -2855,6 +3282,7 @@ def inject_tmux_wake_prompt(pane_id: str, prompt: str) -> dict[str, Any]:
         prompt,
         str(preflight_capture.get("output") or ""),
         str(preflight_capture.get("raw_output") or ""),
+        record=record,
     )
     preflight_timing = timing_entry(preflight_start, captured=preflight_capture.get("captured"), status=preflight_state.get("status"))
     if (not preflight_capture.get("captured")) or not preflight_state.get("safe_to_inject"):
@@ -3184,6 +3612,8 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
     now = tmux_state.utc_now()
     notification_timing: dict[str, Any] = {}
     existing = notification_for_event(record, event_id) or {}
+    wake_id = tmux_state.one_line_text(existing.get("wake_id")) or tmux_state.one_line_text(candidate.get("wake_id")) or tmux_inject_wake_id(event_id)
+    candidate["wake_id"] = wake_id
     if event_id in submitted and not (
         notify.get("mode") == "tmux-inject"
         and not existing.get("acknowledged_by_codex")
@@ -3212,6 +3642,7 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
         "acknowledged_by_codex": bool(existing.get("acknowledged_by_codex")),
         "terminal_assessment": terminal_assessment,
         "timing": notification_timing,
+        "wake_id": wake_id,
     }
     if notify.get("mode") == "none":
         notification_timing["total"] = timing_entry(notify_start)
@@ -3265,6 +3696,7 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
                 "submitted_to_tmux": False,
                 "injected_to_tmux": False,
                 "codex_pane_id": bound_pane_id,
+                "wake_id": wake_id,
                 "coalesced_by_event_id": coalesced_by_event_id,
                 "last_error": reason,
             }
@@ -3275,7 +3707,7 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
         notification_timing["pane_validation"] = timing_entry(validation_start, safe=validation.get("safe"), status=validation.get("status"))
         if (
             existing.get("mode") == "tmux-inject"
-            and existing.get("status") in {"awaiting_receipt", "inject_pending", "injected", "receipt_blocked"}
+            and existing.get("status") in {"queued_in_codex", "awaiting_receipt", "inject_pending", "injected", "receipt_blocked"}
             and existing.get("submitted_to_tmux")
             and bound_pane_id
             and validation.get("safe")
@@ -3307,7 +3739,7 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
                     status, reason = tmux_inject_status_after_delivery(delivery_check, injection)
                 elif action == "retry":
                     injection_start = monotonic_ms()
-                    injection = inject_tmux_wake_prompt(bound_pane_id, prompt)
+                    injection = inject_tmux_wake_prompt(bound_pane_id, prompt, record=record)
                     notification_timing["prompt_injection"] = timing_entry(injection_start, pasted=injection.get("pasted"), injected=injection.get("injected"), receipt_retry=True)
                     if isinstance(injection.get("timing"), dict):
                         notification_timing["prompt_injection_detail"] = injection.get("timing")
@@ -3319,8 +3751,11 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
                             notification_timing["delivery_check_detail"] = delivery_check.get("timing")
                         status, reason = tmux_inject_status_after_delivery(delivery_check, injection)
                     else:
-                        status = "inject_pending"
                         reason = str(injection.get("reason") or "tmux receipt retry did not paste prompt")
+                        blocked_status, blocked_reason = tmux_inject_status_from_blocked_injection(injection)
+                        defer_reason = tmux_inject_defer_reason_from_injection(injection)
+                        status = blocked_status or ("deferred" if defer_reason else "inject_pending")
+                        reason = blocked_reason or defer_reason or reason
                 else:
                     status = str(receipt_check.get("status") or "awaiting_receipt")
                     reason = str(receipt_check.get("reason") or "tmux-inject delivery awaits Codex ack")
@@ -3360,6 +3795,13 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
                 fields["injected_at"] = now
             if reason:
                 fields["reason"] = reason
+            if status == "deferred":
+                apply_deferred_notification_fields(fields, reason=reason or "tmux-inject deferred", now=now)
+            elif status == "blocked_by_other_wake":
+                fields["notification_phase"] = "blocked"
+                fields["blocked_at"] = now
+                fields["blocked_reason"] = reason
+                fields["requires_manual_resume"] = True
             record = upsert_notification(record, event_id, fields)
             append_unique_text(record, "submitted_event_ids", event_id)
             append_unique_text(record, "notified_event_ids", event_id)
@@ -3373,6 +3815,13 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
                 "injected_to_tmux": bool(injection.get("injected")),
                 "codex_pane_id": bound_pane_id,
                 "last_error": reason,
+                "notification_phase": fields.get("notification_phase"),
+                "wake_id": wake_id,
+                "blocked_at": fields.get("blocked_at"),
+                "blocked_reason": fields.get("blocked_reason"),
+                "deferred_at": fields.get("deferred_at"),
+                "defer_reason": fields.get("defer_reason"),
+                "requires_manual_resume": fields.get("requires_manual_resume"),
             }
             record["events"] = events
             return record
@@ -3403,7 +3852,7 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
             refused_reason = "tmux-inject planner selected a pane different from the bound Codex pane"
         elif sdk_decision.get("decision") == "inject":
             injection_start = monotonic_ms()
-            injection = inject_tmux_wake_prompt(bound_pane_id, prompt)
+            injection = inject_tmux_wake_prompt(bound_pane_id, prompt, record=record)
             notification_timing["prompt_injection"] = timing_entry(injection_start, pasted=injection.get("pasted"), injected=injection.get("injected"))
             if isinstance(injection.get("timing"), dict):
                 notification_timing["prompt_injection_detail"] = injection.get("timing")
@@ -3415,8 +3864,11 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
                     notification_timing["delivery_check_detail"] = delivery_check.get("timing")
                 status, refused_reason = tmux_inject_status_after_delivery(delivery_check, injection)
             else:
-                status = "inject_pending"
                 refused_reason = str(injection.get("reason") or "tmux injection did not paste prompt")
+                blocked_status, blocked_reason = tmux_inject_status_from_blocked_injection(injection)
+                defer_reason = tmux_inject_defer_reason_from_injection(injection)
+                status = blocked_status or ("deferred" if defer_reason else "inject_pending")
+                refused_reason = blocked_reason or defer_reason or refused_reason
         else:
             status = "inject_pending"
             refused_reason = str(sdk_decision.get("reason") or "tmux-inject planner deferred injection")
@@ -3439,6 +3891,13 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
             fields["delivery_check"] = delivery_check
         if refused_reason:
             fields["reason"] = refused_reason
+        if status == "deferred":
+            apply_deferred_notification_fields(fields, reason=refused_reason or "tmux-inject deferred", now=now)
+        elif status == "blocked_by_other_wake":
+            fields["notification_phase"] = "blocked"
+            fields["blocked_at"] = now
+            fields["blocked_reason"] = refused_reason
+            fields["requires_manual_resume"] = True
         if injection and injection.get("pasted"):
             fields["submitted_at"] = now
             fields["injected_at"] = now
@@ -3456,6 +3915,13 @@ def notify_terminal_event(record: dict[str, Any], candidate: dict[str, Any]) -> 
             "injected_to_tmux": bool(injection and injection.get("injected")),
             "codex_pane_id": bound_pane_id,
             "last_error": refused_reason,
+            "notification_phase": fields.get("notification_phase"),
+            "wake_id": wake_id,
+            "blocked_at": fields.get("blocked_at"),
+            "blocked_reason": fields.get("blocked_reason"),
+            "deferred_at": fields.get("deferred_at"),
+            "defer_reason": fields.get("defer_reason"),
+            "requires_manual_resume": fields.get("requires_manual_resume"),
         }
         record["events"] = events
         return record
@@ -3630,6 +4096,10 @@ def manager_cycle(record: dict[str, Any], *, paths: dict[str, Path]) -> dict[str
             if event.get("acknowledged_by_codex"):
                 continue
             notification = notification_for_event(record, event_id)
+            if isinstance(notification, dict) and (
+                notification.get("status") == "deferred" or notification.get("requires_manual_resume")
+            ):
+                continue
             if notification is None or tmux_inject_ack_recheck_due(notification):
                 record = notify_terminal_event(record, event)
 
