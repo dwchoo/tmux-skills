@@ -63,6 +63,8 @@ def acknowledge_status(paths: dict[str, Any], status: dict[str, Any]) -> str | N
 
 
 def manager_owns_terminal(paths: dict[str, Any], status: dict[str, Any]) -> bool:
+    if status.get("manager_owned") is True or tmux_state.one_line_text(status.get("manager_id")):
+        return True
     job_id = str(status.get("id") or status.get("job_id") or "")
     event_id = str(status.get("event_id") or "")
     status_path = str(status.get("status_path") or "")

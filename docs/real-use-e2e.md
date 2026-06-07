@@ -78,9 +78,59 @@ Full-only scenarios:
 
 현재 핵심 데모는 visible manager가 현재 tmux session에서 background process로 유지되고, worker pane에서 15초 tick 출력 후 random digit을 종료하며, `tmux-inject` wake prompt가 bound Codex pane으로 전달되고, Codex가 manager state를 확인한 뒤 `manager ack`를 기록하는 흐름이다. `tmux-inject` wake prompt는 `ID:<six-hex-wake-id>;` 첫 줄을 사용하고, stale/handled wake id가 화면에 남아 있어도 최신 event injection을 막지 않아야 한다. 반복 데모는 첫 번째 `0` 또는 `1`은 제외하고 두 번째 `0` 또는 `1`이 나올 때까지 `manager submit`을 반복해야 하며, manager pane과 worker pane layout을 유지해야 한다.
 
-이 데모에 직접 필요한 경로는 `manager start --process-mode background --notify tmux-inject`, `manager submit`, terminal event 기록, tmux-inject delivery check, `manager ack`, manager cleanup/cancel safety, 그리고 manager-owned raw status를 lifecycle hook fallback에서 제외하는 동작이다. 독립 `bridge register|start|status|cancel` daemon 경로, app-server PoC fixture, legacy state compatibility, watch/queue/autopilot 경로는 별도 시나리오가 요구할 때만 유지한다. 코드 정리는 이 core demo boundary를 깨지 않는 선에서 진행하고, 삭제 전에는 해당 항목이 이 표의 시나리오나 현재 문서 계약에 필요한지 확인한다.
+이 데모에 직접 필요한 경로는 `manager start --process-mode background --notify tmux-inject`, `manager submit`, terminal event 기록, tmux-inject delivery check, `manager ack`, manager cleanup/cancel safety다. Lifecycle hook은 기본 데모 경로에 필요하지 않은 optional fallback이며, 독립 `bridge register|start|status|cancel` daemon 경로, app-server PoC fixture, legacy state compatibility, watch/queue/autopilot 경로는 별도 시나리오가 요구할 때만 유지한다. 코드 정리는 이 core demo boundary를 깨지 않는 선에서 진행하고, 삭제 전에는 해당 항목이 이 표의 시나리오나 현재 문서 계약에 필요한지 확인한다.
 
 `tmux-inject` delivery check는 bound Codex pane capture에서 `Working` 상태가 보이더라도 마지막 wake prompt 블록과 composer footer가 함께 남아 있으면 staged prompt로 판정해야 한다. 이 deterministic staged 판정은 sidecar의 `confirmed` 결정보다 우선하며, prompt가 남아 있으면 manager는 bounded submit 또는 queue follow-up을 실행한 뒤 다시 capture해야 한다. footer가 `queue message`이면 manager는 Enter 재전송이 아니라 bounded `Tab` follow-up을 사용해 현재 작업 뒤로 prompt를 queue해야 하며, ack가 기록되기 전까지 event를 receipt로 처리하지 않는다. Wake prompt 첫 줄은 `ID:<wake_id>;`이고, 같은 `wake_id`가 이미 Codex composer/queue에 보이면 manager는 재주입하지 않고 `queued_in_codex`로 기록해야 한다. 다른 active unacknowledged 또는 unknown wake id가 보이면 새 prompt를 넣지 않고 `blocked_by_other_wake` 또는 `deferred` 상태로 사용자의 TUI/CLI 선택을 기다리지만, acknowledged/handled wake id는 stale evidence로만 기록하고 최신 event를 막지 않는다. Codex는 manager event prompt를 받은 뒤 manager state를 1회 inspect하고, stale/handled event는 report-only 처리하며, `manager run-next` 후에는 직접 worker pane이나 manager status를 polling하지 않고 다음 manager event를 기다려야 한다.
+
+## Basic Demo Scenario
+
+이 시나리오는 실제 사용자가 보는 기본 시연 흐름이다. Harness scenario는 아래 절차를 자동화해서 검증하되, 사람이 시연할 때도 같은 제약과 성공 기준을 따른다.
+
+### Constraints
+
+- 현재 tmux session에서 진행한다.
+- 기존 manager가 있으면 `manager start`를 다시 실행해서 같은 workspace/window의 manager를 재사용하거나 새 작업을 그 manager에 붙인다.
+- 완료 후 manager pane과 worker pane은 닫지 않는다.
+- manager가 떠 있는 동안 tmux-skills로 실행하는 장기 스크립트는 직접 pane에 보내지 않고 manager를 통해 다른 worker pane에서 실행한다.
+
+### Procedure
+
+1. 현재 Codex pane을 기준으로 background process mode manager를 띄운다.
+
+   ```bash
+   python scripts/tmux_control.py current
+   python scripts/tmux_control.py manager start \
+     --process-mode background \
+     --notify tmux-inject \
+     --codex-pane current
+   ```
+
+2. manager가 살아 있으면 이후 장기 작업은 `manager submit`으로만 제출한다. 이 데모의 worker command는 attempt 번호를 출력하고, 1초 간격으로 15개 tick을 출력한 뒤 random digit `0`부터 `9` 중 하나를 출력하고 종료한다.
+
+   ```bash
+   python scripts/tmux_control.py manager submit \
+     --job-id random-demo-1 \
+     --command 'python3 -c "import random,time; attempt=1; print(f\"ATTEMPT={attempt}\", flush=True); [(print(f\"tick {i}/15\", flush=True), time.sleep(1)) for i in range(1,16)]; print(f\"RANDOM_DIGIT={random.randint(0,9)}\", flush=True)"'
+   ```
+
+3. worker command가 terminal 상태가 되면 manager가 bound Codex pane에 `ID:<wake_id>;`로 시작하는 tmux-inject wake prompt를 보낸다.
+
+4. Codex는 wake prompt를 받은 뒤 `manager status`를 한 번만 inspect하고, 최신 unacknowledged terminal event를 확인한 뒤 `manager ack --event-id EVENT_ID`를 기록한다.
+
+5. Codex는 event/job의 status 또는 worker pane output을 tmux-skills로 읽고, 사용자에게 `숫자는 N이 나왔습니다.`라고 보고한다.
+
+6. 출력 숫자가 `0` 또는 `1`이 나올 때까지 Codex가 `manager submit`으로 다음 작업을 반복한다. 단, 첫 번째 시도에서 `0` 또는 `1`이 나오면 성공으로 세지 않고 최소 한 번 더 실행한다.
+
+7. 반복 중에도 Codex는 worker pane을 직접 polling하지 않는다. 각 제출 후에는 다음 manager event를 기다리고, event를 받을 때마다 status inspect 1회, ack 1회, 결과 보고 또는 다음 `manager submit` 1회만 수행한다.
+
+### Success Criteria
+
+- manager는 Codex-owned background terminal running 상태로 유지되고, `/ps`에서 추적 가능한 manager process로 남는다.
+- 작업은 현재 tmux session의 별도 worker pane에서 실행된다.
+- 각 worker command는 `ATTEMPT=N`, `tick 1/15`부터 `tick 15/15`, `RANDOM_DIGIT=N` 형식의 output을 남기고 terminal event를 만든다.
+- 각 terminal event는 tmux-inject notification, Codex `manager ack`, 결과 보고 순서로 처리된다.
+- 최종 보고 숫자는 `0` 또는 `1`이고, attempt 1의 `0` 또는 `1`은 최종 성공으로 세지 않는다.
+- 데모 종료 후 manager pane과 worker pane은 열린 상태로 유지된다.
 
 ## Scenario Matrix
 
@@ -118,7 +168,7 @@ Each harness run uses a temporary workspace, a temporary `TMUX_TMPDIR`, and an i
 | `manager-multi-pane` | One manager monitors multiple visible worker panes. | Start a manager with a slow first job. | Call `manager submit --new-worker` with a fast second job. | The fast job succeeds first while the slow job remains active, the slow job is still detected later, `worker_pane_ids` contains both panes, and the compact dashboard summarizes active/error jobs with readable pane labels without printing full paths. |
 | `manager-tui-delete-completed` | The compact manager TUI can delete completed/error rows without touching active work. | Start a manager with one terminal job and one active job. | Send the viewer delete key and inspect manager state. | Terminal `succeeded`/`failed` job rows and manager-owned command/status/log evidence are removed, active jobs remain active, and no panes/windows are closed. |
 | `manager-bridge-random-notify` | Bridge notification reaches Codex and is acknowledged by `manager ack`. | Start a background manager attached to a live `codex app-server --listen unix://PATH` and `codex --remote unix://PATH` target. | Submit a random-number command through `manager submit` and let the bridge turn handle the event. | Records show `last_notification.mode == bridge`, `submitted_to_app_server == true`, `acknowledged_by_codex == true`, and `last_ack.event_id == last_terminal_event_id`; the number response comes from notify handling rather than main-turn polling. |
-| `manager-tmux-inject-wakes-current-codex` | tmux-inject notification wakes an already-open Codex TUI in tmux. | Start an isolated real `codex` TUI pane, accept its temp-workspace trust prompt, bind `manager start --notify tmux-inject --codex-pane PANE_ID` to that pane, and submit `python3 -c "import random,time; time.sleep(15); print(random.randint(0, 9))"`. | After the 15 second terminal event, the manager pastes the short wake prompt and presses the bounded composer submit key. The manager uses deterministic bound-pane capture inspection, without `OPENAI_API_KEY`, to decide whether the prompt remains staged and whether a follow-up submit/queue key is needed; with the configured Codex sidecar, it also records bounded terminal-event and receipt-recovery assessments. If no ack arrives, the manager keeps the event in `queued_in_codex` or `awaiting_receipt`, rechecks receipt every configured interval, and retries the same wake prompt only when no same/different wake id is visible and the Codex sidecar explicitly chooses `retry`; `wait`, `block`, sidecar failure, working state, user text, visible same wake id, visible different wake id, or retry/check limits prevent automatic reinjection. If active user composer text blocks the first injection, the event moves to `deferred` and is not auto-injected after the composer returns to placeholder-only; `manager notification retry` or the TUI must explicitly resume it. The Codex TUI inspects manager state/output once, runs `manager ack`, and writes a Korean response file. | The manager records one injected, queued, awaiting receipt, deferred, blocked, or pending tmux notification for the terminal event, `wake_id` is present and appears as the prompt first line, `submitted_event_ids` includes the event only after a tmux submission attempt, `last_ack.event_id == last_terminal_event_id`, `events[event_id].acknowledged_by_codex` matches the notification ack state, the prompt hash matches the short wake-only prompt, and the Codex response matches `숫자는 N이 나왔습니다.` for the printed digit. |
+| `manager-tmux-inject-wakes-current-codex` | tmux-inject notification wakes an already-open Codex TUI in tmux. | Start an isolated real `codex` TUI pane, accept its temp-workspace trust prompt, bind `manager start --notify tmux-inject --codex-pane PANE_ID` to that pane, and submit a command that prints `ATTEMPT=N`, `tick 1/15` through `tick 15/15`, then `RANDOM_DIGIT=N`. | After the 15 second terminal event, the manager pastes the short wake prompt and presses the bounded composer submit key. The manager uses deterministic bound-pane capture inspection, without `OPENAI_API_KEY`, to decide whether the prompt remains staged and whether a follow-up submit/queue key is needed; with the configured Codex sidecar, it also records bounded terminal-event and receipt-recovery assessments. If no ack arrives, the manager keeps the event in `queued_in_codex` or `awaiting_receipt`, rechecks receipt every configured interval, and retries the same wake prompt only when no same/different wake id is visible and the Codex sidecar explicitly chooses `retry`; `wait`, `block`, sidecar failure, working state, user text, visible same wake id, visible different wake id, or retry/check limits prevent automatic reinjection. If active user composer text blocks the first injection, the event moves to `deferred` and is not auto-injected after the composer returns to placeholder-only; `manager notification retry` or the TUI must explicitly resume it. The Codex TUI inspects manager state/output once, runs `manager ack`, and writes a Korean response file. | The manager records one injected, queued, awaiting receipt, deferred, blocked, or pending tmux notification for the terminal event, `wake_id` is present and appears as the prompt first line, `submitted_event_ids` includes the event only after a tmux submission attempt, `last_ack.event_id == last_terminal_event_id`, `events[event_id].acknowledged_by_codex` matches the notification ack state, the prompt hash matches the short wake-only prompt, and the Codex response matches `숫자는 N이 나왔습니다.` for the printed digit. |
 | `manager-random-repeat-until-zero-one` | The random notify demo repeats until the result is `0` or `1`, excluding attempt 1. | Use the verified bridge manager from the random notify path. | Submit repeated random-number jobs through `manager submit` until an eligible result appears, always running at least a second attempt when attempt 1 is already `0` or `1`. | Each terminal event is bridge-acknowledged, the final reported number is `0` or `1`, and the manager remains alive after jobs complete. |
 | `manager-start-reuses-live-process` | Repeated `manager start` does not create a second live manager or extra panes. | Start a manager and let its first job reach `waiting_for_codex`. | Call `manager start` again with the same manager id while the first manager process is still alive. | The second job is queued to the existing manager, the manager PID stays the same, and manager/worker pane ids and pane count stay unchanged. |
 | `manager-cancel` | Manager cancellation preserves panes unless worker stop is requested. | Start a manager with a long-running worker command. | Call `manager cancel` once without `--stop-worker`, then call it again with `--stop-worker`. | The first cancel stops the manager/viewer lifecycle without stopping the worker or closing panes; the second cancel sends an interrupt and the worker job records `stopped`. |

@@ -907,6 +907,40 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertTrue(state["safe_to_inject"])
         self.assertFalse(state["safe_to_submit"])
 
+    def test_tmux_inject_preflight_allows_unstyled_summarize_placeholder_suggestion(self) -> None:
+        prompt = self.tmux_inject_prompt("event-one")
+        capture = "\n".join(
+            [
+                "› Summarize recent commits",
+                "",
+                "  gpt-5.5 high · main · Context 85% left",
+            ]
+        )
+
+        state = tmux_manager.tmux_inject_composer_state(prompt, capture, capture)
+
+        self.assertEqual(state["status"], "placeholder_composer_suggestion")
+        self.assertTrue(state["safe_to_inject"])
+        self.assertFalse(state["safe_to_submit"])
+        self.assertEqual(state["composer_preview"], "Summarize recent commits")
+
+    def test_tmux_inject_preflight_allows_unstyled_review_placeholder_suggestion(self) -> None:
+        prompt = self.tmux_inject_prompt("event-one")
+        capture = "\n".join(
+            [
+                "› Run /review on my current changes",
+                "",
+                "  gpt-5.5 high · main · Context 85% left",
+            ]
+        )
+
+        state = tmux_manager.tmux_inject_composer_state(prompt, capture, capture)
+
+        self.assertEqual(state["status"], "placeholder_composer_suggestion")
+        self.assertTrue(state["safe_to_inject"])
+        self.assertFalse(state["safe_to_submit"])
+        self.assertEqual(state["composer_preview"], "Run /review on my current changes")
+
     def test_receipt_sidecar_capture_tail_omits_placeholder_composer(self) -> None:
         capture = {
             "output": "\n".join(

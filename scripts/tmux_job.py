@@ -204,6 +204,9 @@ def exec_job(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).expanduser().resolve() if args.cwd else paths["workspace"]
     status_file = tmux_state.status_path(paths, args.job_id)
     log_file = tmux_state.log_path(paths, args.job_id)
+    manager_id = tmux_state.one_line_text(getattr(args, "manager_id", None))
+    manager_sequence_arg = getattr(args, "manager_sequence", None)
+    manager_sequence = manager_sequence_arg if isinstance(manager_sequence_arg, int) else None
     try:
         command_text = read_command_text(command_file)
     except Exception as exc:
@@ -220,6 +223,8 @@ def exec_job(args: argparse.Namespace) -> int:
             log_file=log_file,
             exit_code=1,
             last_output=f"could not read command file: {exc}",
+            manager_id=manager_id,
+            manager_sequence=manager_sequence,
         )
         tmux_state.write_status(status_file, failed)
         return 1
@@ -237,6 +242,8 @@ def exec_job(args: argparse.Namespace) -> int:
             log_file=log_file,
             exit_code=1,
             last_output="command is blank",
+            manager_id=manager_id,
+            manager_sequence=manager_sequence,
         )
         tmux_state.write_status(status_file, failed)
         return 1
@@ -252,6 +259,8 @@ def exec_job(args: argparse.Namespace) -> int:
         cwd=str(cwd),
         status_file=status_file,
         log_file=log_file,
+        manager_id=manager_id,
+        manager_sequence=manager_sequence,
     )
     tmux_state.write_status(status_file, running)
 
@@ -286,6 +295,8 @@ def build_parser() -> argparse.ArgumentParser:
     exec_parser.add_argument("--cwd")
     exec_parser.add_argument("--workspace")
     exec_parser.add_argument("--state-dir")
+    exec_parser.add_argument("--manager-id")
+    exec_parser.add_argument("--manager-sequence", type=positive_int)
     return parser
 
 

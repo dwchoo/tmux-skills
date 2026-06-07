@@ -2466,6 +2466,9 @@ def start_pending_job(record: dict[str, Any]) -> dict[str, Any]:
         return record
     job_id = tmux_state.safe_id(str(pending.get("job_id") or "job"))
     target_pane_id = tmux_state.one_line_text(pending.get("pane_id")) or tmux_state.one_line_text(record.get("worker_pane_id"))
+    manager_sequence = pending.get("manager_sequence")
+    if not isinstance(manager_sequence, int):
+        manager_sequence = len([value for value in record.get("job_ids", []) if tmux_state.one_line_text(value)]) + 1
     argv = [
         sys.executable,
         str(script_dir() / "tmux_control.py"),
@@ -2480,6 +2483,10 @@ def start_pending_job(record: dict[str, Any]) -> dict[str, Any]:
         str(record["workspace"]),
         "--state-dir",
         str(record["state_dir"]),
+        "--manager-id",
+        str(record["manager_id"]),
+        "--manager-sequence",
+        str(manager_sequence),
     ]
     if pending.get("cwd"):
         argv.extend(["--cwd", str(pending["cwd"])])
@@ -2490,9 +2497,6 @@ def start_pending_job(record: dict[str, Any]) -> dict[str, Any]:
         "sent": False,
         "reason": proc.stderr.strip() or proc.stdout.strip() or f"tmux_control.py run exited {proc.returncode}",
     }
-    manager_sequence = pending.get("manager_sequence")
-    if not isinstance(manager_sequence, int):
-        manager_sequence = len([value for value in record.get("job_ids", []) if tmux_state.one_line_text(value)]) + 1
     if isinstance(result, dict):
         result["manager_sequence"] = manager_sequence
     jobs = dict(record.get("jobs") or {})
@@ -2909,6 +2913,10 @@ def codex_composer_block_content(block: str) -> str:
     return first[1:].strip() if first.startswith("›") else first.strip()
 
 
+CODEX_DIM_PLACEHOLDER_SUGGESTIONS = {"Explain this codebase", "Summarize recent commits"}
+CODEX_UNSTYLED_PLACEHOLDER_SUGGESTIONS = {"Run /review on my current changes", "Summarize recent commits"}
+
+
 def codex_composer_block_is_placeholder(block: str) -> bool:
     content = codex_composer_block_content(block)
     if not content:
@@ -2918,7 +2926,9 @@ def codex_composer_block_is_placeholder(block: str) -> bool:
         return False
     prompt_index = first.find("›")
     after_prompt = first[prompt_index + 1 :] if prompt_index >= 0 else first
-    return "\x1b[2m" in after_prompt and content in {"Explain this codebase"}
+    if "\x1b[2m" in after_prompt and content in CODEX_DIM_PLACEHOLDER_SUGGESTIONS:
+        return True
+    return content in CODEX_UNSTYLED_PLACEHOLDER_SUGGESTIONS
 
 
 def latest_codex_composer_block(capture_output: str) -> str:

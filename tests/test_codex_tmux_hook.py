@@ -87,6 +87,23 @@ class CodexTmuxHookTests(unittest.TestCase):
 
         self.assertEqual(result, {})
 
+    def test_stop_acknowledges_manager_marked_terminal_status_without_manager_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            status = self.write_terminal_status(paths, "manager-job", ended_at="2026-06-06T00:00:01Z")
+            status["manager_owned"] = True
+            status["manager_id"] = "manager-one"
+            status["manager_sequence"] = 1
+            status = tmux_state.write_status(Path(str(status["status_path"])), status)
+
+            result = codex_tmux_hook.stop(SimpleNamespace(workspace=tmp, state_dir=None), {})
+
+            ack_path = tmux_state.ack_path(paths, str(status["event_id"]))
+            self.assertTrue(ack_path.exists())
+
+        self.assertEqual(result, {})
+
     def test_stop_blocks_non_manager_terminal_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = tmux_state.state_paths(tmp)

@@ -789,6 +789,9 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
     cmd_file = tmux_state.command_path(paths, item_id)
     status_file = tmux_state.status_path(paths, item_id)
     log_file = tmux_state.log_path(paths, item_id)
+    manager_id = tmux_state.one_line_text(getattr(args, "manager_id", None))
+    manager_sequence_arg = getattr(args, "manager_sequence", None)
+    manager_sequence = manager_sequence_arg if isinstance(manager_sequence_arg, int) else None
 
     def finalize_start_failure(reason: str, command_preview_text: str | None) -> dict[str, Any]:
         failed = tmux_state.build_status(
@@ -804,6 +807,8 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
             log_file=log_file,
             exit_code=1,
             last_output=reason,
+            manager_id=manager_id,
+            manager_sequence=manager_sequence,
         )
         tmux_state.write_status(status_file, failed)
         return {
@@ -862,6 +867,8 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
         cwd=str(cwd),
         status_file=status_file,
         log_file=log_file,
+        manager_id=manager_id,
+        manager_sequence=manager_sequence,
     )
     tmux_state.write_status(status_file, pending)
 
@@ -885,6 +892,10 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
         "--state-dir",
         str(paths["root"]),
     ]
+    if manager_id:
+        argv.extend(["--manager-id", manager_id])
+    if manager_sequence is not None:
+        argv.extend(["--manager-sequence", str(manager_sequence)])
     if args.name:
         argv.extend(["--name", args.name])
 
@@ -925,6 +936,8 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
             log_file=log_file,
             exit_code=1,
             last_output=f"command was not sent to pane: {reason}",
+            manager_id=manager_id,
+            manager_sequence=manager_sequence,
         )
         failed = tmux_state.write_status(status_file, failed)
         if next_task is not None:
@@ -3987,6 +4000,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--cwd")
     run_parser.add_argument("--workspace")
     run_parser.add_argument("--state-dir")
+    run_parser.add_argument("--manager-id", help=argparse.SUPPRESS)
+    run_parser.add_argument("--manager-sequence", type=positive_int, help=argparse.SUPPRESS)
     run_parser.add_argument("--require-idle-shell", action="store_true")
     next_instruction_group = run_parser.add_mutually_exclusive_group()
     next_instruction_group.add_argument("--next-instruction", help="Codex instruction to make ready after this job finishes")

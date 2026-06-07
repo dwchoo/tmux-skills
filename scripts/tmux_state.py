@@ -250,6 +250,8 @@ def build_status(
     exit_code: int | None = None,
     last_output: str = "",
     ended_at: str | None = None,
+    manager_id: str | None = None,
+    manager_sequence: int | None = None,
 ) -> dict[str, Any]:
     now = utc_now()
     kind_value = token_text(kind) or "job"
@@ -273,6 +275,11 @@ def build_status(
         "log_path": str(log_file) if log_file else None,
         "last_output": tail_text(last_output),
     }
+    if manager_id:
+        data["manager_owned"] = True
+        data["manager_id"] = manager_id
+        if manager_sequence is not None:
+            data["manager_sequence"] = manager_sequence
     if status_value in TERMINAL_STATUSES:
         data["ended_at"] = ended_at or now
         data["event_id"] = terminal_event_id(data)
