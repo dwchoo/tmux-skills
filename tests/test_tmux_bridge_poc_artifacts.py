@@ -172,7 +172,7 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
                     thread_id="   ",
                     endpoint="unix:///tmp/app-server.sock",
                     workspace=str(workspace),
-                    prompt="tmux-control observed a terminal event.",
+                    prompt="tmux-manager observed a terminal event.",
                     state_dir=str(state_dir),
                     fixture_root=tmp / "fixtures",
                     timestamp="20260604-120000",
@@ -193,7 +193,7 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
                     thread_id="thr_test",
                     endpoint="ws://127.0.0.1:4500",
                     workspace=str(workspace),
-                    prompt="tmux-control observed a terminal event.",
+                    prompt="tmux-manager observed a terminal event.",
                     state_dir=str(state_dir),
                     codex_bin=str(tmp / "missing-codex"),
                     fixture_root=tmp / "fixtures",
@@ -216,7 +216,7 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
                     thread_id="thr_test",
                     endpoint=f"unix://{socket_path}",
                     workspace=str(workspace),
-                    prompt="tmux-control observed a terminal event.\n\nWorkspace: test",
+                    prompt="tmux-manager observed a terminal event.\n\nWorkspace: test",
                     state_dir=str(state_dir),
                     fixture_root=fixture_root,
                     timestamp="20260604-120000",
@@ -237,10 +237,10 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
             fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
             self.assertEqual(fixture["canonical_success_signal"], "turn_start_response")
             self.assertEqual([item["method"] for item in fixture["requests"]], ["initialize", "initialized", "thread/resume", "turn/start"])
-            self.assertEqual(fixture["requests"][0]["params"]["clientInfo"]["title"], "tmux-control bridge")
+            self.assertEqual(fixture["requests"][0]["params"]["clientInfo"]["title"], "tmux-manager bridge")
             self.assertEqual(fixture["requests"][0]["params"]["clientInfo"]["version"], "0.1")
             self.assertEqual(fixture["requests"][0]["params"]["capabilities"]["optOutNotificationMethods"], [])
-            self.assertEqual(fixture["requests"][3]["params"]["input"][0]["text"].splitlines()[0], "tmux-control observed a terminal event.")
+            self.assertEqual(fixture["requests"][3]["params"]["input"][0]["text"].splitlines()[0], "tmux-manager observed a terminal event.")
             self.assertEqual(fixture["requests"][3]["params"]["input"][0]["text_elements"], [])
             self.assertFalse(any("jsonrpc" in item for item in fixture["requests"]))
             self.assertEqual(fixture["protocol_evidence"]["command"], "codex app-server generate-ts --experimental")
@@ -248,11 +248,11 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
             manual_path.write_text(
                 "\n".join(
                     [
-                        "# tmux-control bridge PoC manual confirmation",
+                        "# tmux-manager bridge PoC manual confirmation",
                         "",
                         "main_cli_thread_id: thr_test",
                         "received_prompt_timestamp: 2026-06-04T12:00:01+09:00",
-                        "received_prompt_first_line: tmux-control observed a terminal event.",
+                        "received_prompt_first_line: tmux-manager observed a terminal event.",
                         "operator_confirmation: confirmed_same_thread",
                         "",
                     ]
@@ -277,7 +277,7 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
                     thread_id="thr_live",
                     endpoint=f"unix://{socket_path}",
                     workspace=str(workspace),
-                    prompt="tmux-control observed a terminal event.",
+                    prompt="tmux-manager observed a terminal event.",
                     state_dir=str(tmp / "state"),
                     fixture_root=tmp / "fixtures",
                     timestamp="20260604-120000",
@@ -304,8 +304,8 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
                                 "method": "initialize",
                                 "params": {
                                     "clientInfo": {
-                                        "name": "tmux-control-bridge",
-                                        "title": "tmux-control bridge",
+                                        "name": "tmux-manager-bridge",
+                                        "title": "tmux-manager bridge",
                                         "version": "0.1",
                                     },
                                     "capabilities": {
@@ -329,7 +329,7 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
                                     "input": [
                                         {
                                             "type": "text",
-                                            "text": "tmux-control observed a terminal event.",
+                                            "text": "tmux-manager observed a terminal event.",
                                             "text_elements": [],
                                         }
                                     ],
@@ -345,8 +345,8 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
                             "observed_at": "2026-06-04T00:00:00+00:00",
                             "initialize_params": {
                                 "clientInfo": {
-                                    "name": "tmux-control-bridge",
-                                    "title": "tmux-control bridge",
+                                    "name": "tmux-manager-bridge",
+                                    "title": "tmux-manager bridge",
                                     "version": "0.1",
                                 },
                                 "capabilities": {
@@ -370,7 +370,7 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
                     [
                         "main_cli_thread_id: thr_test",
                         "received_prompt_timestamp: 2026-06-04T12:00:01+09:00",
-                        "received_prompt_first_line: tmux-control observed a terminal event.",
+                        "received_prompt_first_line: tmux-manager observed a terminal event.",
                         "operator_confirmation: confirmed",
                     ]
                 ),
@@ -414,8 +414,8 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
                                 "method": "initialize",
                                 "params": {
                                     "clientInfo": {
-                                        "name": "tmux-control-bridge",
-                                        "title": "tmux-control bridge",
+                                        "name": "tmux-manager-bridge",
+                                        "title": "tmux-manager bridge",
                                         "version": "0.1",
                                     },
                                     "capabilities": {
@@ -458,7 +458,7 @@ class TmuxBridgePocArtifactTests(unittest.TestCase):
                     [
                         "main_cli_thread_id: thr_test",
                         "received_prompt_timestamp: 2026-06-04T12:00:01+09:00",
-                        "received_prompt_first_line: tmux-control observed a terminal event.",
+                        "received_prompt_first_line: tmux-manager observed a terminal event.",
                         "operator_confirmation: confirmed_same_thread",
                     ]
                 ),

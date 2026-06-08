@@ -1,12 +1,12 @@
 ---
-name: tmux-control
-description: Use when Codex needs to operate tmux sessions, windows, or panes; run long-lived commands in tmux; send commands to a specific pane; capture pane output; or inspect tmux results before making follow-up code changes.
+name: tmux-manager
+description: Reference instructions for tmux-skills. Manager-owned long-running jobs should use the project-scoped tmux-manager MCP server, not a global tmux-control Skill.
 ---
 
 # tmux Control
 
 ## Purpose
-Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over pane positions, keep user-owned tmux state intact, and use visible manager panes plus status files for long-running jobs.
+Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over pane positions, keep user-owned tmux state intact, and use the `tmux-manager` MCP workflow for manager-owned long-running jobs.
 
 ## Quick Start
 1. Run `python scripts/tmux_control.py current` to identify the current tmux socket, session, window, and pane.
@@ -17,10 +17,10 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 6. Send commands with `python scripts/tmux_control.py send --pane <pane_id> --command '<command>' --enter --require-idle-shell` unless the pane is intentionally receiving input while busy.
 7. Capture results with `python scripts/tmux_control.py capture --pane <pane_id> --lines 200`; add `--strip-ansi` for tqdm/color/control-heavy output.
 8. For long-running commands, prefer `python scripts/tmux_control.py run --pane <pane_id> --command '<command>'` when a status/log record is enough.
-9. For the default visible long-task workflow, start one idle Codex-owned manager first, then submit jobs with `manager submit`.
-10. Use `manager run-next` only for sequential follow-up in the default worker pane after the relevant manager event has been acknowledged.
-11. After receiving a manager event, inspect manager state once, run `manager ack --event-id EVENT`, then answer or queue one follow-up.
-12. After `manager run-next`, stop the current repeat loop and wait for the next manager event; do not directly poll or monitor the worker pane.
+9. For the default visible long-task workflow, use the project-scoped `tmux-manager` MCP tools first: `manager.start`, `manager.submit`, `manager.status`, `manager.observe`, `manager.ack`, `manager.run_next`, and `manager.cancel`.
+10. Treat `manager.submit` output as opaque. It may return `job_handle` and `codex_contract`; it must not expose worker `pane_id`, `status_path`, or `log_path`.
+11. After receiving a manager event, inspect manager state once, use only the event-scoped one-time read token or an explicit `manager.observe` grant when a read token/grant exists, run `manager.ack`, then answer or queue one follow-up. If the event has no read token, acknowledge after the bounded status inspection instead of inventing an observe token.
+12. After `manager.run_next`, stop the current repeat loop and wait for the next manager event; do not directly poll `manager.status`, capture the worker pane, or read raw status/log files.
 13. For delayed checks or follow-up submissions, use managed `watch`, `queue-after-idle`, or `queue-after-status` instead of raw shell `sleep` watchers.
 14. Add resume-only follow-up instructions with `run --next-instruction TEXT`, `run --next-instruction-file PATH`, or anchored `task add --after-job JOB_ID|--after-event EVENT_ID`.
 15. Use `autopilot start` only when a Codex Desktop heartbeat will wake this thread to continue bounded repair work later.
@@ -45,17 +45,18 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 ## Reading Output
 - Read small output directly with `capture`.
 - For large or monitored output, inspect the status tail first; escalate to full `log_path` or explicit `capture` only for `error`, `unclear`, or `needs_analysis`.
+- For manager-owned jobs, ignore the two preceding generic capture rules. Read raw output only through `manager.observe` when the user explicitly asked for progress/logs, or through a terminal-event token scoped to the current event. Default manager policy is `observe: none`.
 - Require subagent summaries to include `Can judge`, `Key conclusion`, `Important verbatim excerpts`, `Errors or risks`, `Recommended next action`, and `Uncertainty`.
 
 ## Long-Running Jobs and Managers
 - `run`, `watch`, `queue-after-idle`, and `queue-after-status` store command files, logs, status JSON, acknowledgements, and managed worker records under `.codex/tmux-skills` by default.
 - Managed worker contracts are canonical in [docs/managed-workers.md](docs/managed-workers.md). Real-use E2E coverage is canonical in [docs/real-use-e2e.md](docs/real-use-e2e.md).
-- Detailed visible manager, bridge, tmux-inject, receipt recovery, sidecar, placeholder, and timing contracts are canonical in [docs/workflows-and-features.md](docs/workflows-and-features.md).
+- Detailed MCP manager, visible manager, bridge, tmux-inject, receipt recovery, sidecar, placeholder, hook, and timing contracts are canonical in [docs/workflows-and-features.md](docs/workflows-and-features.md).
 - Default visible long-task workflow: start one Codex-owned manager with `manager start --process-mode background`, keep worker output in visible panes, and use a compact reusable manager dashboard below Codex.
 - Start the manager before long work. For bridge notification, run `manager bridge-check` before queueing work; for tmux-inject, start with `--notify tmux-inject --codex-pane PANE_ID|current` and bind exactly one verified Codex pane.
 - `manager start --notify bridge` requires `--thread-id` and `--endpoint unix://PATH`. `manager start --notify tmux-inject` requires `--codex-pane PANE_ID|current`. Use `--notify none` only for manual visible-dashboard debugging.
-- Manager events are the normal wake path. Codex should not rely on polling `manager status` except for manual diagnostics, tests, or details hidden from the compact pane.
-- Codex lifecycle hooks are optional fallback only; manager bridge/tmux-inject workflows do not require `SessionStart`, `UserPromptSubmit`, or `Stop` hooks.
+- Manager events are the normal wake path. Codex should not rely on polling `manager.status` except for manual diagnostics or tests. If the user explicitly asks to see progress/logs, request a one-shot or bounded `manager.observe` lease.
+- Codex lifecycle hooks are fallback guards. `PreToolUse` blocks arbitrary polling/capture/raw file reads for active manager-owned jobs unless a valid observe grant or explicit manual override reason exists. `UserPromptSubmit` and `SessionStart` remind Codex not to poll. `Stop` leaves manager-owned terminal lifecycle to the manager event flow.
 - App-server or tmux prompt submission is not Codex receipt. Receipt is recorded only after main Codex runs `manager ack --event-id EVENT`.
 - In manager-controlled tmux-inject mode, the wake prompt starts with `ID:<wake_id>;`, where `wake_id` is six lowercase hex characters. After the prompt, inspect manager state once, handle only the latest unacknowledged event, ack/report stale or handled events only, and wait for the next manager event after `manager run-next`.
 - `manager run-next` starts sequential work in the default worker pane only, never creates a new worker pane, marks the previous terminal event as handled by the next job, and is blocked by active jobs or unacknowledged terminal events in bridge/tmux-inject modes.
@@ -71,11 +72,14 @@ Use tmux as Codex's long-running command workspace. Prefer stable pane IDs over 
 
 ## Helper Script
 Use `scripts/tmux_control.py` from the skill directory. The helper uses only the Python standard library, but it imports sibling modules and launches sibling worker scripts, so copy or sync the whole `scripts/` directory for repository-local skill installations.
+Use `scripts/tmux_mcp_server.py` as the `tmux-manager` stdio MCP server entrypoint when installing tmux-skills as a plugin or MCP server. Lifecycle hooks are served by `scripts/codex_tmux_hook.py context --event SessionStart|UserPromptSubmit`, `scripts/codex_tmux_hook.py pre-tool-use`, and `scripts/codex_tmux_hook.py stop`.
+For project-only MCP use, configure `.codex/config.toml` in the target repository instead of running `codex mcp add`, which writes user-level config.
 
 This quick reference lists common paths; run `python scripts/tmux_control.py COMMAND --help` for the complete flag set.
 
 ```bash
 python scripts/tmux_control.py list
+python scripts/tmux_mcp_server.py
 python scripts/tmux_control.py current [--target TARGET]
 python scripts/tmux_control.py resolve [--target TARGET] [--current-window] [--pane-index 0..|--ordinal 1..]
 python scripts/tmux_control.py spawn [--target SESSION:WINDOW] [--cwd PATH] [--vertical|--horizontal] [--percent 1..99]
@@ -85,6 +89,7 @@ python scripts/tmux_control.py run --pane PANE_ID (--command TEXT|--command-file
 python scripts/tmux_control.py manager start [--manager-id ID] [--job-id ID (--command TEXT|--command-file PATH)] [--notify bridge --thread-id THREAD --endpoint unix://PATH|--notify tmux-inject --codex-pane (PANE_ID|current)|--notify none] [--dashboard-renderer pane|none] [--log-max-bytes N] [--process-mode foreground|background]
 python scripts/tmux_control.py manager ps-poc
 python scripts/tmux_control.py manager status [--manager-id ID]
+python scripts/tmux_control.py manager observe [--manager-id ID] --job-handle HANDLE --once --reason TEXT
 python scripts/tmux_control.py manager bridge-check [--manager-id ID] [--ack-timeout-seconds N]
 python scripts/tmux_control.py manager ack [--manager-id ID] --event-id EVENT [--turn-id TURN] [--note TEXT]
 python scripts/tmux_control.py manager submit [--manager-id ID] [--pane PANE_ID|--new-worker] --job-id ID (--command TEXT|--command-file PATH)

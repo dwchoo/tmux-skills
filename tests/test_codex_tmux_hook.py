@@ -118,6 +118,66 @@ class CodexTmuxHookTests(unittest.TestCase):
         self.assertEqual(result["decision"], "block")
         self.assertIn("tmux-skills observed a terminal event: raw-job", result["reason"])
 
+    def test_pre_tool_use_blocks_manager_owned_capture_without_grant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            status = self.write_terminal_status(paths, "manager-job", ended_at="2026-06-06T00:00:01Z")
+            self.write_manager_record(paths, status)
+            manager_path = paths["managers"] / "manager-one.json"
+            record = tmux_state.read_json(manager_path)[0]
+            record["status"] = "running"
+            record["active_job_ids"] = ["manager-job"]
+            record["worker_pane_ids"] = ["%2"]
+            tmux_state.atomic_write_json(manager_path, record)
+
+            result = codex_tmux_hook.pre_tool_use(
+                SimpleNamespace(workspace=tmp, state_dir=None),
+                {"tool_input": {"command": "python scripts/tmux_control.py capture --pane %2 --lines 20"}},
+            )
+
+        self.assertEqual(result["decision"], "block")
+        self.assertIn("must not be polled", result["reason"])
+
+    def test_pre_tool_use_allows_manual_override_with_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            status = self.write_terminal_status(paths, "manager-job", ended_at="2026-06-06T00:00:01Z")
+            self.write_manager_record(paths, status)
+            manager_path = paths["managers"] / "manager-one.json"
+            record = tmux_state.read_json(manager_path)[0]
+            record["status"] = "running"
+            record["active_job_ids"] = ["manager-job"]
+            record["worker_pane_ids"] = ["%2"]
+            tmux_state.atomic_write_json(manager_path, record)
+
+            result = codex_tmux_hook.pre_tool_use(
+                SimpleNamespace(workspace=tmp, state_dir=None),
+                {"tool_input": {"command": "python scripts/tmux_control.py capture --pane %2 --manual-override --reason inspect"}},
+            )
+
+        self.assertEqual(result, {})
+
+    def test_context_injects_no_polling_policy_for_active_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = tmux_state.state_paths(tmp)
+            tmux_state.ensure_state_dirs(paths)
+            status = self.write_terminal_status(paths, "manager-job", ended_at="2026-06-06T00:00:01Z")
+            self.write_manager_record(paths, status)
+            manager_path = paths["managers"] / "manager-one.json"
+            record = tmux_state.read_json(manager_path)[0]
+            record["status"] = "running"
+            record["active_job_ids"] = ["manager-job"]
+            record["worker_pane_ids"] = ["%2"]
+            tmux_state.atomic_write_json(manager_path, record)
+
+            result = codex_tmux_hook.context(SimpleNamespace(workspace=tmp, state_dir=None))
+
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("active manager-owned work", context)
+        self.assertIn("do not poll manager status", context)
+
 
 if __name__ == "__main__":
     unittest.main()

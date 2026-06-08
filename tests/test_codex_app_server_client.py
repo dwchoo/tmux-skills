@@ -230,7 +230,7 @@ class AppServerClientTests(unittest.TestCase):
                 ["initialize", "initialized", "thread/start", "thread/resume", "turn/start"],
             )
             self.assertFalse(any("jsonrpc" in item for item in client.transcript["outbound"]))
-            self.assertEqual(client.transcript["outbound"][0]["params"]["clientInfo"]["title"], "tmux-control bridge")
+            self.assertEqual(client.transcript["outbound"][0]["params"]["clientInfo"]["title"], "tmux-manager bridge")
             self.assertEqual(client.transcript["outbound"][0]["params"]["clientInfo"]["version"], "0.1")
             self.assertEqual(client.transcript["outbound"][0]["params"]["capabilities"]["experimentalApi"], False)
             self.assertEqual(

@@ -12,7 +12,8 @@ import shlex
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,9 @@ MANAGER_PS_POC_STATUS_UNSUPPORTED = "unsupported_by_current_codex_surface"
 MANAGER_PS_POC_STATUS_VERIFIED = "verified"
 MANAGER_TERMINAL_JOB_STATUSES = {"succeeded", "failed", "stopped", "timeout", "cancelled", "stale"}
 MANAGER_DELETABLE_JOB_STATUSES = MANAGER_TERMINAL_JOB_STATUSES | {"complete", "completed", "error"}
+MANAGER_OBSERVE_DEFAULT_TTL_SECONDS = 300
+MANAGER_OBSERVE_DEFAULT_INTERVAL_SECONDS = 5
+MANAGER_OBSERVE_DEFAULT_MAX_READS = 1
 BRIDGE_VERIFICATION_STATUSES = {"unverified", "awaiting_ack", "verified", "expired", "mismatched_config", "submission_failed"}
 TMUX_INJECT_NOTIFICATION_STATUSES = {
     "awaiting_receipt",
@@ -62,10 +66,12 @@ TMUX_SKILLS_CONFIG_FILENAME = "tmux-skills.config.json"
 TMUX_INJECT_WAKE_PROMPT = "\n".join(
     [
         "ID:{wake_id};",
-        "tmux-skills event ready. Use $tmux-control only.",
+        "tmux-manager event ready. Use the tmux-manager MCP only.",
         "",
         "Manager ID: {manager_id}",
         "Event ID: {event_id}",
+        "Job handle: {job_handle}",
+        "Event read token: {event_token}",
         "",
         "Inspect manager status once. Handle only the latest unacked event.",
         "If stale or already handled, ack/report only.",
@@ -167,6 +173,239 @@ def manager_paths(workspace: str | None = None, state_dir: str | None = None) ->
 
 def manager_record_path(paths: dict[str, Path], manager_id: str) -> Path:
     return paths["managers"] / f"{manager_id_value(manager_id)}.json"
+
+
+def manager_audit_path(paths: dict[str, Path]) -> Path:
+    return paths["audit"] / "manager-audit.jsonl"
+
+
+def append_manager_audit(
+    paths: dict[str, Path],
+    *,
+    manager_id: str | None,
+    action: str,
+    result: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    paths["audit"].mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": tmux_state.utc_now(),
+        "manager_id": manager_id_value(manager_id or "unknown"),
+        "action": tmux_state.token_text(action) or "unknown",
+        "result": tmux_state.token_text(result) or "unknown",
+        "details": details or {},
+    }
+    with manager_audit_path(paths).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def opaque_token(prefix: str) -> str:
+    safe_prefix = tmux_state.safe_id(prefix) or "token"
+    return f"{safe_prefix}_{uuid.uuid4().hex}"
+
+
+def utc_after_seconds(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+def timestamp_is_expired(value: Any) -> bool:
+    parsed = tmux_state.parse_time(value)
+    return bool(parsed and parsed <= datetime.now(timezone.utc))
+
+
+def job_handle_for(record: dict[str, Any], job_id: str, *, create: bool = True) -> str | None:
+    item_id = optional_safe_id(job_id)
+    if not item_id:
+        return None
+    handles = dict(record.get("job_handles") or {})
+    jobs = dict(record.get("jobs") or {})
+    job = dict(jobs.get(item_id) or {})
+    existing = tmux_state.one_line_text(job.get("job_handle"))
+    if existing:
+        handles.setdefault(existing, {"job_id": item_id, "created_at": record.get("created_at") or tmux_state.utc_now()})
+        record["job_handles"] = handles
+        return existing
+    for handle, entry in handles.items():
+        if isinstance(entry, dict) and optional_safe_id(entry.get("job_id")) == item_id:
+            job["job_handle"] = handle
+            jobs[item_id] = job
+            record["jobs"] = jobs
+            return handle
+    if not create:
+        return None
+    handle = opaque_token("job")
+    handles[handle] = {"job_id": item_id, "created_at": tmux_state.utc_now()}
+    job["job_id"] = item_id
+    job["job_handle"] = handle
+    jobs[item_id] = job
+    record["job_handles"] = handles
+    record["jobs"] = jobs
+    return handle
+
+
+def job_id_for_handle(record: dict[str, Any], job_handle: str | None) -> str | None:
+    handle = tmux_state.one_line_text(job_handle)
+    if not handle:
+        return None
+    entry = (record.get("job_handles") or {}).get(handle)
+    if isinstance(entry, dict):
+        return optional_safe_id(entry.get("job_id"))
+    jobs = record.get("jobs") if isinstance(record.get("jobs"), dict) else {}
+    for job_id, job in jobs.items():
+        if isinstance(job, dict) and tmux_state.one_line_text(job.get("job_handle")) == handle:
+            return optional_safe_id(job_id)
+    return None
+
+
+def event_for_id(record: dict[str, Any], event_id: str | None) -> dict[str, Any] | None:
+    target = tmux_state.one_line_text(event_id)
+    if not target:
+        return None
+    events = record.get("events") if isinstance(record.get("events"), dict) else {}
+    event = events.get(target)
+    return dict(event) if isinstance(event, dict) else None
+
+
+def codex_contract_for_job(record: dict[str, Any], job_handle: str | None) -> dict[str, Any]:
+    return {
+        "manager_id": record.get("manager_id"),
+        "job_handle": job_handle,
+        "observe": "none",
+        "allowed_tools": [
+            "manager.status",
+            "manager.observe",
+            "manager.ack",
+            "manager.run_next",
+            "manager.cancel",
+        ],
+        "direct_reads": "denied_without_observe_grant",
+        "continuous_monitoring": "requires_explicit_user_request_with_bounded_lease",
+    }
+
+
+def redacted_status(status: dict[str, Any] | None, record: dict[str, Any], job_id: str | None) -> dict[str, Any] | None:
+    if not status:
+        return status
+    handle = job_handle_for(record, str(job_id or status.get("id") or ""), create=True)
+    allowed_keys = ("id", "kind", "attempt", "name", "status", "exit_code", "started_at", "updated_at", "ended_at", "event_id")
+    redacted = {key: status.get(key) for key in allowed_keys if key in status}
+    redacted.update({"job_handle": handle, "manager_owned": True, "redacted": True, "observe": "none"})
+    if "manager_sequence" in status:
+        redacted["manager_sequence"] = status["manager_sequence"]
+    return redacted
+
+
+def redacted_event(record: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    job_id = optional_safe_id(event.get("job_id"))
+    handle = job_handle_for(record, job_id or "", create=True)
+    redacted = {
+        "event_id": event.get("event_id"),
+        "job_handle": handle,
+        "status": event.get("status"),
+        "exit_code": event.get("exit_code"),
+        "observed_at": event.get("observed_at"),
+        "acknowledged_by_codex": bool(event.get("acknowledged_by_codex")),
+        "notification_status": event.get("notification_status"),
+        "redacted": True,
+    }
+    token = tmux_state.one_line_text(event.get("event_read_token"))
+    if token and not event.get("event_read_consumed_at"):
+        redacted["event_read_token"] = token
+    return redacted
+
+
+def redacted_job(record: dict[str, Any], job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    handle = job_handle_for(record, job_id, create=True)
+    return {
+        "job_handle": handle,
+        "status": job.get("status"),
+        "manager_sequence": job.get("manager_sequence"),
+        "terminal_event_id": job.get("terminal_event_id"),
+        "redacted": True,
+    }
+
+
+def redacted_manager_record(record: dict[str, Any]) -> dict[str, Any]:
+    jobs = record.get("jobs") if isinstance(record.get("jobs"), dict) else {}
+    events = record.get("events") if isinstance(record.get("events"), dict) else {}
+    active_handles = [job_handle_for(record, str(job_id), create=True) for job_id in active_job_ids(record)]
+    notify = record.get("notify") if isinstance(record.get("notify"), dict) else {}
+    return {
+        "manager_id": record.get("manager_id"),
+        "status": record.get("status"),
+        "notify": {"mode": notify.get("mode")},
+        "heartbeat_at": record.get("heartbeat_at"),
+        "last_terminal_event_id": record.get("last_terminal_event_id"),
+        "current_job_handle": job_handle_for(record, str(record.get("current_job_id") or ""), create=True),
+        "active_job_handles": [handle for handle in active_handles if handle],
+        "job_count": len(jobs),
+        "active_job_count": len(active_job_ids(record)),
+        "jobs": {str(job_id): redacted_job(record, str(job_id), job) for job_id, job in jobs.items() if isinstance(job, dict)},
+        "events": {str(event_id): redacted_event(record, event) for event_id, event in events.items() if isinstance(event, dict)},
+        "last_ack": record.get("last_ack"),
+        "redacted": True,
+    }
+
+
+def redacted_manager_status_result(result: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
+    record = result.get("record") if isinstance(result.get("record"), dict) else None
+    if not record:
+        return result
+    current_job_id = str(record.get("current_job_id") or "")
+    redacted = {
+        "manager_id": result.get("manager_id"),
+        "found": result.get("found"),
+        "record": redacted_manager_record(record),
+        "current_job_status": redacted_status(result.get("current_job_status"), record, current_job_id),
+        "active_job_statuses": {
+            str(job_id): redacted_status(status, record, str(job_id))
+            for job_id, status in (result.get("active_job_statuses") or {}).items()
+            if isinstance(status, dict)
+        },
+        "redacted": True,
+    }
+    append_manager_audit(paths, manager_id=str(result.get("manager_id") or ""), action="status", result="redacted")
+    return redacted
+
+
+def manager_owned_pane_details(paths: dict[str, Path], pane_id: str | None) -> dict[str, Any] | None:
+    target = tmux_state.one_line_text(pane_id)
+    if not target:
+        return None
+    for manager_path in sorted(paths["managers"].glob("*.json")):
+        record, error = read_manager_record(paths, manager_path.stem)
+        if error or not record:
+            continue
+        pane_values = set(record.get("worker_pane_ids") or [])
+        if record.get("worker_pane_id"):
+            pane_values.add(str(record.get("worker_pane_id")))
+        pending = record.get("pending_job") if isinstance(record.get("pending_job"), dict) else {}
+        if pending.get("pane_id"):
+            pane_values.add(str(pending.get("pane_id")))
+        jobs = record.get("jobs") if isinstance(record.get("jobs"), dict) else {}
+        for job in jobs.values():
+            if isinstance(job, dict) and job.get("pane_id"):
+                pane_values.add(str(job.get("pane_id")))
+        if target in pane_values:
+            return {
+                "manager_id": record.get("manager_id"),
+                "pane_id": target,
+                "active_job_ids": active_job_ids(record),
+                "pending": bool(record.get("pending_job")),
+            }
+    statuses, _errors = tmux_state.load_statuses_normalized(paths["root"])
+    for status in statuses:
+        if (
+            tmux_state.one_line_text(status.get("pane_id")) == target
+            and (status.get("manager_owned") is True or tmux_state.one_line_text(status.get("manager_id")))
+        ):
+            return {
+                "manager_id": status.get("manager_id"),
+                "pane_id": target,
+                "status_id": status.get("id"),
+                "event_id": status.get("event_id"),
+            }
+    return None
 
 
 def manager_process_mode_value(value: str | None) -> str:
@@ -1536,6 +1775,12 @@ def normalize_manager_record(record: dict[str, Any], paths: dict[str, Path] | No
         normalized["submitted_event_ids"] = list(normalized["notified_event_ids"])
     notifications = normalized.get("notifications")
     normalized["notifications"] = [dict(value) for value in notifications if isinstance(value, dict)] if isinstance(notifications, list) else []
+    raw_handles = normalized.get("job_handles")
+    normalized["job_handles"] = {str(key): dict(value) for key, value in raw_handles.items() if isinstance(value, dict)} if isinstance(raw_handles, dict) else {}
+    for job_id in list(normalized["jobs"].keys()):
+        job_handle_for(normalized, job_id, create=False)
+    raw_grants = normalized.get("observe_grants")
+    normalized["observe_grants"] = {str(key): dict(value) for key, value in raw_grants.items() if isinstance(value, dict)} if isinstance(raw_grants, dict) else {}
     normalized.setdefault("last_notification", None)
     normalized.setdefault("last_ack", None)
     normalized.setdefault("last_error", None)
@@ -2085,7 +2330,12 @@ def queue_manager_job(
     target_pane_index = tmux_state.one_line_text(pane_index)
     if not target_pane_index and target_pane_id == tmux_state.one_line_text(record.get("worker_pane_id")):
         target_pane_index = tmux_state.one_line_text(record.get("worker_pane_index"))
+    job_handle = job_handle_for(record, item_id, create=True)
     record["pending_job"] = build_pending_job(item_id, request_path, cwd, target_pane_id, target_pane_index, manager_sequence)
+    record["pending_job"]["manager_owned"] = True
+    record["pending_job"]["manager_id"] = record["manager_id"]
+    if job_handle:
+        record["pending_job"]["job_handle"] = job_handle
     record["status"] = "queued"
     record["worker_pane_ids"] = unique_text_values(list(record.get("worker_pane_ids") or []) + [target_pane_id])
     if not record.get("worker_pane_id"):
@@ -2103,6 +2353,7 @@ def queue_manager_job(
     return manager_controlled_response({
         "manager_id": record["manager_id"],
         "job_id": item_id,
+        "job_handle": job_handle,
         "queued": True,
         "manager_path": record["manager_path"],
         "command_request_path": str(request_path),
@@ -2175,8 +2426,10 @@ def ack_manager_event(
             "turn_id": ack_turn_id,
             "note": tmux_state.one_line_text(note),
         }
+        record = consume_event_grants_for_ack(record, target_event_id)
         record = preserve_external_cancel_state(paths, record)
         record = write_manager_record(paths, record)
+        append_manager_audit(paths, manager_id=item_id, action="ack", result="acked", details={"event_id": target_event_id})
         return {
             "manager_id": item_id,
             "event_id": target_event_id,
@@ -2193,17 +2446,22 @@ def ack_manager_event(
     existing_status = str((existing or {}).get("status") or "")
     status = "handled" if existing_status.startswith("handled") else "acknowledged"
     existing_delivery = (existing or {}).get("delivery") if isinstance((existing or {}).get("delivery"), dict) else {}
+    events = dict(record.get("events") or {})
+    event = events.get(target_event_id) if isinstance(events.get(target_event_id), dict) else {}
+    notify = record.get("notify") if isinstance(record.get("notify"), dict) else {}
+    ack_mode = (existing or {}).get("mode") or ("bridge" if event.get("submitted_to_app_server") or notify.get("mode") == "bridge" else "manual")
     ack_turn_id = tmux_state.one_line_text(turn_id) or tmux_state.one_line_text(existing_delivery.get("turn_id"))
     ack_fields = {
         "event_id": target_event_id,
-        "mode": (existing or {}).get("mode") or "manual",
-        "source": (existing or {}).get("source") or "manager_ack",
-        "job_id": (existing or {}).get("job_id") or record.get("current_job_id"),
+        "mode": ack_mode,
+        "source": (existing or {}).get("source") or (event.get("source") if ack_mode == "bridge" else "manager_ack"),
+        "job_id": (existing or {}).get("job_id") or event.get("job_id") or record.get("current_job_id"),
         "status": status,
         "acknowledged_by_codex": True,
         "acknowledged_at": now,
         "ack_turn_id": ack_turn_id,
         "ack_note": tmux_state.one_line_text(note),
+        "submitted_to_app_server": bool((existing or {}).get("submitted_to_app_server") or event.get("submitted_to_app_server") or ack_mode == "bridge"),
     }
     if existing_status.startswith("handled"):
         ack_fields["handled_without_ack"] = False
@@ -2222,6 +2480,7 @@ def ack_manager_event(
             "ack_turn_id": ack_turn_id,
             "ack_note": tmux_state.one_line_text(note),
             "notification_status": status,
+            "submitted_to_app_server": bool(events[target_event_id].get("submitted_to_app_server") or ack_mode == "bridge"),
         }
         record["events"] = events
     record["last_ack"] = {
@@ -2230,9 +2489,11 @@ def ack_manager_event(
         "turn_id": ack_turn_id,
         "note": tmux_state.one_line_text(note),
     }
+    record = consume_event_grants_for_ack(record, target_event_id)
     record = refresh_aggregate_status(record)
     record = preserve_external_cancel_state(paths, record)
     record = write_manager_record(paths, record)
+    append_manager_audit(paths, manager_id=item_id, action="ack", result="acked", details={"event_id": target_event_id})
     return {
         "manager_id": item_id,
         "event_id": target_event_id,
@@ -2502,6 +2763,9 @@ def start_pending_job(record: dict[str, Any]) -> dict[str, Any]:
     jobs = dict(record.get("jobs") or {})
     jobs[job_id] = {
         "job_id": job_id,
+        "job_handle": tmux_state.one_line_text(pending.get("job_handle")) or job_handle_for(record, job_id, create=True),
+        "manager_owned": True,
+        "manager_id": record.get("manager_id"),
         "pane_id": target_pane_id,
         "pane_index": tmux_state.one_line_text(pending.get("pane_index")),
         "command_request_path": pending.get("command_file"),
@@ -2811,10 +3075,13 @@ def codex_sdk_inject_decision(
 def build_tmux_inject_wake_prompt(record: dict[str, Any], candidate: dict[str, Any]) -> str:
     event_id = str(candidate.get("event_id") or "unknown")
     wake_id = tmux_state.one_line_text(candidate.get("wake_id")) or tmux_inject_wake_id(event_id)
+    job_handle = job_handle_for(record, str(candidate.get("job_id") or ""), create=True) or "none"
     return TMUX_INJECT_WAKE_PROMPT.format(
         wake_id=wake_id,
         manager_id=record.get("manager_id") or "unknown",
         event_id=event_id,
+        job_handle=job_handle,
+        event_token=candidate.get("event_read_token") or "none",
     )
 
 
@@ -2882,6 +3149,7 @@ def codex_composer_footer_line(line: str) -> bool:
         or "submit message" in text
         or "to submit" in text
         or ("Context" in text and "left" in text)
+        or bool(re.match(r"^(?:gpt|o\d|codex)[A-Za-z0-9_.-]*(?:\s+[A-Za-z0-9_.-]+){0,3}\s+·\s+", text))
     )
 
 
@@ -2914,7 +3182,14 @@ def codex_composer_block_content(block: str) -> str:
 
 
 CODEX_DIM_PLACEHOLDER_SUGGESTIONS = {"Explain this codebase", "Summarize recent commits"}
-CODEX_UNSTYLED_PLACEHOLDER_SUGGESTIONS = {"Run /review on my current changes", "Summarize recent commits"}
+CODEX_UNSTYLED_PLACEHOLDER_SUGGESTIONS = {
+    "Find and fix a bug in @filename",
+    "Improve documentation in @filename",
+    "Implement {feature}",
+    "Run /review on my current changes",
+    "Summarize recent commits",
+    "Use /skills to list available skills",
+}
 
 
 def codex_composer_block_is_placeholder(block: str) -> bool:
@@ -3021,7 +3296,7 @@ def tmux_inject_composer_state(
             "composer_preview": content[:120],
             **wake_visibility,
         }
-    if content.startswith("tmux-skills event ready") or content.startswith("ID:") or content_wake_ids:
+    if content.startswith(("tmux-skills event ready", "tmux-manager event ready")) or content.startswith("ID:") or content_wake_ids:
         return {
             "status": "other_wake_prompt_staged",
             "safe_to_inject": False,
@@ -3549,9 +3824,13 @@ def status_with_manager_metadata(status: dict[str, Any] | None, record: dict[str
         return status
     jobs = record.get("jobs") if isinstance(record.get("jobs"), dict) else {}
     job = jobs.get(job_id) if isinstance(jobs.get(job_id), dict) else {}
+    enriched = dict(status) | {"manager_owned": True, "manager_id": record.get("manager_id")}
+    handle = job_handle_for(record, job_id, create=True)
+    if handle:
+        enriched["job_handle"] = handle
     if "manager_sequence" in job:
-        return dict(status) | {"manager_sequence": job["manager_sequence"]}
-    return status
+        enriched["manager_sequence"] = job["manager_sequence"]
+    return enriched
 
 
 def task_path_for_job(paths: dict[str, Path], job_id: str | None) -> str | None:
@@ -3577,22 +3856,13 @@ def worker_missing_event_id(record: dict[str, Any], job_id: str | None = None, p
 
 
 def build_manager_wake_prompt(record: dict[str, Any], candidate: dict[str, Any]) -> str:
-    ack_command = " ".join(
-        shlex.quote(str(value))
-        for value in (
-            "python3",
-            script_dir() / "tmux_control.py",
-            "manager",
-            "ack",
-            "--manager-id",
-            record.get("manager_id") or "",
-            "--event-id",
-            candidate.get("event_id") or "",
-            "--workspace",
-            record.get("workspace") or "",
-            "--state-dir",
-            record.get("state_dir") or "",
-        )
+    candidate_job_id = optional_safe_id(candidate.get("job_id"))
+    job_handle = job_handle_for(record, candidate_job_id or "", create=True) if candidate_job_id and candidate_job_id != "none" else None
+    event_token = tmux_state.one_line_text(candidate.get("event_read_token"))
+    read_instruction = (
+        "Inspect manager status once. Read only this event through manager.observe with the event token."
+        if event_token
+        else "Inspect manager status once. This event has no read token, so acknowledge it without manager.observe."
     )
     return "\n".join(
         [
@@ -3600,16 +3870,11 @@ def build_manager_wake_prompt(record: dict[str, Any], candidate: dict[str, Any])
             "",
             f"Event ID: {candidate.get('event_id') or 'unknown'}",
             f"Manager ID: {record.get('manager_id') or 'unknown'}",
-            f"Job ID: {candidate.get('job_id') or 'none'}",
-            f"Pane ID: {candidate.get('pane_id') or 'none'}",
-            f"Workspace: {record.get('workspace')}",
-            f"Manager path: {record.get('manager_path') or 'none'}",
-            f"Status path: {candidate.get('status_path') or 'none'}",
-            f"Task path: {candidate.get('task_path') or 'none'}",
-            f"Log path: {candidate.get('log_path') or 'none'}",
+            f"Job handle: {job_handle or 'none'}",
+            f"Event read token: {event_token or 'none'}",
             "",
-            f"Ack command: {ack_command}",
-            "After inspecting these paths, acknowledge receipt with manager ack for the event id.",
+            read_instruction,
+            "Immediately after that read/status step, run manager.ack for this event id before any report or follow-up action.",
         ]
     )
 
@@ -4044,6 +4309,11 @@ def transition_terminal(
         candidate["manager_sequence"] = job["manager_sequence"]
         if status is not None:
             status["manager_sequence"] = job["manager_sequence"]
+    existing_events = record.get("events") if isinstance(record.get("events"), dict) else {}
+    existing_event = existing_events.get(str(candidate["event_id"])) if isinstance(existing_events.get(str(candidate["event_id"])), dict) else {}
+    candidate["event_read_token"] = tmux_state.one_line_text(existing_event.get("event_read_token")) or opaque_token("evt")
+    if existing_event.get("event_read_consumed_at"):
+        candidate["event_read_consumed_at"] = existing_event.get("event_read_consumed_at")
     record["last_terminal_event_id"] = candidate["event_id"]
     record["last_terminal_candidate"] = candidate
     events = dict(record.get("events") or {})
@@ -4070,6 +4340,10 @@ def transition_terminal(
     jobs[target_job_id] = job
     record["jobs"] = jobs
     record["active_job_ids"] = [value for value in active_job_ids(record) if value != target_job_id]
+    notify = record.get("notify") if isinstance(record.get("notify"), dict) else {}
+    if notify.get("mode") == "bridge":
+        # Bridge delivery waits for target Codex; publish the event token first so the target can observe and ack.
+        record = write_manager_record(paths, record)
     record = notify_terminal_event(record, candidate)
     return refresh_aggregate_status(record)
 
@@ -4211,6 +4485,287 @@ def manager_status(manager_id: str, workspace: str | None = None, state_dir: str
         "current_job_status": job_status,
         "active_job_statuses": active_statuses,
     }
+
+
+def public_submit_result(result: dict[str, Any], paths: dict[str, Path] | None = None) -> dict[str, Any]:
+    if not result.get("queued"):
+        return {key: value for key, value in result.items() if key not in {"record", "manager_path", "command_request_path", "pane_id", "pane_index"}}
+    record = result.get("record") if isinstance(result.get("record"), dict) else {}
+    job_handle = tmux_state.one_line_text(result.get("job_handle")) or job_handle_for(record, str(result.get("job_id") or ""), create=True)
+    response = {
+        "manager_id": result.get("manager_id"),
+        "queued": True,
+        "job_handle": job_handle,
+        "codex_contract": codex_contract_for_job(record, job_handle),
+    }
+    if paths:
+        append_manager_audit(paths, manager_id=str(result.get("manager_id") or ""), action="submit", result="redacted", details={"job_handle": job_handle})
+    return response
+
+
+def manager_status_public(
+    manager_id: str,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    *,
+    manual_override_reason: str | None = None,
+) -> dict[str, Any]:
+    paths = manager_paths(workspace, state_dir)
+    result = manager_status(manager_id, workspace, state_dir)
+    item_id = manager_id_value(manager_id)
+    if not result.get("found"):
+        return result
+    reason = tmux_state.one_line_text(manual_override_reason)
+    if reason:
+        append_manager_audit(paths, manager_id=item_id, action="status", result="manual_override", details={"reason": reason})
+        return result
+    redacted = redacted_manager_status_result(result, paths)
+    record = result.get("record") if isinstance(result.get("record"), dict) else None
+    if record:
+        write_manager_record(paths, record)
+    return redacted
+
+
+def observed_status_payload(status: dict[str, Any] | None, record: dict[str, Any], job_id: str | None) -> dict[str, Any] | None:
+    if status is None:
+        return None
+    payload = redacted_status(status, record, job_id)
+    if payload is None:
+        return None
+    payload["last_output"] = tmux_state.tail_text(str(status.get("last_output") or ""), limit=4000)
+    payload["command_preview"] = status.get("command_preview")
+    return payload
+
+
+def observed_event_payload(event: dict[str, Any] | None, record: dict[str, Any]) -> dict[str, Any] | None:
+    if event is None:
+        return None
+    payload = redacted_event(record, event)
+    payload["last_output"] = tmux_state.tail_text(str(event.get("last_output") or ""), limit=4000)
+    return payload
+
+
+def read_observed_evidence(paths: dict[str, Path], record: dict[str, Any], job_id: str | None, event_id: str | None = None) -> dict[str, Any]:
+    item_id = optional_safe_id(job_id)
+    job = (record.get("jobs") or {}).get(item_id or "") if isinstance(record.get("jobs"), dict) else {}
+    if not isinstance(job, dict):
+        job = {}
+    status = load_job_status(paths, item_id or "") if item_id else None
+    log_tail = ""
+    log_path = tmux_state.one_line_text(job.get("log_path") or (status or {}).get("log_path"))
+    if log_path:
+        path = Path(log_path)
+        try:
+            if cleanup_path_allowed(path, paths["root"]) and path.exists():
+                log_tail = tmux_state.tail_text(path.read_text(encoding="utf-8", errors="replace"), limit=4000)
+        except OSError as exc:
+            log_tail = f"could not read log: {exc}"
+    event = event_for_id(record, event_id)
+    return {
+        "job_handle": job_handle_for(record, item_id or "", create=True),
+        "event_id": tmux_state.one_line_text(event_id),
+        "status": observed_status_payload(status, record, item_id),
+        "event": observed_event_payload(event, record),
+        "log_tail": log_tail,
+    }
+
+
+def grant_scope_job_id(record: dict[str, Any], *, job_handle: str | None, event_id: str | None) -> tuple[str | None, dict[str, Any] | None]:
+    event = event_for_id(record, event_id)
+    if event:
+        return optional_safe_id(event.get("job_id")), event
+    return job_id_for_handle(record, job_handle), None
+
+
+def consume_event_read_token(record: dict[str, Any], token: str, *, event_id: str | None = None) -> tuple[bool, str | None, str | None]:
+    target_token = tmux_state.one_line_text(token)
+    events = dict(record.get("events") or {})
+    for key, event in events.items():
+        if not isinstance(event, dict):
+            continue
+        if event_id and key != event_id:
+            continue
+        if tmux_state.one_line_text(event.get("event_read_token")) != target_token:
+            continue
+        if event.get("event_read_consumed_at"):
+            return False, optional_safe_id(event.get("job_id")), "event read token already consumed"
+        event = dict(event)
+        event["event_read_consumed_at"] = tmux_state.utc_now()
+        events[key] = event
+        record["events"] = events
+        return True, optional_safe_id(event.get("job_id")), None
+    return False, None, "event read token not found"
+
+
+def consume_observe_grant(
+    record: dict[str, Any],
+    token: str,
+    *,
+    event_id: str | None = None,
+) -> tuple[bool, str | None, str | None, dict[str, Any] | None]:
+    grants = dict(record.get("observe_grants") or {})
+    grant = grants.get(token)
+    if not isinstance(grant, dict):
+        return False, None, "observe grant not found", None
+    if event_id and tmux_state.one_line_text(grant.get("event_id")) and tmux_state.one_line_text(grant.get("event_id")) != event_id:
+        return False, None, "observe grant does not match event", grant
+    if timestamp_is_expired(grant.get("expires_at")):
+        grant = dict(grant)
+        grant["status"] = "expired"
+        grants[token] = grant
+        record["observe_grants"] = grants
+        return False, optional_safe_id(grant.get("job_id")), "observe grant expired", grant
+    reads = int(grant.get("reads") or 0)
+    max_reads = int(grant.get("max_reads") or 1)
+    if reads >= max_reads:
+        grant = dict(grant)
+        grant["status"] = "consumed"
+        grants[token] = grant
+        record["observe_grants"] = grants
+        return False, optional_safe_id(grant.get("job_id")), "observe grant already consumed", grant
+    if reads > 0:
+        interval = float(grant.get("interval_seconds") or 0)
+        last_read = tmux_state.parse_time(grant.get("last_read_at"))
+        if interval > 0 and last_read and last_read + timedelta(seconds=interval) > datetime.now(timezone.utc):
+            return False, optional_safe_id(grant.get("job_id")), "observe grant interval has not elapsed", grant
+    grant = dict(grant)
+    grant["reads"] = reads + 1
+    grant["last_read_at"] = tmux_state.utc_now()
+    if grant["reads"] >= max_reads:
+        grant["status"] = "consumed"
+        grant["consumed_at"] = grant["last_read_at"]
+    grants[token] = grant
+    record["observe_grants"] = grants
+    return True, optional_safe_id(grant.get("job_id")), None, grant
+
+
+def observe_grant_for_token(
+    *,
+    manager_id: str,
+    token: str,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+) -> dict[str, Any] | None:
+    paths = manager_paths(workspace, state_dir)
+    record, error = read_manager_record(paths, manager_id)
+    if error or not record:
+        return None
+    grant = (record.get("observe_grants") or {}).get(token)
+    return dict(grant) if isinstance(grant, dict) else None
+
+
+def observe_manager_output(
+    *,
+    manager_id: str,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    job_handle: str | None = None,
+    event_id: str | None = None,
+    observe_token: str | None = None,
+    reason: str | None = None,
+    once: bool = True,
+    ttl_seconds: float = MANAGER_OBSERVE_DEFAULT_TTL_SECONDS,
+    interval_seconds: float = MANAGER_OBSERVE_DEFAULT_INTERVAL_SECONDS,
+    max_reads: int = MANAGER_OBSERVE_DEFAULT_MAX_READS,
+    manual_override_reason: str | None = None,
+) -> dict[str, Any]:
+    paths = manager_paths(workspace, state_dir)
+    item_id = manager_id_value(manager_id)
+    record, error = read_manager_record(paths, item_id)
+    if error:
+        return {"manager_id": item_id, "observed": False, "reason": error}
+    if record is None:
+        return {"manager_id": item_id, "observed": False, "reason": "manager record not found"}
+    override = tmux_state.one_line_text(manual_override_reason)
+    target_event_id = tmux_state.one_line_text(event_id)
+    if override:
+        target_job_id, _event = grant_scope_job_id(record, job_handle=job_handle, event_id=target_event_id)
+        append_manager_audit(paths, manager_id=item_id, action="observe", result="manual_override", details={"reason": override, "event_id": target_event_id, "job_id": target_job_id})
+        return {"manager_id": item_id, "observed": True, "manual_override": True} | read_observed_evidence(paths, record, target_job_id, target_event_id)
+
+    token = tmux_state.one_line_text(observe_token)
+    if token:
+        event_ok, event_job_id, event_error = consume_event_read_token(record, token, event_id=target_event_id)
+        if event_ok:
+            append_manager_audit(paths, manager_id=item_id, action="observe", result="event_token_read", details={"event_id": target_event_id})
+            record = write_manager_record(paths, record)
+            return {"manager_id": item_id, "observed": True, "observe_token": token, "token_consumed": True} | read_observed_evidence(paths, record, event_job_id, target_event_id)
+        grant_ok, grant_job_id, grant_error, grant = consume_observe_grant(record, token, event_id=target_event_id)
+        if grant_ok:
+            append_manager_audit(paths, manager_id=item_id, action="observe", result="grant_read", details={"event_id": target_event_id, "reads": (grant or {}).get("reads")})
+            record = write_manager_record(paths, record)
+            return {"manager_id": item_id, "observed": True, "observe_token": token, "grant": grant} | read_observed_evidence(paths, record, grant_job_id, target_event_id)
+        denial_reason = event_error if event_error and event_error != "event read token not found" else (grant_error or event_error)
+        append_manager_audit(paths, manager_id=item_id, action="observe", result="denied", details={"reason": denial_reason, "event_id": target_event_id})
+        record = write_manager_record(paths, record)
+        return {"manager_id": item_id, "observed": False, "reason": denial_reason or "observe token denied"}
+
+    explicit_reason = tmux_state.one_line_text(reason)
+    if not explicit_reason:
+        append_manager_audit(paths, manager_id=item_id, action="observe", result="denied", details={"reason": "missing explicit user reason"})
+        return {"manager_id": item_id, "observed": False, "reason": "manager observe requires an observe token or explicit user reason"}
+    if once:
+        max_reads = 1
+    elif max_reads <= 1:
+        append_manager_audit(paths, manager_id=item_id, action="observe", result="denied", details={"reason": "continuous lease requires max_reads greater than 1"})
+        return {"manager_id": item_id, "observed": False, "reason": "continuous observe lease requires max_reads greater than 1"}
+    if ttl_seconds <= 0 or interval_seconds <= 0 or max_reads <= 0:
+        append_manager_audit(paths, manager_id=item_id, action="observe", result="denied", details={"reason": "invalid lease bounds"})
+        return {"manager_id": item_id, "observed": False, "reason": "observe lease requires positive ttl_seconds, interval_seconds, and max_reads"}
+    target_job_id, _event = grant_scope_job_id(record, job_handle=job_handle, event_id=target_event_id)
+    if not target_job_id:
+        append_manager_audit(paths, manager_id=item_id, action="observe", result="denied", details={"reason": "job handle or event not found"})
+        return {"manager_id": item_id, "observed": False, "reason": "job handle or event not found"}
+    new_token = opaque_token("obs")
+    grants = dict(record.get("observe_grants") or {})
+    grant = {
+        "token": new_token,
+        "job_id": target_job_id,
+        "job_handle": job_handle_for(record, target_job_id, create=True),
+        "event_id": target_event_id,
+        "reason": explicit_reason,
+        "created_at": tmux_state.utc_now(),
+        "expires_at": utc_after_seconds(ttl_seconds),
+        "ttl_seconds": ttl_seconds,
+        "interval_seconds": interval_seconds,
+        "max_reads": max_reads,
+        "reads": 0,
+        "status": "active",
+    }
+    grants[new_token] = grant
+    record["observe_grants"] = grants
+    ok, grant_job_id, grant_error, consumed_grant = consume_observe_grant(record, new_token, event_id=target_event_id)
+    append_manager_audit(paths, manager_id=item_id, action="observe_grant", result="created", details={"job_id": target_job_id, "event_id": target_event_id, "max_reads": max_reads})
+    if not ok:
+        append_manager_audit(paths, manager_id=item_id, action="observe", result="denied", details={"reason": grant_error})
+        record = write_manager_record(paths, record)
+        return {"manager_id": item_id, "observed": False, "reason": grant_error or "observe grant denied"}
+    record = write_manager_record(paths, record)
+    return {"manager_id": item_id, "observed": True, "observe_token": new_token, "grant": consumed_grant} | read_observed_evidence(paths, record, grant_job_id, target_event_id)
+
+
+def consume_event_grants_for_ack(record: dict[str, Any], event_id: str) -> dict[str, Any]:
+    now = tmux_state.utc_now()
+    events = dict(record.get("events") or {})
+    event = events.get(event_id)
+    if isinstance(event, dict) and event.get("event_read_token") and not event.get("event_read_consumed_at"):
+        event = dict(event)
+        event["event_read_consumed_at"] = now
+        event["event_read_consumed_by_ack"] = True
+        events[event_id] = event
+        record["events"] = events
+    grants = dict(record.get("observe_grants") or {})
+    for token, grant in list(grants.items()):
+        if not isinstance(grant, dict):
+            continue
+        if tmux_state.one_line_text(grant.get("event_id")) == event_id and grant.get("status") == "active":
+            updated = dict(grant)
+            updated["status"] = "consumed"
+            updated["consumed_at"] = now
+            updated["consumed_by_ack"] = True
+            grants[token] = updated
+    record["observe_grants"] = grants
+    return record
 
 
 def cancel_manager(

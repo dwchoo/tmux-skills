@@ -220,26 +220,17 @@ class TmuxManagerTests(unittest.TestCase):
 
         prompt = tmux_manager.build_tmux_inject_wake_prompt(record, candidate)
 
-        self.assertEqual(
-            prompt,
-            "\n".join(
-                [
-                    "ID:cbf7f0;",
-                    "tmux-skills event ready. Use $tmux-control only.",
-                    "",
-                    "Manager ID: manager-one",
-                    "Event ID: event-one",
-                    "",
-                    "Inspect manager status once. Handle only the latest unacked event.",
-                    "If stale or already handled, ack/report only.",
-                    "After run-next, wait for the next manager event; do not poll or monitor directly.",
-                ]
-            ),
-        )
+        self.assertIn("ID:cbf7f0;", prompt)
+        self.assertIn("Manager ID: manager-one", prompt)
+        self.assertIn("Event ID: event-one", prompt)
+        self.assertIn("Job handle: job_", prompt)
+        self.assertIn("Event read token: none", prompt)
+        self.assertNotIn("status/job-one.json", prompt)
+        self.assertNotIn("logs/job-one.log", prompt)
         self.assertEqual(tmux_manager.tmux_inject_prompt_wake_id(prompt), "cbf7f0")
-        self.assertEqual(tmux_manager.tmux_inject_prompt_wake_id("ID:cbf7f0;tmux-skills event ready"), "cbf7f0")
-        self.assertEqual(tmux_manager.tmux_inject_prompt_wake_id("ID:cbf7f0tmux-skills event ready"), "cbf7f0")
-        self.assertIn("$tmux-control", prompt)
+        self.assertEqual(tmux_manager.tmux_inject_prompt_wake_id("ID:cbf7f0;tmux-manager event ready"), "cbf7f0")
+        self.assertEqual(tmux_manager.tmux_inject_prompt_wake_id("ID:cbf7f0tmux-manager event ready"), "cbf7f0")
+        self.assertIn("the tmux-manager MCP", prompt)
         for forbidden in (
             "Ack command",
             "python",
@@ -251,6 +242,20 @@ class TmuxManagerTests(unittest.TestCase):
             "Codex queue",
         ):
             self.assertNotIn(forbidden, prompt)
+
+    def test_tmux_inject_detects_staged_prompt_with_model_status_footer(self) -> None:
+        record = {"manager_id": "manager-one", "workspace": "/tmp/workspace"}
+        prompt = tmux_manager.build_tmux_inject_wake_prompt(
+            record,
+            {"event_id": "event-one", "job_id": "job-one", "event_read_token": "evt-one"},
+        )
+        capture_output = f"previous output\n› {prompt}\n\n  gpt-5.5 xhigh · /tmp/workspace\n"
+
+        state = tmux_manager.tmux_inject_composer_state(prompt, capture_output, capture_output, record=record)
+
+        self.assertEqual(state["status"], "manager_wake_prompt_staged")
+        self.assertTrue(state["prompt_still_staged"])
+        self.assertTrue(tmux_manager.wake_prompt_still_staged(prompt, capture_output))
 
     def test_tmux_inject_validates_pane_uses_sdk_and_injects_once_before_ack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -591,7 +596,7 @@ class TmuxManagerTests(unittest.TestCase):
 
     def test_tmux_inject_followup_staged_prompt_overrides_sidecar_confirmed(self) -> None:
         prompt = (
-            "tmux-skills event ready. Use $tmux-control only.\n\n"
+            "tmux-manager event ready. Use the tmux-manager MCP only.\n\n"
             "Manager ID: manager-one\n"
             "Event ID: evt-one\n\n"
             "Inspect the manager state for this workspace, decide the next action, and acknowledge the event after inspection."
@@ -609,7 +614,7 @@ class TmuxManagerTests(unittest.TestCase):
 
     def test_tmux_inject_followup_staged_prompt_skips_sidecar_for_immediate_submit(self) -> None:
         prompt = (
-            "tmux-skills event ready. Use $tmux-control only.\n\n"
+            "tmux-manager event ready. Use the tmux-manager MCP only.\n\n"
             "Manager ID: manager-one\n"
             "Event ID: evt-one\n\n"
             "Inspect the manager state for this workspace, decide the next action, and acknowledge the event after inspection."
@@ -748,7 +753,7 @@ class TmuxManagerTests(unittest.TestCase):
         staged_capture = "\n".join(
             [
                 "› ID:cbf7f0;",
-                "  tmux-skills event ready. Use $tmux-control only.",
+                "  tmux-manager event ready. Use the tmux-manager MCP only.",
                 "",
                 "  Manager ID: manager-one",
                 "  Event ID: event-one",
@@ -759,7 +764,7 @@ class TmuxManagerTests(unittest.TestCase):
         submitted_capture = "\n".join(
             [
                 "› ID:cbf7f0;",
-                "  tmux-skills event ready. Use $tmux-control only.",
+                "  tmux-manager event ready. Use the tmux-manager MCP only.",
                 "",
                 "• Working (0s • esc to interrupt)",
             ]
@@ -809,7 +814,7 @@ class TmuxManagerTests(unittest.TestCase):
         capture = "\n".join(
             [
                 "› ID:cbf7f0;",
-                "  tmux-skills event ready. Use $tmux-control only.",
+                "  tmux-manager event ready. Use the tmux-manager MCP only.",
                 "",
                 "  Manager ID: manager-one",
                 "  Event ID: event-one",
@@ -941,6 +946,74 @@ class TmuxManagerTests(unittest.TestCase):
         self.assertFalse(state["safe_to_submit"])
         self.assertEqual(state["composer_preview"], "Run /review on my current changes")
 
+    def test_tmux_inject_preflight_allows_unstyled_documentation_placeholder_suggestion(self) -> None:
+        prompt = self.tmux_inject_prompt("event-one")
+        capture = "\n".join(
+            [
+                "› Improve documentation in @filename",
+                "",
+                "  gpt-5.5 high · main · Context 85% left",
+            ]
+        )
+
+        state = tmux_manager.tmux_inject_composer_state(prompt, capture, capture)
+
+        self.assertEqual(state["status"], "placeholder_composer_suggestion")
+        self.assertTrue(state["safe_to_inject"])
+        self.assertFalse(state["safe_to_submit"])
+        self.assertEqual(state["composer_preview"], "Improve documentation in @filename")
+
+    def test_tmux_inject_preflight_allows_unstyled_implement_placeholder_suggestion(self) -> None:
+        prompt = self.tmux_inject_prompt("event-one")
+        capture = "\n".join(
+            [
+                "› Implement {feature}",
+                "",
+                "  gpt-5.5 high · main · Context 85% left",
+            ]
+        )
+
+        state = tmux_manager.tmux_inject_composer_state(prompt, capture, capture)
+
+        self.assertEqual(state["status"], "placeholder_composer_suggestion")
+        self.assertTrue(state["safe_to_inject"])
+        self.assertFalse(state["safe_to_submit"])
+        self.assertEqual(state["composer_preview"], "Implement {feature}")
+
+    def test_tmux_inject_preflight_allows_unstyled_bugfix_placeholder_suggestion(self) -> None:
+        prompt = self.tmux_inject_prompt("event-one")
+        capture = "\n".join(
+            [
+                "› Find and fix a bug in @filename",
+                "",
+                "  gpt-5.5 high · main · Context 85% left",
+            ]
+        )
+
+        state = tmux_manager.tmux_inject_composer_state(prompt, capture, capture)
+
+        self.assertEqual(state["status"], "placeholder_composer_suggestion")
+        self.assertTrue(state["safe_to_inject"])
+        self.assertFalse(state["safe_to_submit"])
+        self.assertEqual(state["composer_preview"], "Find and fix a bug in @filename")
+
+    def test_tmux_inject_preflight_allows_unstyled_skills_placeholder_suggestion(self) -> None:
+        prompt = self.tmux_inject_prompt("event-one")
+        capture = "\n".join(
+            [
+                "› Use /skills to list available skills",
+                "",
+                "  gpt-5.5 high · main · Context 85% left",
+            ]
+        )
+
+        state = tmux_manager.tmux_inject_composer_state(prompt, capture, capture)
+
+        self.assertEqual(state["status"], "placeholder_composer_suggestion")
+        self.assertTrue(state["safe_to_inject"])
+        self.assertFalse(state["safe_to_submit"])
+        self.assertEqual(state["composer_preview"], "Use /skills to list available skills")
+
     def test_receipt_sidecar_capture_tail_omits_placeholder_composer(self) -> None:
         capture = {
             "output": "\n".join(
@@ -1001,7 +1074,7 @@ class TmuxManagerTests(unittest.TestCase):
                 "• Working (8m 01s • esc to interrupt)",
                 "",
                 "› ID:cbf7f0;",
-                "  tmux-skills event ready. Use $tmux-control only.",
+                "  tmux-manager event ready. Use the tmux-manager MCP only.",
                 "",
                 "  Manager ID: manager-one",
                 "  Event ID: event-one",
@@ -1031,7 +1104,7 @@ class TmuxManagerTests(unittest.TestCase):
                     "• Working (8m 01s • esc to interrupt)",
                     "",
                     "› ID:cbf7f0;",
-                    "  tmux-skills event ready. Use $tmux-control only.",
+                    "  tmux-manager event ready. Use the tmux-manager MCP only.",
                     "",
                     "  Manager ID: manager-one",
                     "  Event ID: event-one",
@@ -1631,8 +1704,8 @@ class TmuxManagerTests(unittest.TestCase):
         capture = {
             "captured": True,
             "returncode": 0,
-            "output": "queued messages\nID:cbf7f0;\ntmux-skills event ready. Use $tmux-control only.\n",
-            "raw_output": "queued messages\nID:cbf7f0;\ntmux-skills event ready. Use $tmux-control only.\n",
+            "output": "queued messages\nID:cbf7f0;\ntmux-manager event ready. Use the tmux-manager MCP only.\n",
+            "raw_output": "queued messages\nID:cbf7f0;\ntmux-manager event ready. Use the tmux-manager MCP only.\n",
             "omitted_chars": 0,
         }
         existing = {"receipt_retry_count": 0, "receipt_sidecar_check_count": 0}
@@ -1661,8 +1734,8 @@ class TmuxManagerTests(unittest.TestCase):
         capture = {
             "captured": True,
             "returncode": 0,
-            "output": "queued messages\nID:0ef821;\ntmux-skills event ready. Use $tmux-control only.\n",
-            "raw_output": "queued messages\nID:0ef821;\ntmux-skills event ready. Use $tmux-control only.\n",
+            "output": "queued messages\nID:0ef821;\ntmux-manager event ready. Use the tmux-manager MCP only.\n",
+            "raw_output": "queued messages\nID:0ef821;\ntmux-manager event ready. Use the tmux-manager MCP only.\n",
             "omitted_chars": 0,
         }
 
@@ -1694,7 +1767,7 @@ class TmuxManagerTests(unittest.TestCase):
                 }
             },
         }
-        capture_output = "old transcript\nID:cbf7f0;\ntmux-skills event ready. Use $tmux-control only.\n"
+        capture_output = "old transcript\nID:cbf7f0;\ntmux-manager event ready. Use the tmux-manager MCP only.\n"
         state = tmux_manager.tmux_inject_composer_state(prompt, capture_output, record=record)
 
         self.assertEqual(state["status"], "no_composer_text_detected")
@@ -1821,14 +1894,83 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(first["submitted_event_ids"], [status["event_id"]])
             prompt = deliver.call_args.args[2]
             self.assertIn(f"Event ID: {status['event_id']}", prompt)
-            self.assertIn("Job ID: job-one", prompt)
-            self.assertIn(f"Workspace: {paths['workspace']}", prompt)
-            self.assertIn(f"Manager path: {paths['managers'] / 'manager-one.json'}", prompt)
-            self.assertIn(f"Status path: {tmux_state.status_path(paths, 'job-one')}", prompt)
-            self.assertIn(f"Log path: {tmux_state.log_path(paths, 'job-one')}", prompt)
-            for forbidden in ("SECRET OUTPUT", "last_output", "traceback", "retry", "command was", "Please inspect"):
+            self.assertIn("Job handle: job_", prompt)
+            self.assertIn("Event read token: evt_", prompt)
+            self.assertIn("manager.observe with the event token", prompt)
+            self.assertIn("Immediately after that read/status step", prompt)
+            self.assertNotIn(str(paths["workspace"]), prompt)
+            self.assertNotIn(str(paths["managers"] / "manager-one.json"), prompt)
+            self.assertNotIn(str(tmux_state.status_path(paths, "job-one")), prompt)
+            self.assertNotIn(str(tmux_state.log_path(paths, "job-one")), prompt)
+            for forbidden in ("SECRET OUTPUT", "last_output", "traceback", "retry", "command was", "Please inspect", "Pane ID"):
                 self.assertNotIn(forbidden, prompt)
             self.assertEqual(second["status"], "waiting_for_codex")
+
+    def test_bridge_event_token_is_published_before_delivery_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            status = self.build_terminal_status(paths)
+
+            def assert_published(_bridge_record: dict[str, object], candidate: dict[str, object], _prompt: str) -> dict[str, object]:
+                published, error = tmux_manager.read_manager_record(paths, "manager-one")
+                self.assertIsNone(error)
+                self.assertIsNotNone(published)
+                events = published.get("events") if isinstance(published, dict) else {}
+                event = events.get(status["event_id"]) if isinstance(events, dict) else {}
+                self.assertEqual(event.get("event_id"), status["event_id"])
+                self.assertEqual(event.get("event_read_token"), candidate.get("event_read_token"))
+                return {"prompt_sha256": "abc123", "event_id": status["event_id"]}
+
+            with mock.patch.object(tmux_manager.tmux_bridge, "deliver_bridge_candidate", side_effect=assert_published):
+                tmux_manager.transition_terminal(record, paths=paths, status=status)
+
+    def test_bridge_ack_before_notification_keeps_bridge_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(
+                paths,
+                {
+                    "mode": "bridge",
+                    "thread_id": "thr-test",
+                    "endpoint": "unix:///tmp/codex.sock",
+                    "socket_path": "/tmp/codex.sock",
+                },
+            )
+            event_id = "evt-terminal"
+            record["last_terminal_event_id"] = event_id
+            record["events"] = {
+                event_id: {
+                    "event_id": event_id,
+                    "source": "manager_terminal",
+                    "job_id": "job-one",
+                    "submitted_to_app_server": False,
+                    "acknowledged_by_codex": False,
+                }
+            }
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.ack_manager_event(manager_id="manager-one", event_id=event_id, workspace=str(workspace))
+
+            self.assertTrue(result["acked"])
+            notification = result["record"]["last_notification"]
+            self.assertEqual(notification["mode"], "bridge")
+            self.assertTrue(notification["submitted_to_app_server"])
+            self.assertEqual(result["record"]["events"][event_id]["notification_status"], "acknowledged")
 
     def test_bridge_submission_failure_retries_until_submitted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -1907,13 +2049,13 @@ class TmuxManagerTests(unittest.TestCase):
             self.assertEqual(verification["event_id"], result["event_id"])
             prompt = deliver.call_args.args[2]
             self.assertIn(f"Event ID: {result['event_id']}", prompt)
-            self.assertIn("Job ID: none", prompt)
-            self.assertIn(f"Workspace: {paths['workspace']}", prompt)
-            self.assertIn(f"Manager path: {paths['managers'] / 'manager-one.json'}", prompt)
-            self.assertIn("Status path: none", prompt)
-            self.assertIn("Task path: none", prompt)
-            self.assertIn("Log path: none", prompt)
-            for forbidden in ("preflight", "retry", "Please inspect", "last_output"):
+            self.assertIn("Job handle: none", prompt)
+            self.assertIn("Event read token: none", prompt)
+            self.assertIn("without manager.observe", prompt)
+            self.assertIn("Immediately after that read/status step", prompt)
+            self.assertNotIn(str(paths["workspace"]), prompt)
+            self.assertNotIn(str(paths["managers"] / "manager-one.json"), prompt)
+            for forbidden in ("preflight", "retry", "Please inspect", "last_output", "Status path", "Log path", "Task path"):
                 self.assertNotIn(forbidden, prompt)
 
     def test_ack_marks_bridge_preflight_verified(self) -> None:
@@ -3201,6 +3343,145 @@ class TmuxManagerTests(unittest.TestCase):
 
         self.assertIn("notify=submission_failed ack=no", text)
         self.assertNotIn("connection refused", text)
+
+    def test_public_manager_status_redacts_manager_owned_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            status = tmux_state.write_status(tmux_state.status_path(paths, "job-one"), self.build_terminal_status(paths))
+            record = tmux_manager.transition_terminal(record, paths=paths, status=status)
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.manager_status_public("manager-one", workspace=str(workspace))
+            serialized = json.dumps(result, sort_keys=True)
+
+            self.assertTrue(result["redacted"])
+            self.assertIn("job_", serialized)
+            self.assertIn("event_read_token", serialized)
+            self.assertNotIn("%2", serialized)
+            self.assertNotIn(str(tmux_state.status_path(paths, "job-one")), serialized)
+            self.assertNotIn(str(tmux_state.log_path(paths, "job-one")), serialized)
+            self.assertNotIn("SECRET OUTPUT", serialized)
+
+    def test_event_read_token_is_one_shot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            log_path = tmux_state.log_path(paths, "job-one")
+            log_path.write_text("full log tail\n", encoding="utf-8")
+            status = tmux_state.write_status(tmux_state.status_path(paths, "job-one"), self.build_terminal_status(paths))
+            record = tmux_manager.transition_terminal(record, paths=paths, status=status)
+            event_id = str(record["last_terminal_event_id"])
+            token = str(record["events"][event_id]["event_read_token"])
+            tmux_manager.write_manager_record(paths, record)
+
+            first = tmux_manager.observe_manager_output(
+                manager_id="manager-one",
+                workspace=str(workspace),
+                event_id=event_id,
+                observe_token=token,
+            )
+            second = tmux_manager.observe_manager_output(
+                manager_id="manager-one",
+                workspace=str(workspace),
+                event_id=event_id,
+                observe_token=token,
+            )
+
+            self.assertTrue(first["observed"])
+            self.assertIn("SECRET OUTPUT", first["event"]["last_output"])
+            self.assertIn("full log tail", first["log_tail"])
+            self.assertFalse(second["observed"])
+            self.assertIn("already consumed", second["reason"])
+
+    def test_ack_consumes_unused_event_read_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            status = tmux_state.write_status(tmux_state.status_path(paths, "job-one"), self.build_terminal_status(paths))
+            record = tmux_manager.transition_terminal(record, paths=paths, status=status)
+            event_id = str(record["last_terminal_event_id"])
+            token = str(record["events"][event_id]["event_read_token"])
+            tmux_manager.write_manager_record(paths, record)
+
+            ack = tmux_manager.ack_manager_event(manager_id="manager-one", event_id=event_id, workspace=str(workspace))
+            observed = tmux_manager.observe_manager_output(
+                manager_id="manager-one",
+                workspace=str(workspace),
+                event_id=event_id,
+                observe_token=token,
+            )
+
+            self.assertTrue(ack["acked"])
+            self.assertFalse(observed["observed"])
+            self.assertIn("already consumed", observed["reason"])
+
+    def test_explicit_observe_grant_is_one_shot_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            status = tmux_state.write_status(tmux_state.status_path(paths, "job-one"), self.build_terminal_status(paths))
+            record = tmux_manager.transition_terminal(record, paths=paths, status=status)
+            handle = tmux_manager.job_handle_for(record, "job-one", create=True)
+            tmux_manager.write_manager_record(paths, record)
+
+            first = tmux_manager.observe_manager_output(
+                manager_id="manager-one",
+                workspace=str(workspace),
+                job_handle=handle,
+                reason="user requested progress",
+            )
+            second = tmux_manager.observe_manager_output(
+                manager_id="manager-one",
+                workspace=str(workspace),
+                observe_token=first["observe_token"],
+            )
+
+            self.assertTrue(first["observed"])
+            self.assertEqual(first["grant"]["max_reads"], 1)
+            self.assertFalse(second["observed"])
+            self.assertIn("already consumed", second["reason"])
+
+    def test_continuous_observe_lease_requires_multiple_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = self.build_record(paths)
+            record["pending_job"] = None
+            record["current_job_id"] = "job-one"
+            status = tmux_state.write_status(tmux_state.status_path(paths, "job-one"), self.build_terminal_status(paths))
+            record = tmux_manager.transition_terminal(record, paths=paths, status=status)
+            handle = tmux_manager.job_handle_for(record, "job-one", create=True)
+            tmux_manager.write_manager_record(paths, record)
+
+            result = tmux_manager.observe_manager_output(
+                manager_id="manager-one",
+                workspace=str(workspace),
+                job_handle=handle,
+                reason="user requested continuous progress",
+                once=False,
+                max_reads=1,
+            )
+
+            self.assertFalse(result["observed"])
+            self.assertIn("max_reads greater than 1", result["reason"])
 
 
 if __name__ == "__main__":

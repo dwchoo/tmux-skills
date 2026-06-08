@@ -741,6 +741,28 @@ def truncate_text(text: str, max_chars: int | None) -> tuple[str, bool, int]:
 
 
 def capture(args: argparse.Namespace) -> dict[str, Any]:
+    paths = tmux_manager.manager_paths(getattr(args, "workspace", None), getattr(args, "state_dir", None))
+    owner = tmux_manager.manager_owned_pane_details(paths, args.pane)
+    if owner and not getattr(args, "manual_override", False) and not tmux_state.one_line_text(getattr(args, "observe_token", None)):
+        tmux_manager.append_manager_audit(paths, manager_id=str(owner.get("manager_id") or "unknown"), action="capture", result="denied", details={"pane_id": args.pane})
+        return {"pane_id": args.pane, "captured": False, "redacted": True, "reason": "manager-owned pane capture requires manager.observe grant or --manual-override --reason TEXT"}
+    if owner and getattr(args, "manual_override", False):
+        reason = tmux_state.one_line_text(getattr(args, "reason", None))
+        if not reason:
+            tmux_manager.append_manager_audit(paths, manager_id=str(owner.get("manager_id") or "unknown"), action="capture", result="denied", details={"pane_id": args.pane, "reason": "missing override reason"})
+            return {"pane_id": args.pane, "captured": False, "reason": "manual override requires --reason TEXT"}
+        tmux_manager.append_manager_audit(paths, manager_id=str(owner.get("manager_id") or "unknown"), action="capture", result="manual_override", details={"pane_id": args.pane, "reason": reason})
+    token = tmux_state.one_line_text(getattr(args, "observe_token", None))
+    if owner and token:
+        observed = tmux_manager.observe_manager_output(
+            manager_id=str(owner.get("manager_id") or "unknown"),
+            workspace=getattr(args, "workspace", None),
+            state_dir=getattr(args, "state_dir", None),
+            observe_token=token,
+        )
+        if not observed.get("observed"):
+            tmux_manager.append_manager_audit(paths, manager_id=str(owner.get("manager_id") or "unknown"), action="capture", result="denied", details={"pane_id": args.pane, "reason": observed.get("reason")})
+            return {"pane_id": args.pane, "captured": False, "reason": observed.get("reason") or "observe token denied"}
     output = capture_text(args.pane, args.lines, strip=args.strip_ansi)
     output, truncated, omitted_chars = truncate_text(output, args.max_chars)
     return {
@@ -1568,9 +1590,7 @@ def manager_submit(args: argparse.Namespace) -> dict[str, Any]:
         pane_index=pane_index,
         allow_parallel=True,
     )
-    result["pane_id"] = pane_id
-    result["pane_index"] = pane_index
-    return result
+    return tmux_manager.public_submit_result(result, paths)
 
 
 def manager(args: argparse.Namespace) -> dict[str, Any]:
@@ -1578,7 +1598,28 @@ def manager(args: argparse.Namespace) -> dict[str, Any]:
         return manager_start(args)
     if args.manager_action == "status":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
-        return tmux_manager.manager_status(manager_id, args.workspace, args.state_dir)
+        if getattr(args, "manual_override", False) and not tmux_state.one_line_text(args.reason):
+            return {"manager_id": manager_id, "found": False, "reason": "manual override requires --reason TEXT"}
+        reason = args.reason if getattr(args, "manual_override", False) else None
+        return tmux_manager.manager_status_public(manager_id, args.workspace, args.state_dir, manual_override_reason=reason)
+    if args.manager_action == "observe":
+        manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
+        if getattr(args, "manual_override", False) and not tmux_state.one_line_text(args.reason):
+            return {"manager_id": manager_id, "observed": False, "reason": "manual override requires --reason TEXT"}
+        return tmux_manager.observe_manager_output(
+            manager_id=manager_id,
+            workspace=args.workspace,
+            state_dir=args.state_dir,
+            job_handle=args.job_handle,
+            event_id=args.event_id,
+            observe_token=args.observe_token,
+            reason=args.reason,
+            once=args.once,
+            ttl_seconds=args.ttl_seconds,
+            interval_seconds=args.interval_seconds,
+            max_reads=args.max_reads,
+            manual_override_reason=args.reason if getattr(args, "manual_override", False) else None,
+        )
     if args.manager_action == "ps-poc":
         return tmux_manager.manager_ps_poc(args.workspace, args.state_dir)
     if args.manager_action == "bridge-check":
@@ -1601,7 +1642,7 @@ def manager(args: argparse.Namespace) -> dict[str, Any]:
         )
     if args.manager_action == "run-next":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
-        return tmux_manager.queue_manager_job(
+        result = tmux_manager.queue_manager_job(
             manager_id=manager_id,
             job_id=args.job_id,
             command_text=args.command_text,
@@ -1610,6 +1651,15 @@ def manager(args: argparse.Namespace) -> dict[str, Any]:
             state_dir=args.state_dir,
             cwd=args.cwd,
         )
+        paths = tmux_manager.manager_paths(args.workspace, args.state_dir)
+        tmux_manager.append_manager_audit(
+            paths,
+            manager_id=manager_id,
+            action="run_next",
+            result="queued" if result.get("queued") else "denied",
+            details={"reason": result.get("reason"), "job_handle": result.get("job_handle")},
+        )
+        return tmux_manager.public_submit_result(result, paths)
     if args.manager_action == "notification":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
         if args.notification_action == "list":
@@ -1655,7 +1705,7 @@ def manager(args: argparse.Namespace) -> dict[str, Any]:
         return manager_submit(args)
     if args.manager_action == "cancel":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
-        return tmux_manager.cancel_manager(
+        result = tmux_manager.cancel_manager(
             manager_id,
             workspace=args.workspace,
             state_dir=args.state_dir,
@@ -1663,6 +1713,15 @@ def manager(args: argparse.Namespace) -> dict[str, Any]:
             job_id=args.job_id,
             all_workers=args.all_workers,
         )
+        paths = tmux_manager.manager_paths(args.workspace, args.state_dir)
+        tmux_manager.append_manager_audit(
+            paths,
+            manager_id=manager_id,
+            action="cancel",
+            result="cancelled" if result.get("cancelled") else "denied",
+            details={"reason": result.get("reason"), "job_id": args.job_id, "all_workers": bool(args.all_workers)},
+        )
+        return result
     if args.manager_action == "cleanup":
         manager_id = resolve_manager_id_arg(args.manager_id, args.workspace, args.state_dir)
         paths = tmux_manager.manager_paths(args.workspace, args.state_dir)
@@ -1693,6 +1752,39 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
         die("monitor requires nonblank --pane")
     paths = tmux_state.state_paths(args.workspace, args.state_dir)
     tmux_state.ensure_state_dirs(paths)
+    owner = tmux_manager.manager_owned_pane_details(paths, args.pane)
+    if owner and not getattr(args, "manual_override", False) and not tmux_state.one_line_text(getattr(args, "observe_token", None)):
+        tmux_manager.append_manager_audit(paths, manager_id=str(owner.get("manager_id") or "unknown"), action="monitor", result="denied", details={"pane_id": args.pane})
+        return {"started": False, "pane_id": args.pane, "redacted": True, "reason": "manager-owned pane monitor requires manager.observe grant or --manual-override --reason TEXT"}
+    if owner and getattr(args, "manual_override", False):
+        reason = tmux_state.one_line_text(getattr(args, "reason", None))
+        if not reason:
+            tmux_manager.append_manager_audit(paths, manager_id=str(owner.get("manager_id") or "unknown"), action="monitor", result="denied", details={"pane_id": args.pane, "reason": "missing override reason"})
+            return {"started": False, "pane_id": args.pane, "reason": "manual override requires --reason TEXT"}
+        tmux_manager.append_manager_audit(paths, manager_id=str(owner.get("manager_id") or "unknown"), action="monitor", result="manual_override", details={"pane_id": args.pane, "reason": reason})
+    token = tmux_state.one_line_text(getattr(args, "observe_token", None))
+    if owner and token:
+        grant = tmux_manager.observe_grant_for_token(
+            manager_id=str(owner.get("manager_id") or "unknown"),
+            token=token,
+            workspace=args.workspace,
+            state_dir=args.state_dir,
+        )
+        if not grant or int(grant.get("max_reads") or 1) <= 1:
+            tmux_manager.append_manager_audit(paths, manager_id=str(owner.get("manager_id") or "unknown"), action="monitor", result="denied", details={"pane_id": args.pane, "reason": "monitor requires bounded observe lease"})
+            return {"started": False, "pane_id": args.pane, "reason": "manager-owned monitor requires a bounded manager.observe lease, not a one-shot event token"}
+        if args.timeout_seconds is None:
+            tmux_manager.append_manager_audit(paths, manager_id=str(owner.get("manager_id") or "unknown"), action="monitor", result="denied", details={"pane_id": args.pane, "reason": "missing timeout"})
+            return {"started": False, "pane_id": args.pane, "reason": "manager-owned monitor with observe lease requires --timeout-seconds"}
+        observed = tmux_manager.observe_manager_output(
+            manager_id=str(owner.get("manager_id") or "unknown"),
+            workspace=args.workspace,
+            state_dir=args.state_dir,
+            observe_token=token,
+        )
+        if not observed.get("observed"):
+            tmux_manager.append_manager_audit(paths, manager_id=str(owner.get("manager_id") or "unknown"), action="monitor", result="denied", details={"pane_id": args.pane, "reason": observed.get("reason")})
+            return {"started": False, "pane_id": args.pane, "reason": observed.get("reason") or "observe token denied"}
     monitor_id = tmux_state.safe_id(f"monitor-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}")
     script_dir = Path(__file__).resolve().parent
     status_lines = getattr(args, "status_lines", tmux_state.DEFAULT_STATUS_LINES)
@@ -2746,6 +2838,42 @@ def job_status(args: argparse.Namespace, kind: str | None = None) -> dict[str, A
         return compact_job_output(result, args)
     if getattr(args, "include_pane_state", False):
         record = attach_pane_state(record)
+    manager_id = tmux_state.one_line_text((status or {}).get("manager_id") or (record or {}).get("manager_id"))
+    if status and (status.get("manager_owned") is True or manager_id):
+        if getattr(args, "manual_override", False):
+            reason = tmux_state.one_line_text(getattr(args, "reason", None))
+            if not reason:
+                return {"job_id": item_id, "found": True, "manager_owned": True, "reason": "manual override requires --reason TEXT"}
+            tmux_manager.append_manager_audit(paths, manager_id=manager_id or "unknown", action="job_status", result="manual_override", details={"job_id": item_id, "reason": reason})
+        elif tmux_state.one_line_text(getattr(args, "observe_token", None)):
+            observed = tmux_manager.observe_manager_output(
+                manager_id=manager_id or "unknown",
+                workspace=args.workspace,
+                state_dir=args.state_dir,
+                event_id=tmux_state.one_line_text(status.get("event_id")),
+                observe_token=getattr(args, "observe_token", None),
+            )
+            if not observed.get("observed"):
+                return {"job_id": item_id, "found": True, "manager_owned": True, "observed": False, "reason": observed.get("reason")}
+            return {"job_id": item_id, "found": True, "manager_owned": True, "observe": observed}
+        else:
+            tmux_manager.append_manager_audit(paths, manager_id=manager_id or "unknown", action="job_status", result="redacted", details={"job_id": item_id})
+            return {
+                "job_id": item_id,
+                "found": True,
+                "manager_owned": True,
+                "redacted": True,
+                "status": {
+                    "id": status.get("id"),
+                    "status": status.get("status"),
+                    "exit_code": status.get("exit_code"),
+                    "event_id": status.get("event_id"),
+                    "manager_id": manager_id,
+                    "manager_sequence": status.get("manager_sequence"),
+                    "redacted": True,
+                },
+                "reason": "manager-owned job status requires manager.observe grant or --manual-override --reason TEXT for raw evidence",
+            }
     result = {
         "job_id": item_id,
         "found": bool(record or status),
@@ -3989,6 +4117,11 @@ def build_parser() -> argparse.ArgumentParser:
     capture_parser.add_argument("--lines", type=positive_int, default=200, help="Number of recent lines")
     capture_parser.add_argument("--strip-ansi", action="store_true", help="Remove ANSI/control escape sequences from output")
     capture_parser.add_argument("--max-chars", type=nonnegative_int, help="Return only the last N characters after optional ANSI stripping")
+    capture_parser.add_argument("--observe-token")
+    capture_parser.add_argument("--manual-override", action="store_true")
+    capture_parser.add_argument("--reason")
+    capture_parser.add_argument("--workspace")
+    capture_parser.add_argument("--state-dir")
 
     run_parser = subparsers.add_parser("run", help="Run a long-running command through the status wrapper")
     run_parser.add_argument("--pane", required=True, help="Stable tmux pane ID, such as %%3")
@@ -4041,6 +4174,25 @@ def build_parser() -> argparse.ArgumentParser:
     manager_status_parser.add_argument("--manager-id")
     manager_status_parser.add_argument("--workspace")
     manager_status_parser.add_argument("--state-dir")
+    manager_status_parser.add_argument("--manual-override", action="store_true")
+    manager_status_parser.add_argument("--reason")
+
+    manager_observe_parser = manager_subparsers.add_parser("observe", help="Read manager-owned evidence through a bounded observe grant")
+    manager_observe_parser.add_argument("--manager-id")
+    observe_scope = manager_observe_parser.add_mutually_exclusive_group()
+    observe_scope.add_argument("--job-handle")
+    observe_scope.add_argument("--event-id")
+    manager_observe_parser.add_argument("--observe-token")
+    observe_mode = manager_observe_parser.add_mutually_exclusive_group()
+    observe_mode.add_argument("--once", dest="once", action="store_true", default=True)
+    observe_mode.add_argument("--lease", dest="once", action="store_false")
+    manager_observe_parser.add_argument("--ttl-seconds", type=positive_float, default=tmux_manager.MANAGER_OBSERVE_DEFAULT_TTL_SECONDS)
+    manager_observe_parser.add_argument("--interval-seconds", type=positive_float, default=tmux_manager.MANAGER_OBSERVE_DEFAULT_INTERVAL_SECONDS)
+    manager_observe_parser.add_argument("--max-reads", type=positive_int, default=tmux_manager.MANAGER_OBSERVE_DEFAULT_MAX_READS)
+    manager_observe_parser.add_argument("--reason")
+    manager_observe_parser.add_argument("--manual-override", action="store_true")
+    manager_observe_parser.add_argument("--workspace")
+    manager_observe_parser.add_argument("--state-dir")
 
     manager_bridge_check_parser = manager_subparsers.add_parser("bridge-check", help="Verify that bridge prompts reach target Codex")
     manager_bridge_check_parser.add_argument("--manager-id")
@@ -4132,6 +4284,9 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser.add_argument("--lines", type=positive_int, default=200)
     monitor_parser.add_argument("--status-lines", type=positive_int, default=tmux_state.DEFAULT_STATUS_LINES)
     monitor_parser.add_argument("--status-max-chars", type=positive_int, default=tmux_state.DEFAULT_STATUS_MAX_CHARS)
+    monitor_parser.add_argument("--observe-token")
+    monitor_parser.add_argument("--manual-override", action="store_true")
+    monitor_parser.add_argument("--reason")
     monitor_parser.add_argument("--workspace")
     monitor_parser.add_argument("--state-dir")
 
@@ -4158,6 +4313,9 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--no-observed-tail", action="store_true")
     watch_parser.add_argument("--max-chars", type=nonnegative_int)
     watch_parser.add_argument("--include-pane-state", action="store_true")
+    watch_parser.add_argument("--observe-token")
+    watch_parser.add_argument("--manual-override", action="store_true")
+    watch_parser.add_argument("--reason")
 
     queue_idle_parser = subparsers.add_parser("queue-after-idle", help="Submit a command after a pane becomes an idle shell")
     queue_idle_parser.add_argument("--job-id", required=True)
@@ -4217,6 +4375,9 @@ def build_parser() -> argparse.ArgumentParser:
     job_status_parser.add_argument("--no-observed-tail", action="store_true")
     job_status_parser.add_argument("--max-chars", type=nonnegative_int)
     job_status_parser.add_argument("--include-pane-state", action="store_true")
+    job_status_parser.add_argument("--observe-token")
+    job_status_parser.add_argument("--manual-override", action="store_true")
+    job_status_parser.add_argument("--reason")
     job_cancel_parser = job_subparsers.add_parser("cancel", help="Cancel one managed worker")
     job_cancel_parser.add_argument("--job-id", required=True)
     job_cancel_parser.add_argument("--workspace")

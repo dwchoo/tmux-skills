@@ -411,9 +411,9 @@ def select_bridge_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] 
 
 def build_wake_prompt(workspace: str, candidate: dict[str, Any]) -> str:
     first_line = (
-        "tmux-control observed a ready task."
+        "tmux-manager observed a ready task."
         if candidate.get("source") == "ready_task"
-        else "tmux-control observed a terminal event."
+        else "tmux-manager observed a terminal event."
     )
     return "\n".join(
         [
@@ -426,7 +426,7 @@ def build_wake_prompt(workspace: str, candidate: dict[str, Any]) -> str:
             f"Task path: {candidate.get('task_path') or 'none'}",
             f"Log path: {candidate.get('log_path') or 'none'}",
             "",
-            "Please use $tmux-control to inspect the status and logs, then continue the requested work.",
+            "Please use the tmux-manager MCP to inspect manager status or request a bounded observe grant, then continue the requested work.",
         ]
     )
 
@@ -719,7 +719,7 @@ def write_manual_note(path: Path, *, thread_id: str, prompt: str) -> None:
     path.write_text(
         "\n".join(
             [
-                "# tmux-control bridge PoC manual confirmation",
+                "# tmux-manager bridge PoC manual confirmation",
                 "",
                 f"main_cli_thread_id: {thread_id}",
                 "received_prompt_timestamp: ",
@@ -747,7 +747,7 @@ def protocol_fixture_payload(
             "observed_at": utc_timestamp(),
             "initialize_params": {
                 "clientInfo": {
-                    "name": "tmux-control-bridge",
+                    "name": "tmux-manager-bridge",
                     "title": codex_app_server_client.CLIENT_TITLE,
                     "version": codex_app_server_client.CLIENT_VERSION,
                 },
@@ -911,8 +911,8 @@ def validate_protocol_fixture_shape(fixture: dict[str, Any], runtime: dict[str, 
     for key in ("name", "title", "version"):
         if not client_info.get(key):
             raise ValueError(f"initialize clientInfo.{key} must be present")
-    if client_info["name"] != "tmux-control-bridge":
-        raise ValueError("initialize clientInfo.name must be tmux-control-bridge")
+    if client_info["name"] != "tmux-manager-bridge":
+        raise ValueError("initialize clientInfo.name must be tmux-manager-bridge")
     if not isinstance(capabilities, dict):
         raise ValueError("initialize capabilities must be an object")
     for key in ("experimentalApi", "requestAttestation"):
@@ -1009,7 +1009,7 @@ def validate_poc_artifacts(runtime_json: Path) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="tmux-control bridge helpers")
+    parser = argparse.ArgumentParser(description="tmux-manager bridge helpers")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     poc = subparsers.add_parser("poc", help="run the app-server same-thread wake PoC")

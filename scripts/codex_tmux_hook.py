@@ -9,6 +9,7 @@ import sys
 from typing import Any
 
 import tmux_state
+import tmux_manager
 
 
 def read_stdin_json() -> dict[str, Any]:
@@ -118,6 +119,103 @@ def manager_owns_terminal(paths: dict[str, Any], status: dict[str, Any]) -> bool
     return False
 
 
+def active_manager_context(paths: dict[str, Any]) -> list[dict[str, Any]]:
+    managers_dir = paths["root"] / "managers"
+    rows: list[dict[str, Any]] = []
+    try:
+        manager_paths = list(managers_dir.glob("*.json"))
+    except OSError:
+        return rows
+    for manager_path in manager_paths:
+        record, error = tmux_manager.read_manager_record(paths, manager_path.stem)
+        if error or not record:
+            continue
+        active_ids = tmux_manager.active_job_ids(record)
+        unacked = tmux_manager.unacknowledged_terminal_event_ids(record)
+        if active_ids or record.get("pending_job") or unacked:
+            rows.append(
+                {
+                    "manager_id": record.get("manager_id"),
+                    "status": record.get("status"),
+                    "active_job_count": len(active_ids),
+                    "unacked_event_count": len(unacked),
+                }
+            )
+    return rows
+
+
+def command_text_from_hook(data: dict[str, Any]) -> str:
+    tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    candidates = [
+        tool_input.get("command"),
+        tool_input.get("cmd"),
+        data.get("command"),
+        data.get("cmd"),
+        data.get("input"),
+    ]
+    for value in candidates:
+        text = str(value or "")
+        if text.strip():
+            return text
+    return ""
+
+
+def has_manual_override(command: str) -> bool:
+    return "--manual-override" in command and "--reason" in command
+
+
+def has_observe_grant(command: str) -> bool:
+    return "--observe-token" in command or "TMUX_SKILLS_OBSERVE_TOKEN" in command
+
+
+def command_is_forbidden_monitoring(command: str) -> bool:
+    text = command.strip()
+    lowered = text.lower()
+    if not text:
+        return False
+    if "manager observe" in lowered or "manager ack" in lowered or "manager run-next" in lowered or "manager cancel" in lowered:
+        return False
+    if ".codex/tmux-skills" in text and any(word in lowered for word in ("cat ", "tail ", "less ", "sed ", "awk ", "jq ", "python")):
+        return True
+    if "tmux_control.py capture" in text or " tmux capture-pane" in f" {text}" or lowered.startswith("tmux capture-pane"):
+        return True
+    if "tmux_control.py job status" in text or "tmux_control.py watch status" in text:
+        return True
+    if "tmux_control.py manager status" in text and any(word in lowered for word in ("sleep", "while ", "until ", "watch ", " for ")):
+        return True
+    if lowered.count("tmux_control.py manager status") > 1:
+        return True
+    if ("/status/" in text or "/logs/" in text) and any(word in lowered for word in ("cat ", "tail ", "less ", "sed ", "awk ", "jq ")):
+        return True
+    return False
+
+
+def pre_tool_use(args: argparse.Namespace, stdin_data: dict[str, Any]) -> dict[str, Any]:
+    paths = tmux_state.state_paths(args.workspace, args.state_dir)
+    managers = active_manager_context(paths)
+    if not managers:
+        return {}
+    command = command_text_from_hook(stdin_data)
+    if not command_is_forbidden_monitoring(command):
+        return {}
+    manager_id = str(managers[0].get("manager_id") or "unknown")
+    if has_observe_grant(command):
+        tmux_manager.append_manager_audit(paths, manager_id=manager_id, action="hook_pre_tool_use", result="allow_grant", details={"command": hook_text(command)})
+        return {}
+    if has_manual_override(command):
+        tmux_manager.append_manager_audit(paths, manager_id=manager_id, action="hook_pre_tool_use", result="manual_override", details={"command": hook_text(command)})
+        return {}
+    tmux_manager.append_manager_audit(paths, manager_id=manager_id, action="hook_pre_tool_use", result="denied", details={"command": hook_text(command)})
+    return {
+        "decision": "block",
+        "reason": (
+            "Active manager-owned tmux work must not be polled or read directly. "
+            "Use manager.observe once only when the user explicitly asked for progress/logs, "
+            "or provide --manual-override --reason TEXT for a human-requested diagnostic override."
+        ),
+    }
+
+
 def newest_unhandled_terminal(paths: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, str]], str | None]:
     all_errors: list[dict[str, str]] = []
     seen_event_ids: set[str] = set()
@@ -154,6 +252,11 @@ def context(args: argparse.Namespace) -> dict[str, Any]:
     ]
     interesting.sort(key=tmux_state.sort_key, reverse=True)
     lines = []
+    managers = active_manager_context(paths)
+    if managers:
+        lines.append(
+            "active manager-owned work: do not poll manager status, capture worker panes, or read raw .codex/tmux-skills files; use one manager.observe only after an explicit user progress/log request"
+        )
     for task in classified["ready_tasks"]:
         lines.append(f"ready task {task.get('task_id')}: {hook_text(task.get('instruction'))}")
         evidence = [path for path in task.get("evidence_paths", []) if path]
@@ -221,6 +324,10 @@ def build_parser() -> argparse.ArgumentParser:
     context_parser.add_argument("--workspace")
     context_parser.add_argument("--state-dir")
 
+    pre_tool_parser = subparsers.add_parser("pre-tool-use", help="Block unsafe manager-owned polling commands")
+    pre_tool_parser.add_argument("--workspace")
+    pre_tool_parser.add_argument("--state-dir")
+
     stop_parser = subparsers.add_parser("stop", help="Block once on ready tasks or unacknowledged terminal events")
     stop_parser.add_argument("--workspace")
     stop_parser.add_argument("--state-dir")
@@ -233,6 +340,8 @@ def main() -> None:
     stdin_data = read_stdin_json()
     if args.action == "context":
         output = context(args)
+    elif args.action == "pre-tool-use":
+        output = pre_tool_use(args, stdin_data)
     elif args.action == "stop":
         output = stop(args, stdin_data)
     else:

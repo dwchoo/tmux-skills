@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-CLIENT_TITLE = "tmux-control bridge"
+CLIENT_TITLE = "tmux-manager bridge"
 CLIENT_VERSION = "0.1"
 INITIALIZE_CAPABILITIES: dict[str, Any] = {
     "experimentalApi": False,
@@ -323,7 +323,7 @@ class AppServerClient:
         transport.connect()
         self.transport = transport
 
-    def initialize(self, client_name: str = "tmux-control-bridge") -> dict[str, Any]:
+    def initialize(self, client_name: str = "tmux-manager-bridge") -> dict[str, Any]:
         response = self._request(
             "initialize",
             {

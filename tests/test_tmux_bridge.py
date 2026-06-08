@@ -86,7 +86,7 @@ class TmuxBridgeTests(unittest.TestCase):
             },
         )
 
-        self.assertTrue(prompt.startswith("tmux-control observed a ready task."))
+        self.assertTrue(prompt.startswith("tmux-manager observed a ready task."))
         for expected in (
             "Workspace: /workspace",
             "Job path: /workspace/.codex/tmux-skills/jobs/job-one.json",
@@ -178,7 +178,7 @@ class TmuxBridgeTests(unittest.TestCase):
             )
 
             def fake_delivery(record: dict[str, object], candidate: dict[str, object], prompt: str) -> dict[str, object]:
-                self.assertEqual(prompt.splitlines()[0], "tmux-control observed a terminal event.")
+                self.assertEqual(prompt.splitlines()[0], "tmux-manager observed a terminal event.")
                 return {
                     "event_id": candidate["event_id"],
                     "delivered_at": tmux_state.utc_now(),

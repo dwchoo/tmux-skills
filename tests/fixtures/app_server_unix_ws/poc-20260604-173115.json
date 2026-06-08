@@ -20,8 +20,8 @@
         "requestAttestation": false
       },
       "clientInfo": {
-        "name": "tmux-control-bridge",
-        "title": "tmux-control bridge",
+        "name": "tmux-manager-bridge",
+        "title": "tmux-manager bridge",
         "version": "0.1"
       }
     },
@@ -43,8 +43,8 @@
           "requestAttestation": false
         },
         "clientInfo": {
-          "name": "tmux-control-bridge",
-          "title": "tmux-control bridge",
+          "name": "tmux-manager-bridge",
+          "title": "tmux-manager bridge",
           "version": "0.1"
         }
       }
@@ -67,7 +67,7 @@
         "cwd": "/Users/dwchoo/project/tmux-skills",
         "input": [
           {
-            "text": "tmux-control observed a terminal event.\n\nWorkspace: /Users/dwchoo/project/tmux-skills\nJob status: /Users/dwchoo/project/tmux-skills/.codex/tmux-skills/jobs/test/status.json\nJob log: /Users/dwchoo/project/tmux-skills/.codex/tmux-skills/jobs/test/output.log\nReady task: /Users/dwchoo/project/tmux-skills/.codex/tmux-skills/tasks/ready/test.json",
+            "text": "tmux-manager observed a terminal event.\n\nWorkspace: /Users/dwchoo/project/tmux-skills\nJob status: /Users/dwchoo/project/tmux-skills/.codex/tmux-skills/jobs/test/status.json\nJob log: /Users/dwchoo/project/tmux-skills/.codex/tmux-skills/jobs/test/output.log\nReady task: /Users/dwchoo/project/tmux-skills/.codex/tmux-skills/tasks/ready/test.json",
             "text_elements": [],
             "type": "text"
           }
@@ -83,7 +83,7 @@
         "codexHome": "/Users/dwchoo/.codex",
         "platformFamily": "unix",
         "platformOs": "macos",
-        "userAgent": "Codex Desktop/0.133.0 (Mac OS 26.5.1; arm64) tmux/3.6a (tmux-control-bridge; 0.1)"
+        "userAgent": "Codex Desktop/0.133.0 (Mac OS 26.5.1; arm64) tmux/3.6a (tmux-manager-bridge; 0.1)"
       }
     },
     {

@@ -1,0 +1,5 @@
+[mcp_servers.tmux-manager]
+command = "python3"
+args = ["/Users/dwchoo/project/tmux-skills/scripts/tmux_mcp_server.py"]
+cwd = "/Users/dwchoo/project/tmux-skills"
+enabled = true

@@ -461,8 +461,11 @@ class TmuxControlTests(unittest.TestCase):
                 result = tmux_control.manager(args)
 
             self.assertTrue(result["queued"])
-            self.assertEqual(result["pane_id"], "%4")
-            self.assertEqual(result["pane_index"], "3")
+            self.assertIn("job_handle", result)
+            self.assertEqual(result["codex_contract"]["observe"], "none")
+            self.assertNotIn("pane_id", result)
+            self.assertNotIn("pane_index", result)
+            self.assertNotIn("record", result)
             loaded, error = tmux_manager.read_manager_record(paths, "manager-one")
             self.assertIsNone(error)
             assert loaded is not None
@@ -1539,6 +1542,45 @@ class TmuxControlTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 1)
         self.assertIn("monitor requires --match-regex, --idle-shell, or --timeout-seconds", stderr.getvalue())
+
+    def test_monitor_blocks_manager_owned_pane_with_one_shot_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            workspace = Path(tmp_name) / "workspace"
+            workspace.mkdir()
+            paths = tmux_manager.manager_paths(str(workspace))
+            record = tmux_manager.build_manager_record(
+                manager_id="manager-one",
+                manager_pane_id="%3",
+                worker_pane_id="%2",
+                pending_job=None,
+                notify={"mode": "none"},
+                workspace=str(workspace),
+                state_dir=str(paths["root"]),
+            )
+            record["status"] = "running"
+            record["active_job_ids"] = ["job-one"]
+            record["jobs"] = {"job-one": {"job_id": "job-one", "pane_id": "%2", "manager_owned": True, "manager_id": "manager-one"}}
+            tmux_manager.write_manager_record(paths, record)
+            args = argparse.Namespace(
+                pane="%2",
+                workspace=str(workspace),
+                state_dir=None,
+                match_regex="done",
+                idle_shell=False,
+                timeout_seconds=1.0,
+                poll_seconds=1.0,
+                lines=20,
+                status_lines=10,
+                status_max_chars=1200,
+                observe_token="evt_one_shot",
+                manual_override=False,
+                reason=None,
+            )
+
+            result = tmux_control.monitor(args)
+
+        self.assertFalse(result["started"])
+        self.assertIn("bounded manager.observe lease", result["reason"])
 
     def test_watch_status_and_cancel_require_job_id_in_main(self) -> None:
         for action in ("status", "cancel"):

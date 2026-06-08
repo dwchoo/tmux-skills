@@ -15,9 +15,23 @@ Use managed workers when:
 
 ## Bridge Wakeup Boundary
 
-`tmux-control bridge` is not a managed queue worker. It observes `.codex/tmux-skills/status` terminal events and `.codex/tmux-skills/tasks` ready tasks, then submits a path-only notification prompt to a user-specified Codex thread through the same local `codex app-server`.
+`tmux_control.py bridge` is not a managed queue worker. It observes `.codex/tmux-skills/status` terminal events and `.codex/tmux-skills/tasks` ready tasks, then submits a path-only notification prompt to a user-specified Codex thread through the same local `codex app-server`.
 
 The bridge does not submit queued commands, inspect panes, summarize logs, diagnose failures, retry commands, clean up tmux lifecycle state, or write managed worker records under `.codex/tmux-skills/jobs`. Its state is isolated under `.codex/tmux-skills/bridge`, and all bridge record read-modify-write updates are protected by the bridge record lock.
+
+## Manager-owned Observation Boundary
+
+Manager-owned workers are controlled by the MCP manager workflow even though their durable command, status, log, and job files still live under `.codex/tmux-skills`. The raw files are manager-internal evidence. Codex-facing submit/status calls must use opaque `job_handle` values and redacted status summaries unless a valid observe grant is present.
+
+Durable manager ownership metadata is stored in manager records and in the worker job/status records themselves. This lets the compatibility CLI and lifecycle hooks recognize manager-owned evidence after a manager cleanup removed the manager record.
+
+`job status`, `watch status`, raw status/log reads, and pane capture against manager-owned jobs must be redacted or refused unless one of these is true:
+
+- A one-shot event token or observe grant authorizes the read.
+- A bounded observe lease authorizes the read and has remaining `ttl_seconds`, `interval_seconds`, and `max_reads`.
+- A human-requested manual override supplies `--manual-override --reason TEXT`.
+
+Every allowed read, denied read, grant creation, grant consumption, grant reuse denial, and manual override is written to the manager audit log. CLI compatibility paths must not silently bypass the MCP manager contract.
 
 ## Commands
 

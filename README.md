@@ -1,6 +1,6 @@
 # tmux-skills
 
-Codex skill for controlled tmux usage. It provides concise skill instructions, Python helpers for tmux panes/windows, long-running job wrappers, managed watch/queue workers, resumable follow-up task records, visible status review flows, and reusable pane monitors.
+Codex MCP manager and helper scripts for controlled tmux usage. The project-scoped MCP server is named `tmux-manager`; do not install or rely on the legacy global `tmux-control` Skill for manager workflows.
 
 ## Requirements
 
@@ -9,7 +9,7 @@ Codex skill for controlled tmux usage. It provides concise skill instructions, P
 
 ## Files
 
-- `SKILL.md`: skill instructions and safety rules.
+- `SKILL.md`: reference operating instructions and safety rules.
 - `llms.txt`: LLM-friendly documentation index.
 - `docs/`: canonical detailed contracts and runbooks.
 - `references/`: copyable workflow examples.
@@ -51,7 +51,7 @@ When outside tmux, `spawn` and `new-window` create or reuse a detached `codex-<w
 
 ## Bridge wakeup
 
-`tmux-control bridge` observes terminal event and ready task records under `.codex/tmux-skills`, then sends a path-only notification prompt to a user-specified main Codex thread through the same local `codex app-server`. It uses existing `codex login` auth/session through local app-server Unix socket WebSocket transport; it does not call the OpenAI API directly and does not require `OPENAI_API_KEY`.
+`tmux_control.py bridge` observes terminal event and ready task records under `.codex/tmux-skills`, then sends a path-only notification prompt to a user-specified main Codex thread through the same local `codex app-server`. It uses existing `codex login` auth/session through local app-server Unix socket WebSocket transport; it does not call the OpenAI API directly and does not require `OPENAI_API_KEY`.
 
 PoC is a hard gate. Prove same-thread wake with `scripts/tmux_bridge.py poc`, save the protocol fixture and manual confirmation note, and run `scripts/tmux_bridge.py validate-poc` before relying on daemon or `tmux_control.py bridge start`.
 
@@ -59,10 +59,10 @@ The bridge never summarizes status/log content, reads task instruction bodies in
 
 ## Raw tmux fallback
 
-Prefer `python scripts/tmux_control.py run` for long-running commands. If the helper is unavailable and you must launch a manual raw tmux fallback, run the installed wrapper from the skill directory so status, logs, PID, and exit code are still preserved:
+Prefer `tmux-manager` MCP tools for manager-owned long-running commands and `python scripts/tmux_control.py run` only for compatibility or manual diagnostics. If the helper is unavailable and you must launch a manual raw tmux fallback, run the repository wrapper so status, logs, PID, and exit code are still preserved:
 
 ```bash
-tmux new-session -d -s <job_id> "cd ~/.codex/skills/tmux-control && bash scripts/run_managed_job.sh <workspace>/logs/jobs/<job_id> <command> <args...>"
+tmux new-session -d -s <job_id> "cd /Users/dwchoo/project/tmux-skills && bash scripts/run_managed_job.sh <workspace>/logs/jobs/<job_id> <command> <args...>"
 ```
 
 The wrapper executes the command as argv without shell re-parsing, writes combined stdout/stderr to `stdout.log`, and does not create `stderr.log`.
